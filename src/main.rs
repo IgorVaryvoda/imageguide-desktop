@@ -222,8 +222,10 @@ struct Audit {
     /// otherwise redo it for every entry on every keystroke.
     mislabelled: usize,
     /// The list, which the component library owns. It holds a weak handle back to
-    /// this audit and reads its rows through that.
-    table: gpui::Entity<TableState<AuditTable>>,
+    /// this audit and reads its rows through that, so it cannot be built until this
+    /// audit is a live entity: `TableState::new` asks the delegate for its row and
+    /// column counts straight away, and answering that means reading the audit.
+    table: Option<gpui::Entity<TableState<AuditTable>>>,
 }
 
 /// List order. Every column is sortable, and clicking the active one reverses it.
@@ -2230,11 +2232,13 @@ impl Render for Audit {
                         .flex_1()
                         .p_2()
                         .into_any_element()
-                    } else {
-                        DataTable::new(&self.table)
+                    } else if let Some(table) = self.table.as_ref() {
+                        DataTable::new(table)
                             .stripe(false)
                             .bordered(false)
                             .into_any_element()
+                    } else {
+                        div().into_any_element()
                     }),
             )
             .into_any_element()
@@ -2537,14 +2541,8 @@ fn run_window(launch: Launch) {
                             .iter()
                             .filter(|entry| entry.extension_lies())
                             .count();
-                        // The table reads its rows back out of this audit, so it takes a
-                        // weak handle: the audit owns the table state, not the reverse.
-                        let table = {
-                            let delegate = AuditTable::new(cx.weak_entity());
-                            cx.new(|cx| TableState::new(delegate, window, cx))
-                        };
                         let mut audit = Audit {
-                            table,
+                            table: None,
                             root,
                             entries,
                             skipped_raw,
@@ -2588,6 +2586,15 @@ fn run_window(launch: Launch) {
                         }
                         audit
                     });
+
+                    // Only now that the audit is a live entity, because building the
+                    // table asks the delegate how many rows there are and answering
+                    // that means reading the audit.
+                    let table = {
+                        let delegate = AuditTable::new(audit.downgrade());
+                        cx.new(|cx| TableState::new(delegate, window, cx))
+                    };
+                    audit.update(cx, |audit, _| audit.table = Some(table));
 
                     // Dialogs, notifications and tooltips are drawn by the Root, so the
                     // window's first level has to be one.
