@@ -14,10 +14,13 @@ rewrite your files. This one can.
 
 ## Status
 
-Early. The audit works, with thumbnails. Conversion is not written yet.
+Audit, thumbnails, and WebP conversion all work.
 
 ```bash
-cargo run --release -- ~/path/to/folder
+imageguide ~/path/to/folder                        # audit, in a window
+imageguide ~/path/to/folder --convert              # convert, no window
+imageguide ~/path/to/folder --convert --quality 60
+imageguide ~/path/to/folder --convert --lossless
 ```
 
 It walks the folder and its subfolders, reads each image's header, and lists what it
@@ -51,9 +54,32 @@ Reading headers only is deliberate. Decoding a 6000px JPEG to learn that it is 6
 wide costs a hundred times what reading its header costs, and a shoot folder holds
 thousands of them.
 
+## Converting
+
+Pick a quality in the header and press **Convert to WebP**, or use `--convert` to do
+the same work without a window. Files are written to `optimized/` inside the folder,
+mirroring its subfolder layout. Sources are never touched, and that output folder is
+excluded from later scans so a second run does not offer to convert its own output.
+
+Eight files encode at once. Each holds a fully decoded image in memory, so that
+number is a memory bound as much as a CPU one.
+
+**Anything with real transparency goes lossless** whatever quality you asked for.
+libwebp's lossy path mangles alpha in ways that ruin cut-outs. An image with an alpha
+channel that is entirely opaque is treated as opaque, because that is just an RGB
+image paying for a fourth channel.
+
+A file that grew is reported as grown rather than hidden. Re-encoding an
+already-optimal JPEG usually costs bytes, and that is worth seeing.
+
+Twelve mixed files from a real photo library, at q80:
+
+```
+12 converted at q80: 76.0 MB -> 4.6 MB, saved 71.4 MB (94%)
+```
+
 ## Planned
 
-- WebP conversion with a real before/after size, written to an output folder.
 - A full-resolution original-versus-converted slider. Judging compression is the
   whole job and it is what a browser is worst at.
 - AVIF. Deferred: `rav1e` wants `nasm` to build with assembly, and it is worth doing

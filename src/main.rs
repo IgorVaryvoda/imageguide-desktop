@@ -4,6 +4,7 @@
 //! does the same work locally, so nothing leaves the machine and the folder size is
 //! bounded by the disk rather than by a tab.
 
+mod convert;
 mod scan;
 mod thumbs;
 
@@ -16,12 +17,18 @@ use gpui::{
     prelude::*, px, rgb, rgba, size, uniform_list, white,
 };
 use gpui_platform::application;
+use convert::Quality;
 use scan::{Entry, format_bytes, format_name};
 
 const BACKGROUND: u32 = 0x14161b;
 const ROW: u32 = 0x1b1e25;
 const MUTED: u32 = 0xffffff77;
 const ROW_HEIGHT: f32 = 60.;
+const ACCENT: u32 = 0x8ab4ff;
+const GOOD: u32 = 0x5ec27a;
+/// How many files encode at once. Each one holds a fully decoded image in memory, so
+/// this is a memory bound as much as a CPU one.
+const WORKERS: usize = 8;
 
 struct Audit {
     root: PathBuf,
@@ -33,11 +40,109 @@ struct Audit {
     /// Rows already handed to a background thread, so scrolling past one twice does
     /// not decode it twice.
     requested: HashSet<usize>,
+    quality: Quality,
+    /// Encoded size per row, filled in as conversion progresses.
+    results: HashMap<usize, u64>,
+    converting: bool,
+    /// Files that could not be decoded or written, so the count is honest.
+    failed: usize,
 }
 
 impl Audit {
     fn total_bytes(&self) -> u64 {
         self.entries.iter().map(|entry| entry.bytes).sum()
+    }
+
+    /// Bytes before and after, counting only the files actually converted. Comparing
+    /// against the whole folder mid-run would report a fake saving.
+    fn converted_totals(&self) -> (u64, u64) {
+        self.results.iter().fold((0, 0), |(before, after), (index, bytes)| {
+            let source = self.entries.get(*index).map_or(0, |entry| entry.bytes);
+            (before + source, after + bytes)
+        })
+    }
+
+    fn start_conversion(&mut self, cx: &mut Context<Self>) {
+        if self.converting {
+            return;
+        }
+        self.converting = true;
+        self.results.clear();
+        self.failed = 0;
+        cx.notify();
+
+        let root = self.root.clone();
+        let out_dir = self.root.join(scan::OUTPUT_DIR);
+        let quality = self.quality;
+        let sources: Vec<(usize, PathBuf)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (index, entry.path.clone()))
+            .collect();
+
+        cx.spawn(async move |this, cx| {
+            for chunk in sources.chunks(WORKERS) {
+                // Spawn a bounded batch, then wait for it. Queueing all 5,000 at once
+                // would be fine for the executor and terrible for memory.
+                let batch: Vec<_> = chunk
+                    .iter()
+                    .map(|(index, path)| {
+                        let (index, path) = (*index, path.clone());
+                        let (root, out_dir) = (root.clone(), out_dir.clone());
+                        cx.background_executor().spawn(async move {
+                            (index, convert::convert_file(&root, &path, &out_dir, quality))
+                        })
+                    })
+                    .collect();
+
+                let mut done = Vec::with_capacity(batch.len());
+                for task in batch {
+                    done.push(task.await);
+                }
+
+                if this
+                    .update(cx, |audit, cx| {
+                        for (index, result) in done {
+                            match result {
+                                Some(converted) => {
+                                    audit.results.insert(index, converted.bytes);
+                                }
+                                None => audit.failed += 1,
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+
+            let _ = this.update(cx, |audit, cx| {
+                audit.converting = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn quality_button(&self, quality: Quality, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.quality == quality;
+        div()
+            .id(gpui::SharedString::from(quality.label()))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(12.))
+            .bg(if selected { rgba(0xffffff1f) } else { rgba(0xffffff08) })
+            .text_color(if selected { rgb(ACCENT) } else { rgba(MUTED) })
+            .child(quality.label())
+            .on_click(cx.listener(move |audit, _, _, cx| {
+                audit.quality = quality;
+                cx.notify();
+            }))
     }
 
     /// Kick off decoding for a row, unless it is already loaded or in flight.
@@ -131,6 +236,27 @@ impl Audit {
                     .text_color(white())
                     .child(format_bytes(entry.bytes)),
             )
+            .child(
+                div()
+                    .w(px(132.))
+                    .when_some(self.results.get(&index), |slot, converted| {
+                        let saved = entry.bytes.saturating_sub(*converted);
+                        let percent = if entry.bytes == 0 {
+                            0.
+                        } else {
+                            saved as f32 / entry.bytes as f32 * 100.
+                        };
+                        // A file that grew is a real outcome, not a rounding error:
+                        // re-encoding an already-optimal JPEG usually costs bytes.
+                        let grew = *converted > entry.bytes;
+                        slot.text_color(if grew { rgba(MUTED) } else { rgb(GOOD) })
+                            .child(if grew {
+                                format!("→ {} (larger)", format_bytes(*converted))
+                            } else {
+                                format!("→ {}  −{percent:.0}%", format_bytes(*converted))
+                            })
+                    }),
+            )
     }
 }
 
@@ -172,8 +298,58 @@ impl Render for Audit {
                                     format_bytes(self.total_bytes())
                                 ),
                             }),
+                    )
+                    .child(div().flex_1())
+                    .child(self.quality_button(Quality::lossy(60.), cx))
+                    .child(self.quality_button(Quality::lossy(80.), cx))
+                    .child(self.quality_button(Quality::LOSSLESS, cx))
+                    .child(
+                        div()
+                            .id("convert")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(12.))
+                            .bg(rgba(0xffffff1f))
+                            .text_color(white())
+                            .hover(|style| style.bg(rgba(0xffffff33)))
+                            .child(if self.converting {
+                                format!("Converting {}/{count}", self.results.len() + self.failed)
+                            } else {
+                                "Convert to WebP".to_string()
+                            })
+                            .on_click(cx.listener(|audit, _, _, cx| audit.start_conversion(cx))),
                     ),
             )
+            .when(!self.results.is_empty(), |shell| {
+                let (before, after) = self.converted_totals();
+                let saved = before.saturating_sub(after);
+                let percent = if before == 0 {
+                    0.
+                } else {
+                    saved as f32 / before as f32 * 100.
+                };
+                shell.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(GOOD))
+                        .child(match self.failed {
+                            0 => format!(
+                                "{} converted · {} → {} · saved {} ({percent:.0}%)",
+                                self.results.len(),
+                                format_bytes(before),
+                                format_bytes(after),
+                                format_bytes(saved)
+                            ),
+                            failed => format!(
+                                "{} converted · saved {} ({percent:.0}%) · {failed} failed",
+                                self.results.len(),
+                                format_bytes(saved)
+                            ),
+                        }),
+                )
+            })
             .child(
                 uniform_list(
                     "images",
@@ -193,18 +369,92 @@ impl Render for Audit {
     }
 }
 
-fn main() {
-    let root = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+/// `imageguide <folder> [--convert] [--quality N | --lossless]`
+struct Args {
+    root: PathBuf,
+    convert: bool,
+    quality: Quality,
+}
 
-    if !root.is_dir() {
-        eprintln!("imageguide: {} is not a folder", root.display());
+fn parse_args() -> Args {
+    let mut root = None;
+    let mut convert = false;
+    let mut quality = Quality::lossy(80.);
+    let mut rest = std::env::args().skip(1);
+
+    while let Some(argument) = rest.next() {
+        match argument.as_str() {
+            "--convert" => convert = true,
+            "--lossless" => quality = Quality::LOSSLESS,
+            "--quality" => {
+                if let Some(value) = rest.next().and_then(|value| value.parse().ok()) {
+                    quality = Quality::lossy(value);
+                }
+            }
+            _ => root = Some(PathBuf::from(argument)),
+        }
+    }
+
+    Args {
+        root: root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+        convert,
+        quality,
+    }
+}
+
+/// Convert without opening a window, so the same work is scriptable and testable.
+fn convert_headless(root: &std::path::Path, entries: &[Entry], quality: Quality) {
+    let out_dir = root.join(scan::OUTPUT_DIR);
+    let (mut before, mut after, mut failed) = (0u64, 0u64, 0usize);
+
+    for entry in entries {
+        match convert::convert_file(root, &entry.path, &out_dir, quality) {
+            Some(converted) => {
+                before += entry.bytes;
+                after += converted.bytes;
+                let delta = entry.bytes as i64 - converted.bytes as i64;
+                let percent = delta as f64 / entry.bytes.max(1) as f64 * 100.;
+                println!(
+                    "{:<52} {:>9} -> {:>9}  {percent:+.0}%",
+                    entry.name(),
+                    format_bytes(entry.bytes),
+                    format_bytes(converted.bytes)
+                );
+            }
+            None => {
+                failed += 1;
+                println!("{:<52} failed", entry.name());
+            }
+        }
+    }
+
+    let saved = before.saturating_sub(after);
+    let percent = saved as f64 / before.max(1) as f64 * 100.;
+    println!(
+        "\n{} converted at {}: {} -> {}, saved {} ({percent:.0}%){}",
+        entries.len() - failed,
+        quality.label(),
+        format_bytes(before),
+        format_bytes(after),
+        format_bytes(saved),
+        if failed == 0 {
+            String::new()
+        } else {
+            format!(", {failed} failed")
+        }
+    );
+    println!("written to {}", out_dir.display());
+}
+
+fn main() {
+    let args = parse_args();
+
+    if !args.root.is_dir() {
+        eprintln!("imageguide: {} is not a folder", args.root.display());
         std::process::exit(2);
     }
 
-    let scanned = scan::scan(&root);
+    let scanned = scan::scan(&args.root);
     let entries = scanned.entries;
     println!(
         "{} images, {} on disk, {} camera raw skipped",
@@ -213,6 +463,13 @@ fn main() {
         scanned.skipped_raw
     );
 
+    if args.convert {
+        convert_headless(&args.root, &entries, args.quality);
+        return;
+    }
+
+    let root = args.root;
+    let quality = args.quality;
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
         cx.open_window(
@@ -228,6 +485,10 @@ fn main() {
                     skipped_raw: scanned.skipped_raw,
                     thumbs: HashMap::new(),
                     requested: HashSet::new(),
+                    quality,
+                    results: HashMap::new(),
+                    converting: false,
+                    failed: 0,
                 })
             },
         )

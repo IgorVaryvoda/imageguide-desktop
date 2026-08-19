@@ -24,6 +24,10 @@ pub fn is_raw(path: &Path) -> bool {
         })
 }
 
+/// Converted files land here, inside the folder being audited. A second run would
+/// otherwise list its own output and offer to convert it again.
+pub const OUTPUT_DIR: &str = "optimized";
+
 /// What a folder holds.
 pub struct Scan {
     pub entries: Vec<Entry>,
@@ -88,6 +92,9 @@ pub fn scan(root: &Path) -> Scan {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
     {
+        if file.path().components().any(|part| part.as_os_str() == OUTPUT_DIR) {
+            continue;
+        }
         if is_raw(file.path()) {
             skipped_raw += 1;
             continue;
@@ -184,6 +191,21 @@ mod tests {
         assert_eq!(scanned.entries.len(), 2);
         assert_eq!(scanned.entries[0].name(), "big.png", "heaviest file sorts first");
         assert!(scanned.entries[0].bytes > scanned.entries[1].bytes);
+    }
+
+    #[test]
+    fn the_output_folder_is_not_audited_as_input() {
+        let dir = temp_dir("output");
+        write_sample(&dir, "source.png", 16, 16);
+        std::fs::create_dir_all(dir.join(OUTPUT_DIR)).unwrap();
+        write_sample(&dir.join(OUTPUT_DIR), "source.png", 16, 16);
+
+        let scanned = scan(&dir);
+        assert_eq!(
+            scanned.entries.len(),
+            1,
+            "a second run must not offer to convert its own output"
+        );
     }
 
     #[test]
