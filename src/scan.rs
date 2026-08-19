@@ -19,9 +19,7 @@ const RAW_EXTENSIONS: [&str; 9] = [
 pub fn is_raw(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            RAW_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
-        })
+        .is_some_and(|extension| RAW_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
 }
 
 /// Converted files land here, inside the folder being audited. A second run would
@@ -92,7 +90,11 @@ pub fn scan(root: &Path) -> Scan {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
     {
-        if file.path().components().any(|part| part.as_os_str() == OUTPUT_DIR) {
+        if file
+            .path()
+            .components()
+            .any(|part| part.as_os_str() == OUTPUT_DIR)
+        {
             continue;
         }
         if is_raw(file.path()) {
@@ -105,7 +107,7 @@ pub fn scan(root: &Path) -> Scan {
     }
 
     // Heaviest first: the top of the list is the work worth doing.
-    entries.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.bytes));
     Scan {
         entries,
         skipped_raw,
@@ -189,7 +191,11 @@ mod tests {
 
         let scanned = scan(&dir);
         assert_eq!(scanned.entries.len(), 2);
-        assert_eq!(scanned.entries[0].name(), "big.png", "heaviest file sorts first");
+        assert_eq!(
+            scanned.entries[0].name(),
+            "big.png",
+            "heaviest file sorts first"
+        );
         assert!(scanned.entries[0].bytes > scanned.entries[1].bytes);
     }
 
@@ -218,7 +224,10 @@ mod tests {
 
         let scanned = scan(&dir);
         assert_eq!(scanned.entries.len(), 1);
-        assert_eq!(scanned.skipped_raw, 2, "raw is counted, not silently dropped");
+        assert_eq!(
+            scanned.skipped_raw, 2,
+            "raw is counted, not silently dropped"
+        );
     }
 
     #[test]

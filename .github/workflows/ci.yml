@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not hide the state of the others.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # nasm builds rav1e's assembly, dav1d decodes AVIF, libwebp does WebP. The rest
+      # is what gpui needs to link a window on Linux.
+      - name: System dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            nasm libdav1d-dev libwebp-dev \
+            cmake clang pkg-config \
+            libasound2-dev libfontconfig-dev libglib2.0-dev libssl-dev \
+            libvulkan1 libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
+            libxcb1-dev
+
+      - name: System dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm dav1d webp
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # gpui is a git dependency and a large one. Caching it turns a cold ten-minute
+      # build into about a minute.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --check

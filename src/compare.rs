@@ -96,8 +96,8 @@ mod tests {
         .save(&path)
         .unwrap();
 
-        let pair = build(&path, Format::WebP, Quality::lossy(70.), MaxEdge::FULL)
-            .expect("pair builds");
+        let pair =
+            build(&path, Format::WebP, Quality::lossy(70.), MaxEdge::FULL).expect("pair builds");
 
         assert_eq!((pair.width, pair.height), (120, 80));
         // The compare view lines the two up pixel for pixel. If the encoder ever
@@ -119,16 +119,30 @@ mod tests {
             base,
             Key::new(path, Format::WebP, Quality::lossy(80.), MaxEdge::FULL)
         );
-        assert_ne!(base, Key::new(path, Format::Avif, Quality::lossy(80.), MaxEdge::FULL));
-        assert_ne!(base, Key::new(path, Format::WebP, Quality::lossy(60.), MaxEdge::FULL));
-        assert_ne!(base, Key::new(path, Format::WebP, Quality::LOSSLESS, MaxEdge::FULL));
+        assert_ne!(
+            base,
+            Key::new(path, Format::Avif, Quality::lossy(80.), MaxEdge::FULL)
+        );
+        assert_ne!(
+            base,
+            Key::new(path, Format::WebP, Quality::lossy(60.), MaxEdge::FULL)
+        );
+        assert_ne!(
+            base,
+            Key::new(path, Format::WebP, Quality::LOSSLESS, MaxEdge::FULL)
+        );
         assert_ne!(
             base,
             Key::new(path, Format::WebP, Quality::lossy(80.), MaxEdge(Some(1600)))
         );
         assert_ne!(
             base,
-            Key::new(Path::new("/photos/two.png"), Format::WebP, Quality::lossy(80.), MaxEdge::FULL)
+            Key::new(
+                Path::new("/photos/two.png"),
+                Format::WebP,
+                Quality::lossy(80.),
+                MaxEdge::FULL
+            )
         );
     }
 

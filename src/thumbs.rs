@@ -20,7 +20,9 @@ pub fn load(path: &Path, edge: u32) -> Option<Arc<RenderImage>> {
     let decoded = image::open(path).ok()?;
     // `thumbnail` preserves the aspect ratio and fits inside the box.
     let scaled = decoded.thumbnail(edge, edge).into_rgba8();
-    Some(Arc::new(RenderImage::new(vec![Frame::new(to_bgra(scaled))])))
+    Some(Arc::new(RenderImage::new(vec![Frame::new(to_bgra(
+        scaled,
+    ))])))
 }
 
 /// `RenderImage` wants BGRA. The `image` crate gives RGBA. Swap in place rather than

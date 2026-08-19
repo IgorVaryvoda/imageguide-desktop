@@ -13,13 +13,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui::{
-    App, Bounds, Context, FocusHandle, FontWeight, RenderImage, Window, WindowBounds, WindowOptions,
-    div, img, prelude::*, px, rgb, rgba, size, uniform_list, white,
-};
-use gpui_platform::application;
 use compare::Pair;
 use convert::{Format, MaxEdge, Quality};
+use gpui::{
+    App, Bounds, Context, FocusHandle, FontWeight, RenderImage, Window, WindowBounds,
+    WindowOptions, div, img, prelude::*, px, rgb, rgba, size, uniform_list, white,
+};
+use gpui_platform::application;
 use scan::{Entry, format_bytes, format_name};
 
 const BACKGROUND: u32 = 0x14161b;
@@ -101,7 +101,9 @@ fn sort_entries(entries: &mut [Entry], sort: Sort) {
         let ordering = match sort.column {
             Column::Name => a.name().to_lowercase().cmp(&b.name().to_lowercase()),
             Column::Format => format_name(a.format).cmp(format_name(b.format)),
-            Column::Pixels => (a.width as u64 * a.height as u64).cmp(&(b.width as u64 * b.height as u64)),
+            Column::Pixels => {
+                (a.width as u64 * a.height as u64).cmp(&(b.width as u64 * b.height as u64))
+            }
             Column::Density => a
                 .bytes_per_pixel()
                 .partial_cmp(&b.bytes_per_pixel())
@@ -126,6 +128,9 @@ struct Comparison {
     split: f32,
     /// How far the image is dragged from centre, in pixels.
     pan: (f32, f32),
+    /// Display scale. `None` means fit the window; `Some(1.0)` is one image pixel per
+    /// screen pixel. Kept separate so resizing the window keeps "fit" fitting.
+    zoom: Option<f32>,
     /// Pointer position when the current drag began, and the pan it started from.
     drag: Option<((f32, f32), (f32, f32))>,
 }
@@ -150,10 +155,12 @@ impl Audit {
     /// Bytes before and after, counting only the files actually converted. Comparing
     /// against the whole folder mid-run would report a fake saving.
     fn converted_totals(&self) -> (u64, u64) {
-        self.results.iter().fold((0, 0), |(before, after), (index, bytes)| {
-            let source = self.entries.get(*index).map_or(0, |entry| entry.bytes);
-            (before + source, after + bytes)
-        })
+        self.results
+            .iter()
+            .fold((0, 0), |(before, after), (index, bytes)| {
+                let source = self.entries.get(*index).map_or(0, |entry| entry.bytes);
+                (before + source, after + bytes)
+            })
     }
 
     fn start_conversion(&mut self, cx: &mut Context<Self>) {
@@ -261,7 +268,12 @@ impl Audit {
         }
     }
 
-    fn column_header(&self, column: Column, width: Option<f32>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn column_header(
+        &self,
+        column: Column,
+        width: Option<f32>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let active = self.sort.column == column;
         let arrow = if !active {
             ""
@@ -380,6 +392,8 @@ impl Audit {
             pair: None,
             split: 0.5,
             pan: (0., 0.),
+            // Open fitted: you cannot judge a crop of an image you have not seen.
+            zoom: None,
             drag: None,
         });
         cx.notify();
@@ -423,9 +437,9 @@ impl Audit {
         .detach();
     }
 
-    /// Full-window, 1:1 pixels. Fitting a 5568px photo into a 900px window would hide
-    /// exactly the artefacts this view exists to show, so the image is drawn at native
-    /// size and centred, and the divider follows the pointer.
+    /// Full-window comparison. It opens fitted, because you cannot judge a crop of an
+    /// image you have not seen yet, and zooms to 1:1 and beyond — fitting a 5568px
+    /// photo into a 900px window hides exactly the artefacts this view exists to show.
     fn compare_view(
         &self,
         comparison: &Comparison,
@@ -463,28 +477,71 @@ impl Audit {
                     }
                 }),
             )
-            .on_mouse_move(cx.listener(move |audit, event: &gpui::MouseMoveEvent, _, cx| {
-                let Some(comparison) = audit.compare.as_mut() else {
-                    return;
-                };
-                let at = (f32::from(event.position.x), f32::from(event.position.y));
+            .on_scroll_wheel(
+                cx.listener(move |audit, event: &gpui::ScrollWheelEvent, _, cx| {
+                    let Some(comparison) = audit.compare.as_mut() else {
+                        return;
+                    };
+                    let Some(pair) = comparison.pair.as_ref() else {
+                        return;
+                    };
 
-                match comparison.drag {
-                    // Held: pan both sides together, so they stay in register.
-                    Some((from, start_pan)) => {
-                        comparison.pan = (
-                            start_pan.0 + at.0 - from.0,
-                            start_pan.1 + at.1 - from.1,
-                        );
+                    let ticks = match event.delta {
+                        gpui::ScrollDelta::Lines(delta) => delta.y,
+                        gpui::ScrollDelta::Pixels(delta) => f32::from(delta.y) / 40.,
+                    };
+                    if ticks == 0. {
+                        return;
                     }
-                    // Free: the divider tracks the pointer.
-                    None => comparison.split = (at.0 / view_w).clamp(0., 1.),
-                }
-                cx.notify();
-            }));
+
+                    let fit = (view_w / pair.width as f32)
+                        .min(view_h / pair.height as f32)
+                        .min(1.);
+                    let before = comparison.zoom.unwrap_or(fit);
+                    let after = (before * 1.2f32.powf(ticks)).clamp(0.02, 16.);
+
+                    // Keep whatever is under the pointer under the pointer. Without this
+                    // zooming walks the image off screen.
+                    let pointer = (
+                        f32::from(event.position.x) - view_w / 2.,
+                        f32::from(event.position.y) - view_h / 2.,
+                    );
+                    let ratio = after / before;
+                    comparison.pan = (
+                        pointer.0 - (pointer.0 - comparison.pan.0) * ratio,
+                        pointer.1 - (pointer.1 - comparison.pan.1) * ratio,
+                    );
+                    comparison.zoom = Some(after);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |audit, event: &gpui::MouseMoveEvent, _, cx| {
+                    let Some(comparison) = audit.compare.as_mut() else {
+                        return;
+                    };
+                    let at = (f32::from(event.position.x), f32::from(event.position.y));
+
+                    match comparison.drag {
+                        // Held: pan both sides together, so they stay in register.
+                        Some((from, start_pan)) => {
+                            comparison.pan =
+                                (start_pan.0 + at.0 - from.0, start_pan.1 + at.1 - from.1);
+                        }
+                        // Free: the divider tracks the pointer.
+                        None => comparison.split = (at.0 / view_w).clamp(0., 1.),
+                    }
+                    cx.notify();
+                }),
+            );
 
         if let Some(pair) = comparison.pair.as_ref() {
-            let (image_w, image_h) = (pair.width as f32, pair.height as f32);
+            let natural = (pair.width as f32, pair.height as f32);
+            // Fit never scales up: a 400px thumbnail blown across a 4K window is just
+            // a blurry 400px thumbnail.
+            let fit = (view_w / natural.0).min(view_h / natural.1).min(1.);
+            let scale = comparison.zoom.unwrap_or(fit);
+            let (image_w, image_h) = (natural.0 * scale, natural.1 * scale);
             // Negative when the image is larger than the window: that is the crop.
             let left = (view_w - image_w) / 2. + comparison.pan.0;
             let top = (view_h - image_h) / 2. + comparison.pan.1;
@@ -552,32 +609,42 @@ impl Audit {
                 .child(label(
                     px(12.),
                     px(view_h - 32.),
-                    format!("{name} · {image_w}×{image_h} at 1:1 · drag to pan"),
+                    format!(
+                        "{name} · {}×{} · {:.0}%  ·  scroll to zoom · drag to pan · F fit · 1 actual · ← → next",
+                        pair.width,
+                        pair.height,
+                        scale * 100.
+                    ),
                     rgba(MUTED),
                 ));
         } else {
-            stage = stage.child(label(px(12.), px(12.), "decoding…".to_string(), rgba(MUTED)));
+            stage = stage.child(label(
+                px(12.),
+                px(12.),
+                "decoding…".to_string(),
+                rgba(MUTED),
+            ));
         }
 
         stage
             .child(
-            div()
-                .id("compare-close")
-                .absolute()
-                .top(px(8.))
-                .right(px(8.))
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .text_size(px(12.))
-                .bg(rgba(0x000000aa))
-                .text_color(white())
-                .child("close")
-                .on_click(cx.listener(|audit, _, _, cx| {
-                    audit.compare = None;
-                    cx.notify();
-                })),
+                div()
+                    .id("compare-close")
+                    .absolute()
+                    .top(px(8.))
+                    .right(px(8.))
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .bg(rgba(0x000000aa))
+                    .text_color(white())
+                    .child("close")
+                    .on_click(cx.listener(|audit, _, _, cx| {
+                        audit.compare = None;
+                        cx.notify();
+                    })),
             )
             .into_any_element()
     }
@@ -585,13 +652,20 @@ impl Audit {
     fn size_button(&self, max_edge: MaxEdge, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.max_edge == max_edge;
         div()
-            .id(gpui::SharedString::from(format!("size-{}", max_edge.label())))
+            .id(gpui::SharedString::from(format!(
+                "size-{}",
+                max_edge.label()
+            )))
             .px_2()
             .py_1()
             .rounded_md()
             .cursor_pointer()
             .text_size(px(12.))
-            .bg(if selected { rgba(0xffffff1f) } else { rgba(0xffffff08) })
+            .bg(if selected {
+                rgba(0xffffff1f)
+            } else {
+                rgba(0xffffff08)
+            })
             .text_color(if selected { rgb(ACCENT) } else { rgba(MUTED) })
             .child(max_edge.label())
             .on_click(cx.listener(move |audit, _, _, cx| {
@@ -610,7 +684,11 @@ impl Audit {
             .rounded_md()
             .cursor_pointer()
             .text_size(px(12.))
-            .bg(if selected { rgba(0xffffff1f) } else { rgba(0xffffff08) })
+            .bg(if selected {
+                rgba(0xffffff1f)
+            } else {
+                rgba(0xffffff08)
+            })
             .text_color(if selected { rgb(ACCENT) } else { rgba(MUTED) })
             .child(format.label())
             .on_click(cx.listener(move |audit, _, _, cx| {
@@ -630,7 +708,11 @@ impl Audit {
             .rounded_md()
             .cursor_pointer()
             .text_size(px(12.))
-            .bg(if selected { rgba(0xffffff1f) } else { rgba(0xffffff08) })
+            .bg(if selected {
+                rgba(0xffffff1f)
+            } else {
+                rgba(0xffffff08)
+            })
             .text_color(if selected { rgb(ACCENT) } else { rgba(MUTED) })
             .child(quality.label())
             .on_click(cx.listener(move |audit, _, _, cx| {
@@ -695,8 +777,16 @@ impl Audit {
                     .justify_center()
                     .rounded_sm()
                     .border_1()
-                    .border_color(if ticked { rgb(ACCENT) } else { rgba(0xffffff33) })
-                    .bg(if ticked { rgb(ACCENT) } else { rgba(0x00000000) })
+                    .border_color(if ticked {
+                        rgb(ACCENT)
+                    } else {
+                        rgba(0xffffff33)
+                    })
+                    .bg(if ticked {
+                        rgb(ACCENT)
+                    } else {
+                        rgba(0x00000000)
+                    })
                     .text_size(px(10.))
                     .text_color(rgb(BACKGROUND))
                     .child(if ticked { "✓" } else { "" })
@@ -783,7 +873,12 @@ impl Audit {
 }
 
 /// A positioned text overlay for the compare view.
-fn label(left: gpui::Pixels, top: gpui::Pixels, text: String, colour: impl Into<gpui::Hsla>) -> impl IntoElement {
+fn label(
+    left: gpui::Pixels,
+    top: gpui::Pixels,
+    text: String,
+    colour: impl Into<gpui::Hsla>,
+) -> impl IntoElement {
     div()
         .absolute()
         .left(left)
@@ -833,12 +928,18 @@ impl Render for Audit {
                     div()
                         .flex()
                         .gap_2()
-                        .child(self.toolbar_button("empty-folder", "Open folder…", cx, |audit, cx| {
-                            audit.pick(true, cx)
-                        }))
-                        .child(self.toolbar_button("empty-file", "Open image…", cx, |audit, cx| {
-                            audit.pick(false, cx)
-                        })),
+                        .child(self.toolbar_button(
+                            "empty-folder",
+                            "Open folder…",
+                            cx,
+                            |audit, cx| audit.pick(true, cx),
+                        ))
+                        .child(self.toolbar_button(
+                            "empty-file",
+                            "Open image…",
+                            cx,
+                            |audit, cx| audit.pick(false, cx),
+                        )),
                 )
                 .on_drop(cx.listener(|audit, paths: &gpui::ExternalPaths, _, cx| {
                     if let Some(path) = paths.paths().first() {
@@ -865,6 +966,20 @@ impl Render for Audit {
                         }
                         "right" | "down" => audit.step_compare(1, cx),
                         "left" | "up" => audit.step_compare(-1, cx),
+                        "f" => {
+                            if let Some(comparison) = audit.compare.as_mut() {
+                                comparison.zoom = None;
+                                comparison.pan = (0., 0.);
+                                cx.notify();
+                            }
+                        }
+                        "1" => {
+                            if let Some(comparison) = audit.compare.as_mut() {
+                                comparison.zoom = Some(1.);
+                                comparison.pan = (0., 0.);
+                                cx.notify();
+                            }
+                        }
                         _ => {}
                     }
                 }))
@@ -898,25 +1013,21 @@ impl Render for Audit {
                             .text_color(white())
                             .child(self.root.display().to_string()),
                     )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgba(MUTED))
-                            .child(match self.skipped_raw {
-                                0 => format!(
-                                    "{count} images · {}",
-                                    format_bytes(self.total_bytes())
-                                ),
-                                skipped => format!(
-                                    "{count} images · {} · {skipped} camera raw skipped",
-                                    format_bytes(self.total_bytes())
-                                ),
-                            }),
-                    )
+                    .child(div().text_size(px(12.)).text_color(rgba(MUTED)).child(
+                        match self.skipped_raw {
+                            0 => format!("{count} images · {}", format_bytes(self.total_bytes())),
+                            skipped => format!(
+                                "{count} images · {} · {skipped} camera raw skipped",
+                                format_bytes(self.total_bytes())
+                            ),
+                        },
+                    ))
                     .child(div().flex_1())
-                    .child(self.toolbar_button("open-folder", "Folder…", cx, |audit, cx| {
-                        audit.pick(true, cx)
-                    }))
+                    .child(
+                        self.toolbar_button("open-folder", "Folder…", cx, |audit, cx| {
+                            audit.pick(true, cx)
+                        }),
+                    )
                     .child(self.toolbar_button("open-file", "Image…", cx, |audit, cx| {
                         audit.pick(false, cx)
                     })),
@@ -952,7 +1063,11 @@ impl Render for Audit {
                             .text_color(white())
                             .hover(|style| style.bg(rgba(0xffffff33)))
                             .child(if self.converting {
-                                format!("Converting {}/{}", self.results.len() + self.failed, self.targets().len())
+                                format!(
+                                    "Converting {}/{}",
+                                    self.results.len() + self.failed,
+                                    self.targets().len()
+                                )
                             } else if self.selected.is_empty() {
                                 format!("Convert all to {}", self.format.label().to_uppercase())
                             } else {
@@ -965,10 +1080,12 @@ impl Render for Audit {
                             .on_click(cx.listener(|audit, _, _, cx| audit.start_conversion(cx))),
                     )
                     .when(!self.selected.is_empty(), |row| {
-                        row.child(self.toolbar_button("select-none", "Clear", cx, |audit, cx| {
-                            audit.selected.clear();
-                            cx.notify();
-                        }))
+                        row.child(
+                            self.toolbar_button("select-none", "Clear", cx, |audit, cx| {
+                                audit.selected.clear();
+                                cx.notify();
+                            }),
+                        )
                     }),
             )
             .when(!self.results.is_empty(), |shell| {
@@ -979,37 +1096,39 @@ impl Render for Audit {
                 } else {
                     saved as f32 / before as f32 * 100.
                 };
-                shell.child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgb(GOOD))
-                        .child(match self.failed {
-                            0 => format!(
-                                "{} converted · {} → {} · saved {} ({percent:.0}%)",
-                                self.results.len(),
-                                format_bytes(before),
-                                format_bytes(after),
-                                format_bytes(saved)
-                            ),
-                            failed => format!(
-                                "{} converted · saved {} ({percent:.0}%) · {failed} failed",
-                                self.results.len(),
-                                format_bytes(saved)
-                            ),
-                        }),
-                )
+                shell.child(div().text_size(px(12.)).text_color(rgb(GOOD)).child(
+                    match self.failed {
+                        0 => format!(
+                            "{} converted · {} → {} · saved {} ({percent:.0}%)",
+                            self.results.len(),
+                            format_bytes(before),
+                            format_bytes(after),
+                            format_bytes(saved)
+                        ),
+                        failed => format!(
+                            "{} converted · saved {} ({percent:.0}%) · {failed} failed",
+                            self.results.len(),
+                            format_bytes(saved)
+                        ),
+                    },
+                ))
             })
             .when(self.converting, |shell| {
                 let done = (self.results.len() + self.failed) as f32;
                 let total = self.targets().len().max(1) as f32;
                 shell.child(
-                    div().w_full().h(px(3.)).rounded_full().bg(rgba(0xffffff14)).child(
-                        div()
-                            .h_full()
-                            .w(gpui::relative(done / total))
-                            .rounded_full()
-                            .bg(rgb(ACCENT)),
-                    ),
+                    div()
+                        .w_full()
+                        .h(px(3.))
+                        .rounded_full()
+                        .bg(rgba(0xffffff14))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(done / total))
+                                .rounded_full()
+                                .bg(rgb(ACCENT)),
+                        ),
                 )
             })
             .child(
