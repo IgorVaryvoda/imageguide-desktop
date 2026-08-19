@@ -8,10 +8,14 @@ description = "Audit and optimise a folder of images without uploading them anyw
 name = "imageguide"
 path = "src/main.rs"
 
-# gpui has no crates.io release. Pin the revision: the API changes without notice.
+# gpui has no crates.io release, and gpui-component tracks zed's default branch with
+# no revision of its own. Pinning one here would give cargo two different git sources
+# for gpui and two incompatible copies of every type in it. Cargo.lock is what pins
+# the actual commit; CI builds --locked.
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", rev = "7b48fc6822118a361b6094310cf5cbfc1a79c988" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b48fc6822118a361b6094310cf5cbfc1a79c988" }
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 image = { version = "0.25", features = ["avif-native"] }
 ravif = "0.13.0"
 rgb = "0.8.53"
@@ -22,7 +26,7 @@ webp = "0.3.1"
 # rfd's portal backend keeps GTK out of the build there; it does not exist on the
 # other platforms, where rfd's defaults are already the native dialogs.
 [target.'cfg(target_os = "linux")'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b48fc6822118a361b6094310cf5cbfc1a79c988", features = ["wayland", "x11"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["wayland", "x11", "font-kit"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]

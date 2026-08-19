@@ -19,6 +19,11 @@ use gpui::{
     App, Bounds, Context, FocusHandle, FontWeight, RenderImage, Window, WindowBounds,
     WindowOptions, div, img, prelude::*, px, rgb, rgba, size, uniform_list, white,
 };
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
+use gpui_component::progress::Progress;
+use gpui_component::slider::{Slider, SliderEvent, SliderState};
+use gpui_component::{ActiveTheme, Root, Selectable, Sizable};
 use gpui_platform::application;
 use scan::{Entry, format_bytes, format_name};
 
@@ -45,6 +50,9 @@ struct Audit {
     format: Format,
     quality: Quality,
     max_edge: MaxEdge,
+    /// Drives the quality slider. Its own entity, because that is how the component
+    /// reports drags.
+    quality_slider: gpui::Entity<SliderState>,
     /// Rows ticked for conversion. Empty means "all of them".
     selected: HashSet<usize>,
     /// Encoded size per row, filled in as conversion progresses.
@@ -368,17 +376,27 @@ impl Audit {
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
-        div()
-            .id(id)
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .cursor_pointer()
-            .text_size(px(12.))
-            .bg(rgba(0xffffff08))
-            .text_color(rgba(MUTED))
-            .hover(|style| style.bg(rgba(0xffffff1f)).text_color(white()))
-            .child(text)
+        Button::new(id)
+            .ghost()
+            .xsmall()
+            .label(text)
+            .on_click(cx.listener(move |audit, _, _, cx| on_click(audit, cx)))
+    }
+
+    /// A button that stays lit while its value is the active one.
+    fn choice_button(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        label: String,
+        selected: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        Button::new(id)
+            .ghost()
+            .xsmall()
+            .selected(selected)
+            .label(label)
             .on_click(cx.listener(move |audit, _, _, cx| on_click(audit, cx)))
     }
 
@@ -650,75 +668,46 @@ impl Audit {
     }
 
     fn size_button(&self, max_edge: MaxEdge, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self.max_edge == max_edge;
-        div()
-            .id(gpui::SharedString::from(format!(
-                "size-{}",
-                max_edge.label()
-            )))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .cursor_pointer()
-            .text_size(px(12.))
-            .bg(if selected {
-                rgba(0xffffff1f)
-            } else {
-                rgba(0xffffff08)
-            })
-            .text_color(if selected { rgb(ACCENT) } else { rgba(MUTED) })
-            .child(max_edge.label())
-            .on_click(cx.listener(move |audit, _, _, cx| {
+        self.choice_button(
+            gpui::SharedString::from(format!("size-{}", max_edge.label())),
+            max_edge.label(),
+            self.max_edge == max_edge,
+            cx,
+            move |audit, cx| {
                 audit.max_edge = max_edge;
                 audit.results.clear();
                 cx.notify();
-            }))
+            },
+        )
     }
 
     fn format_button(&self, format: Format, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self.format == format;
-        div()
-            .id(gpui::SharedString::from(format.label()))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .cursor_pointer()
-            .text_size(px(12.))
-            .bg(if selected {
-                rgba(0xffffff1f)
-            } else {
-                rgba(0xffffff08)
-            })
-            .text_color(if selected { rgb(ACCENT) } else { rgba(MUTED) })
-            .child(format.label())
-            .on_click(cx.listener(move |audit, _, _, cx| {
+        self.choice_button(
+            gpui::SharedString::from(format.label()),
+            format.label().to_string(),
+            self.format == format,
+            cx,
+            move |audit, cx| {
                 audit.format = format;
                 // Results describe the old format; keeping them would mislabel them.
                 audit.results.clear();
                 cx.notify();
-            }))
+            },
+        )
     }
 
     fn quality_button(&self, quality: Quality, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self.quality == quality;
-        div()
-            .id(gpui::SharedString::from(quality.label()))
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .cursor_pointer()
-            .text_size(px(12.))
-            .bg(if selected {
-                rgba(0xffffff1f)
-            } else {
-                rgba(0xffffff08)
-            })
-            .text_color(if selected { rgb(ACCENT) } else { rgba(MUTED) })
-            .child(quality.label())
-            .on_click(cx.listener(move |audit, _, _, cx| {
+        self.choice_button(
+            gpui::SharedString::from(quality.label()),
+            quality.label(),
+            self.quality == quality,
+            cx,
+            move |audit, cx| {
                 audit.quality = quality;
+                audit.results.clear();
                 cx.notify();
-            }))
+            },
+        )
     }
 
     /// Kick off decoding for a row, unless it is already loaded or in flight.
@@ -916,7 +905,7 @@ impl Render for Audit {
                 .items_center()
                 .justify_center()
                 .gap_4()
-                .bg(rgb(BACKGROUND))
+                .bg(cx.theme().background)
                 .font_family("sans-serif")
                 .child(
                     div()
@@ -993,7 +982,7 @@ impl Render for Audit {
             .flex_col()
             .gap_2()
             .p_4()
-            .bg(rgb(BACKGROUND))
+            .bg(cx.theme().background)
             .font_family("sans-serif")
             .track_focus(&self.focus)
             .on_drop(cx.listener(|audit, paths: &gpui::ExternalPaths, _, cx| {
@@ -1047,8 +1036,18 @@ impl Render for Audit {
                     .child(self.format_button(Format::WebP, cx))
                     .child(self.format_button(Format::Avif, cx))
                     .child(div().w(px(12.)))
-                    .child(self.quality_button(Quality::lossy(60.), cx))
-                    .child(self.quality_button(Quality::lossy(80.), cx))
+                    .child(
+                        div()
+                            .w(px(150.))
+                            .child(Slider::new(&self.quality_slider).horizontal()),
+                    )
+                    .child(
+                        div()
+                            .w(px(64.))
+                            .text_size(px(12.))
+                            .text_color(rgba(MUTED))
+                            .child(self.quality.label()),
+                    )
                     .child(self.quality_button(Quality::LOSSLESS, cx))
                     .child(div().flex_1())
                     .child(
@@ -1116,20 +1115,7 @@ impl Render for Audit {
             .when(self.converting, |shell| {
                 let done = (self.results.len() + self.failed) as f32;
                 let total = self.targets().len().max(1) as f32;
-                shell.child(
-                    div()
-                        .w_full()
-                        .h(px(3.))
-                        .rounded_full()
-                        .bg(rgba(0xffffff14))
-                        .child(
-                            div()
-                                .h_full()
-                                .w(gpui::relative(done / total))
-                                .rounded_full()
-                                .bg(rgb(ACCENT)),
-                        ),
-                )
+                shell.child(Progress::new("convert-progress").value(done / total * 100.))
             })
             .child(
                 div()
@@ -1140,21 +1126,9 @@ impl Render for Audit {
                     .pb_1()
                     .child(
                         // Tick-all sits where the per-row ticks are.
-                        div()
-                            .id("select-all")
-                            .w(px(16.))
-                            .h(px(16.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .border_1()
-                            .border_color(rgba(0xffffff33))
-                            .text_size(px(10.))
-                            .text_color(rgba(MUTED))
-                            .child(if self.selected.is_empty() { "" } else { "−" })
-                            .on_click(cx.listener(|audit, _, _, cx| {
+                        Checkbox::new("select-all")
+                            .checked(!self.selected.is_empty())
+                            .on_click(cx.listener(|audit, _: &bool, _, cx| {
                                 if audit.selected.is_empty() {
                                     audit.selected = (0..audit.entries.len()).collect();
                                 } else {
@@ -1372,6 +1346,12 @@ fn run_window(
     max_edge: MaxEdge,
 ) {
     application().run(move |cx: &mut App| {
+        // Must run before any gpui-component type is constructed.
+        gpui_component::init(cx);
+        // Dark by default. Judging compression against a bright chrome is a bad idea,
+        // and the comparison view is full-bleed imagery either way.
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
         cx.open_window(
             WindowOptions {
@@ -1380,9 +1360,31 @@ fn run_window(
                 ..Default::default()
             },
             |window, cx| {
-                cx.new(|cx| {
+                let audit = cx.new(|cx| {
                     let focus = cx.focus_handle();
                     focus.focus(window, cx);
+
+                    let quality_slider = cx.new(|_| {
+                        SliderState::new()
+                            .min(1.)
+                            .max(100.)
+                            .step(1.)
+                            .default_value(quality.0.unwrap_or(80.))
+                    });
+                    // Dragging the slider is the only thing that changes quality now,
+                    // so results from the old value stop being true the moment it moves.
+                    cx.subscribe(
+                        &quality_slider,
+                        |audit: &mut Audit, _, event: &SliderEvent, cx| {
+                            let SliderEvent::Change(value) = event else {
+                                return;
+                            };
+                            audit.quality = Quality::lossy(value.start());
+                            audit.results.clear();
+                            cx.notify();
+                        },
+                    )
+                    .detach();
                     let mut audit = Audit {
                         root,
                         entries,
@@ -1392,6 +1394,7 @@ fn run_window(
                         format,
                         quality,
                         max_edge,
+                        quality_slider,
                         selected: HashSet::new(),
                         sort: Sort {
                             column: Column::Weight,
@@ -1409,7 +1412,11 @@ fn run_window(
                         audit.open_compare(0, cx);
                     }
                     audit
-                })
+                });
+
+                // Dialogs, notifications and tooltips are drawn by the Root, so the
+                // window's first level has to be one.
+                cx.new(|cx| Root::new(audit, window, cx).bg(cx.theme().background))
             },
         )
         .unwrap();

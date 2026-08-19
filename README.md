@@ -105,7 +105,8 @@ compression, and the resize is not the part you need to eyeball.
 
 ### Around the list
 
-Column headers sort. Clicking the active one reverses it; numeric columns open
+Quality is a slider from 1 to 100, with a separate lossless toggle. Column headers
+sort. Clicking the active one reverses it; numeric columns open
 largest-first and text columns A to Z. Ties fall back to the filename, so equal values
 never reshuffle themselves between sorts.
 
@@ -193,5 +194,9 @@ out of the Linux build while the other platforms use their native dialogs by def
 Only Linux is tested so far. The macOS and Windows builds are believed-correct, not
 verified.
 
-The UI is [GPUI](https://www.gpui.rs), pinned to a Zed revision because it has no
-crates.io release and its API moves without notice.
+The UI is [GPUI](https://www.gpui.rs) with
+[gpui-component](https://github.com/longbridge/gpui-component) for the widgets.
+Neither has a crates.io release, and gpui-component tracks Zed's default branch with
+no revision of its own — pinning one here would hand cargo two different git sources
+for gpui and two incompatible copies of every type in it. `Cargo.lock` pins the
+actual commits; CI builds `--locked`.
