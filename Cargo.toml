@@ -1,0 +1,19 @@
+[package]
+name = "imageguide-desktop"
+version = "0.1.0"
+edition = "2024"
+description = "Audit and optimise a folder of images without uploading them anywhere"
+
+[[bin]]
+name = "imageguide"
+path = "src/main.rs"
+
+# gpui has no crates.io release. Pin the revision: the API changes without notice.
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "7b48fc6822118a361b6094310cf5cbfc1a79c988" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "7b48fc6822118a361b6094310cf5cbfc1a79c988", features = ["wayland"] }
+image = "0.25"
+walkdir = "2"
+
+[profile.release]
+opt-level = 2
