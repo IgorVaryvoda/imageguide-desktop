@@ -48,11 +48,11 @@ const THUMB_SLOT: f32 = 34.;
 // One constant per column, shared by the header and every row. They used to be
 // written twice and had already drifted; a header that sits over the wrong column
 // is worse than no header.
-const W_TICK: f32 = 16.;
-const W_FORMAT: f32 = 62.;
-const W_PIXELS: f32 = 84.;
-const W_DENSITY: f32 = 62.;
-const W_WEIGHT: f32 = 92.;
+const W_TICK: f32 = 34.;
+const W_FORMAT: f32 = 82.;
+const W_PIXELS: f32 = 96.;
+const W_DENSITY: f32 = 74.;
+const W_WEIGHT: f32 = 100.;
 const W_RESULT: f32 = 112.;
 /// The weight bar gets a column of its own. Sharing a cell with the figure meant a
 /// left-grown bar under a right-aligned number — an underline for the heaviest file
@@ -136,6 +136,25 @@ fn meter(
         .value(fraction * 100.)
         .color(colour)
         .h(px(height))
+}
+
+/// One option in a segmented control.
+///
+/// The variant is set per option rather than on the group, because a group applies
+/// its own variant to every child — and an outlined group draws the selected child
+/// in the *active* style, which on a near-black theme is the same colour as the
+/// unselected ones. Which option was chosen has to be legible.
+fn segment(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    selected: bool,
+) -> Button {
+    let button = Button::new(id).label(label).selected(selected);
+    if selected {
+        button.primary()
+    } else {
+        button.ghost()
+    }
 }
 
 /// The faint word that says what a group of controls is for.
@@ -845,7 +864,7 @@ impl Audit {
             .gap_2()
             .flex_shrink_0()
             .child(group_label(label, cx))
-            .child(group.small().outline().compact())
+            .child(group.small().compact())
     }
 
     /// Open the side-by-side view for a row and start building both sides.
@@ -1191,9 +1210,11 @@ impl Audit {
         let options = MaxEdge::PRESETS;
         ButtonGroup::new("resize")
             .children(options.iter().map(|edge| {
-                Button::new(gpui::SharedString::from(edge.label()))
-                    .label(edge.label())
-                    .selected(self.max_edge == *edge)
+                segment(
+                    gpui::SharedString::from(edge.label()),
+                    edge.label(),
+                    self.max_edge == *edge,
+                )
             }))
             .on_click(cx.listener(move |audit, clicked: &Vec<usize>, _, cx| {
                 let Some(edge) = clicked.first().and_then(|index| options.get(*index)) else {
@@ -1210,9 +1231,11 @@ impl Audit {
         let options = [Format::WebP, Format::Avif];
         ButtonGroup::new("format")
             .children(options.iter().map(|format| {
-                Button::new(format.label())
-                    .label(format.label().to_uppercase())
-                    .selected(self.format == *format)
+                segment(
+                    format.label(),
+                    format.label().to_uppercase(),
+                    self.format == *format,
+                )
             }))
             .on_click(cx.listener(move |audit, clicked: &Vec<usize>, _, cx| {
                 let Some(format) = clicked.first().and_then(|index| options.get(*index)) else {
@@ -1387,25 +1410,20 @@ impl Audit {
                                 None => "—".to_string(),
                             }),
                     )
-                    .child(
-                        Button::new("lossless")
-                            .ghost()
-                            .small()
-                            .label("Lossless")
-                            .selected(lossless)
-                            .on_click(cx.listener(|audit, _, _, cx| {
-                                // A second click on a lit toggle has to turn it off,
-                                // or lossless is a one-way door.
-                                audit.quality = if audit.quality == Quality::LOSSLESS {
-                                    Quality::lossy(audit.slider_quality)
-                                } else {
-                                    Quality::LOSSLESS
-                                };
-                                audit.results.clear();
-                                audit.schedule_estimate(cx);
-                                cx.notify();
-                            })),
-                    ),
+                    .child(segment("lossless", "Lossless", lossless).small().on_click(
+                        cx.listener(|audit, _, _, cx| {
+                            // A second click on a lit toggle has to turn it off,
+                            // or lossless is a one-way door.
+                            audit.quality = if audit.quality == Quality::LOSSLESS {
+                                Quality::lossy(audit.slider_quality)
+                            } else {
+                                Quality::LOSSLESS
+                            };
+                            audit.results.clear();
+                            audit.schedule_estimate(cx);
+                            cx.notify();
+                        }),
+                    )),
             )
     }
 
@@ -1599,6 +1617,7 @@ impl Audit {
         Some(
             Alert::warning("notices", parts.join("  ·  "))
                 .icon(IconName::TriangleAlert)
+                .py_1()
                 .into_any_element(),
         )
     }
@@ -1639,6 +1658,10 @@ struct AuditTable {
     /// Weak, because the audit owns the table state, which owns this.
     audit: gpui::WeakEntity<Audit>,
     columns: Vec<TableColumn>,
+    /// Width for the name column, recomputed from the window so the fixed columns
+    /// do not leave an empty strip on the right. Columns here take a width, not a
+    /// share, so somebody has to do the arithmetic.
+    name_width: f32,
 }
 
 /// The columns, in display order. `Column` is what the audit sorts by; this adds the
@@ -1669,13 +1692,15 @@ impl TableColumn {
         }
     }
 
-    fn spec(&self) -> TableCol {
+    fn spec(&self, name_width: f32) -> TableCol {
         match self {
-            TableColumn::Tick => TableCol::new("tick", "").width(px(W_TICK)).p_0(),
-            TableColumn::Thumb => TableCol::new("thumb", "").width(px(THUMB_SLOT)).p_0(),
+            TableColumn::Tick => TableCol::new("tick", "").width(px(W_TICK)),
+            TableColumn::Thumb => TableCol::new("thumb", "").width(px(THUMB_SLOT + 12.)).p_0(),
+            // Name takes whatever the other columns leave, so the window has no dead
+            // strip down its right-hand side.
             TableColumn::Name => TableCol::new("name", "Name")
-                .width(px(240.))
-                .min_width(px(120.))
+                .width(px(name_width))
+                .min_width(px(140.))
                 .sortable()
                 .resizable(true),
             TableColumn::Format => TableCol::new("format", "Format")
@@ -1702,9 +1727,27 @@ impl TableColumn {
 }
 
 impl AuditTable {
-    fn new(audit: gpui::WeakEntity<Audit>) -> Self {
+    /// Everything except the name, which gets the remainder.
+    const FIXED_WIDTH: f32 =
+        W_TICK + THUMB_SLOT + 12. + W_FORMAT + W_PIXELS + W_DENSITY + W_BAR + W_WEIGHT;
+
+    /// Chrome the table spends on gaps, cell padding and its own border.
+    const CHROME: f32 = 30.;
+
+    /// The width left for the name once the fixed columns have taken theirs.
+    ///
+    /// Measured once, when the table is built. It cannot be recomputed during the
+    /// audit's own render: telling the table to re-lay-out makes it ask the delegate
+    /// for its row count, and answering that reads the audit that is mid-render. The
+    /// column is resizable, which covers the rest.
+    fn name_width(window: &Window) -> f32 {
+        (f32::from(window.viewport_size().width) - Self::FIXED_WIDTH - Self::CHROME).max(140.)
+    }
+
+    fn new(audit: gpui::WeakEntity<Audit>, window: &Window) -> Self {
         Self {
             audit,
+            name_width: Self::name_width(window),
             columns: vec![
                 TableColumn::Tick,
                 TableColumn::Thumb,
@@ -1746,7 +1789,7 @@ impl TableDelegate for AuditTable {
         let Some(column) = self.columns.get(col_ix) else {
             return TableCol::new("none", "");
         };
-        let mut spec = column.spec();
+        let mut spec = column.spec(self.name_width);
         // Show the arrow on whichever column the audit is actually ordered by.
         if let Some(sort) = column.sorts_by()
             && let Some(audit) = self.audit.upgrade()
@@ -2201,6 +2244,8 @@ impl Render for Audit {
                     .bg(cx.theme().table)
                     .border_1()
                     .border_color(cx.theme().border)
+                    // Columns take a width, not a share, so the remainder after the
+                    // fixed ones has to be handed to the name column by hand.
                     .child(if self.grid {
                         // The gallery has no columns to speak of, so it stays a
                         // uniform list: one row of tiles per list row.
@@ -2433,6 +2478,157 @@ fn main() {
     });
 }
 
+/// Build the audit view for a window. Shared by the app and the screenshot harness
+/// so that what gets captured is the thing that ships.
+fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entity<Audit> {
+    let Launch {
+        root,
+        entries,
+        skipped_raw,
+        unreadable,
+        open_single,
+        format,
+        quality,
+        max_edge,
+        grid,
+    } = launch;
+
+    let audit = cx.new(|cx| {
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+
+        let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name"));
+        cx.subscribe(
+            &filter_input,
+            |audit: &mut Audit, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = input.read(cx).value().to_string();
+                    audit.set_filter(value, cx);
+                }
+            },
+        )
+        .detach();
+
+        let quality_slider = cx.new(|_| {
+            SliderState::new()
+                .min(1.)
+                .max(100.)
+                .step(1.)
+                .default_value(quality.0.unwrap_or(80.))
+        });
+        // Dragging the slider is the only thing that changes quality now,
+        // so results from the old value stop being true the moment it moves.
+        cx.subscribe(
+            &quality_slider,
+            |audit: &mut Audit, _, event: &SliderEvent, cx| {
+                let SliderEvent::Change(value) = event else {
+                    return;
+                };
+                audit.quality = Quality::lossy(value.start());
+                audit.slider_quality = value.start();
+                audit.results.clear();
+                audit.schedule_estimate(cx);
+                cx.notify();
+            },
+        )
+        .detach();
+        let mislabelled = entries
+            .iter()
+            .filter(|entry| entry.extension_lies())
+            .count();
+        let mut audit = Audit {
+            table: None,
+            root,
+            entries,
+            skipped_raw,
+            heaviest: 0,
+            mislabelled,
+            thumbs: HashMap::new(),
+            requested: HashSet::new(),
+            format,
+            quality,
+            max_edge,
+            quality_slider,
+            selected: HashSet::new(),
+            sort: Sort {
+                column: Column::Weight,
+                descending: true,
+            },
+            visible: Vec::new(),
+            filter: String::new(),
+            filter_input,
+            cursor: 0,
+            anchor: 0,
+            slider_quality: quality.0.unwrap_or(80.),
+            grid,
+            estimate: None,
+            estimate_generation: 0,
+            focus,
+            titled: String::new(),
+            settings: settings::Settings::default(),
+            cached: None,
+            results: HashMap::new(),
+            converting: false,
+            failures: Vec::new(),
+            unreadable,
+            drag_over: false,
+            compare: None,
+        };
+        audit.refresh_visible();
+        audit.schedule_estimate(cx);
+        if open_single {
+            audit.open_compare(0, cx);
+        }
+        audit
+    });
+
+    // Only now that the audit is a live entity, because building the
+    // table asks the delegate how many rows there are and answering
+    // that means reading the audit.
+    let table = {
+        let delegate = AuditTable::new(audit.downgrade(), window);
+        cx.new(|cx| TableState::new(delegate, window, cx))
+    };
+    audit.update(cx, |audit, _| audit.table = Some(table));
+
+    audit
+}
+
+/// Set the library up and pick the colours. Shared with the screenshot harness, so
+/// what that captures is what the window draws.
+fn init_theme(cx: &mut App) {
+    // Must run before any gpui-component type is constructed.
+    gpui_component::init(cx);
+    // Dark by default. Judging compression against a bright chrome is a bad idea,
+    // and the comparison view is full-bleed imagery either way.
+    gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+    // The stock dark theme paints `primary` white, which makes the one button that
+    // commits work a white slab and leaves nothing to point at anything else. This
+    // app already has a blue.
+    //
+    // Both halves of the theme have to be told. A button takes its fill from the
+    // token set and its label from the colour set, so setting one and not the other
+    // is how you get black text on a blue button.
+    let theme = gpui_component::Theme::global_mut(cx);
+    let base = gpui::Hsla::from(gpui::rgb(0x2f6feb));
+    let hover = gpui::Hsla::from(gpui::rgb(0x3f7dfa));
+    let active = gpui::Hsla::from(gpui::rgb(0x2760d4));
+
+    theme.primary = base;
+    theme.primary_hover = hover;
+    theme.primary_active = active;
+    theme.primary_foreground = gpui::white();
+    theme.button_primary = base;
+    theme.button_primary_hover = hover;
+    theme.button_primary_active = active;
+    theme.button_primary_foreground = gpui::white();
+
+    theme.tokens.button_primary = base.into();
+    theme.tokens.button_primary_hover = hover.into();
+    theme.tokens.button_primary_active = active.into();
+    theme.tokens.button_primary_foreground = gpui::white().into();
+}
+
 /// Everything the window needs to open. A struct rather than nine positional
 /// arguments, three of which are `usize` and two of which are `bool`.
 struct Launch {
@@ -2448,38 +2644,12 @@ struct Launch {
 }
 
 fn run_window(launch: Launch) {
-    let Launch {
-        root,
-        entries,
-        skipped_raw,
-        unreadable,
-        open_single,
-        format,
-        quality,
-        max_edge,
-        grid,
-    } = launch;
-
     application()
         // Every `IconName` is an SVG loaded through the app's asset source. Without
         // this the icons resolve to nothing and the toolbar renders as bare words.
         .with_assets(gpui_component_assets::Assets)
         .run(move |cx: &mut App| {
-            // Must run before any gpui-component type is constructed.
-            gpui_component::init(cx);
-            // Dark by default. Judging compression against a bright chrome is a bad idea,
-            // and the comparison view is full-bleed imagery either way.
-            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-            // The stock dark theme paints `primary` white, which makes the one button
-            // that commits work a white slab and leaves nothing to point at anything
-            // else. This app already has a blue.
-            {
-                let theme = gpui_component::Theme::global_mut(cx);
-                theme.primary = gpui::rgb(0x2f6feb).into();
-                theme.primary_hover = gpui::rgb(0x3f7dfa).into();
-                theme.primary_active = gpui::rgb(0x2760d4).into();
-                theme.primary_foreground = gpui::white();
-            }
+            init_theme(cx);
 
             let remembered = settings::load();
             let bounds = Bounds::centered(
@@ -2497,113 +2667,104 @@ fn run_window(launch: Launch) {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let audit = cx.new(|cx| {
-                        let focus = cx.focus_handle();
-                        focus.focus(window, cx);
-
-                        let filter_input =
-                            cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name"));
-                        cx.subscribe(
-                            &filter_input,
-                            |audit: &mut Audit, input, event: &InputEvent, cx| {
-                                if matches!(event, InputEvent::Change) {
-                                    let value = input.read(cx).value().to_string();
-                                    audit.set_filter(value, cx);
-                                }
-                            },
-                        )
-                        .detach();
-
-                        let quality_slider = cx.new(|_| {
-                            SliderState::new()
-                                .min(1.)
-                                .max(100.)
-                                .step(1.)
-                                .default_value(quality.0.unwrap_or(80.))
-                        });
-                        // Dragging the slider is the only thing that changes quality now,
-                        // so results from the old value stop being true the moment it moves.
-                        cx.subscribe(
-                            &quality_slider,
-                            |audit: &mut Audit, _, event: &SliderEvent, cx| {
-                                let SliderEvent::Change(value) = event else {
-                                    return;
-                                };
-                                audit.quality = Quality::lossy(value.start());
-                                audit.slider_quality = value.start();
-                                audit.results.clear();
-                                audit.schedule_estimate(cx);
-                                cx.notify();
-                            },
-                        )
-                        .detach();
-                        let mislabelled = entries
-                            .iter()
-                            .filter(|entry| entry.extension_lies())
-                            .count();
-                        let mut audit = Audit {
-                            table: None,
-                            root,
-                            entries,
-                            skipped_raw,
-                            heaviest: 0,
-                            mislabelled,
-                            thumbs: HashMap::new(),
-                            requested: HashSet::new(),
-                            format,
-                            quality,
-                            max_edge,
-                            quality_slider,
-                            selected: HashSet::new(),
-                            sort: Sort {
-                                column: Column::Weight,
-                                descending: true,
-                            },
-                            visible: Vec::new(),
-                            filter: String::new(),
-                            filter_input,
-                            cursor: 0,
-                            anchor: 0,
-                            slider_quality: quality.0.unwrap_or(80.),
-                            grid,
-                            estimate: None,
-                            estimate_generation: 0,
-                            focus,
-                            titled: String::new(),
-                            settings: settings::Settings::default(),
-                            cached: None,
-                            results: HashMap::new(),
-                            converting: false,
-                            failures: Vec::new(),
-                            unreadable,
-                            drag_over: false,
-                            compare: None,
-                        };
-                        audit.refresh_visible();
-                        audit.schedule_estimate(cx);
-                        if open_single {
-                            audit.open_compare(0, cx);
-                        }
-                        audit
-                    });
-
-                    // Only now that the audit is a live entity, because building the
-                    // table asks the delegate how many rows there are and answering
-                    // that means reading the audit.
-                    let table = {
-                        let delegate = AuditTable::new(audit.downgrade());
-                        cx.new(|cx| TableState::new(delegate, window, cx))
-                    };
-                    audit.update(cx, |audit, _| audit.table = Some(table));
-
-                    // Dialogs, notifications and tooltips are drawn by the Root, so the
-                    // window's first level has to be one.
+                    let audit = build_audit(launch, window, cx);
+                    // Dialogs, notifications and tooltips are drawn by the Root, so
+                    // the window's first level has to be one.
                     cx.new(|cx| Root::new(audit, window, cx).bg(cx.theme().background))
                 },
             )
             .unwrap();
             cx.activate(true);
         });
+}
+
+/// Render the audit window to a PNG, so a change to it can actually be looked at.
+///
+/// gpui draws the frame to a texture and hands back the pixels, which needs no
+/// screen and no screen-recording permission — the alternative was describing the
+/// window to someone else and asking them what they saw.
+///
+///     cargo test --bin imageguide -- --ignored --nocapture screenshot
+///
+/// Set `IMAGEGUIDE_SHOT_DIR` to choose the folder to audit and `IMAGEGUIDE_SHOT_OUT`
+/// to choose where the picture lands.
+#[cfg(test)]
+mod screenshot {
+    use super::*;
+    use gpui::HeadlessAppContext;
+
+    #[test]
+    #[ignore = "renders a window; run it deliberately"]
+    fn screenshot() {
+        let folder = std::env::var("IMAGEGUIDE_SHOT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("imageguide-demo"));
+        let out = std::env::var("IMAGEGUIDE_SHOT_OUT")
+            .unwrap_or_else(|_| "/tmp/imageguide-shot.png".to_string());
+        // Which of the shapes the window can take: list, grid, compare or empty.
+        let mode = std::env::var("IMAGEGUIDE_SHOT_MODE").unwrap_or_else(|_| "list".to_string());
+
+        let mut scanned = scan::scan(&folder);
+        assert!(
+            !scanned.entries.is_empty(),
+            "{} holds no images to draw",
+            folder.display()
+        );
+        // The empty state only appears for a root that is not a folder at all.
+        let root = if mode == "empty" {
+            scanned.entries.clear();
+            PathBuf::new()
+        } else {
+            folder.clone()
+        };
+
+        // A real platform, only for its text system: glyph metrics decide every
+        // width in the window, so a fake one would measure a different layout.
+        let text_system = gpui_platform::current_platform(true).text_system();
+        let mut cx = HeadlessAppContext::with_platform(
+            text_system,
+            std::sync::Arc::new(gpui_component_assets::Assets),
+            gpui_platform::current_headless_renderer,
+        );
+
+        cx.update(init_theme);
+
+        let window = cx
+            .open_window(size(px(1100.), px(720.)), |window, cx| {
+                let audit = build_audit(
+                    Launch {
+                        root: root.clone(),
+                        entries: scanned.entries,
+                        skipped_raw: scanned.skipped_raw,
+                        unreadable: scanned.unreadable,
+                        open_single: mode == "compare",
+                        format: Format::WebP,
+                        quality: Quality::lossy(80.),
+                        max_edge: MaxEdge::FULL,
+                        grid: mode == "grid",
+                    },
+                    window,
+                    cx,
+                );
+                cx.new(|cx| Root::new(audit, window, cx).bg(cx.theme().background))
+            })
+            .expect("window opens");
+
+        // Let the thumbnail decodes and the estimate land before drawing. The
+        // estimate waits out a settling timer first, so the clock has to move.
+        cx.allow_parking();
+        cx.run_until_parked();
+        cx.advance_clock(ESTIMATE_DELAY + Duration::from_millis(200));
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(1200));
+        cx.run_until_parked();
+
+        let image = cx
+            .capture_screenshot(window.into())
+            .expect("frame renders to an image");
+        image.save(&out).expect("png writes");
+        println!("wrote {out} ({}x{})", image.width(), image.height());
+    }
 }
 
 #[cfg(test)]
