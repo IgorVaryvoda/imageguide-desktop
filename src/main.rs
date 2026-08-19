@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, FontWeight, RenderImage, Window, WindowBounds, WindowOptions, div, img,
-    prelude::*, px, rgb, rgba, size, uniform_list, white,
+    App, Bounds, Context, FocusHandle, FontWeight, RenderImage, Window, WindowBounds, WindowOptions,
+    div, img, prelude::*, px, rgb, rgba, size, uniform_list, white,
 };
 use gpui_platform::application;
 use compare::Pair;
@@ -54,10 +54,68 @@ struct Audit {
     failed: usize,
     /// The open side-by-side view, if any.
     compare: Option<Comparison>,
+    /// How the list is ordered.
+    sort: Sort,
+    /// Keyboard target. Without one the window gets no key events at all.
+    focus: FocusHandle,
+    /// Last title pushed to the compositor, so render does not set it every frame.
+    titled: String,
     /// The last pair built, kept so closing and reopening the same image is instant.
     // ponytail: one entry. A pair holds two full-size RGBA buffers — 165 MB for a
     // 5568x3712 photo — so a bigger cache would need a byte budget, not a count.
     cached: Option<(compare::Key, Arc<Pair>)>,
+}
+
+/// List order. Every column is sortable, and clicking the active one reverses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sort {
+    column: Column,
+    descending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Column {
+    Name,
+    Format,
+    Pixels,
+    Density,
+    Weight,
+}
+
+impl Column {
+    fn title(&self) -> &'static str {
+        match self {
+            Column::Name => "Name",
+            Column::Format => "Format",
+            Column::Pixels => "Size",
+            Column::Density => "bpp",
+            Column::Weight => "Weight",
+        }
+    }
+}
+
+/// Order `entries` in place. Ties fall back to the filename so the order is stable
+/// between runs — a list that reshuffles itself is worse than one sorted badly.
+fn sort_entries(entries: &mut [Entry], sort: Sort) {
+    entries.sort_by(|a, b| {
+        let ordering = match sort.column {
+            Column::Name => a.name().to_lowercase().cmp(&b.name().to_lowercase()),
+            Column::Format => format_name(a.format).cmp(format_name(b.format)),
+            Column::Pixels => (a.width as u64 * a.height as u64).cmp(&(b.width as u64 * b.height as u64)),
+            Column::Density => a
+                .bytes_per_pixel()
+                .partial_cmp(&b.bytes_per_pixel())
+                .unwrap_or(std::cmp::Ordering::Equal),
+            Column::Weight => a.bytes.cmp(&b.bytes),
+        }
+        .then_with(|| a.name().cmp(&b.name()));
+
+        if sort.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
 }
 
 struct Comparison {
@@ -167,6 +225,65 @@ impl Audit {
             });
         })
         .detach();
+    }
+
+    /// Re-order the list. Everything keyed by row index is dropped, because those
+    /// indices now point at different files.
+    fn set_sort(&mut self, column: Column, cx: &mut Context<Self>) {
+        self.sort = if self.sort.column == column {
+            Sort {
+                column,
+                descending: !self.sort.descending,
+            }
+        } else {
+            // Numbers open largest-first; names open A to Z.
+            Sort {
+                column,
+                descending: !matches!(column, Column::Name | Column::Format),
+            }
+        };
+        sort_entries(&mut self.entries, self.sort);
+        self.thumbs.clear();
+        self.requested.clear();
+        self.selected.clear();
+        self.results.clear();
+        cx.notify();
+    }
+
+    /// Step to the next or previous image while the comparison is open.
+    fn step_compare(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(current) = self.compare.as_ref().map(|comparison| comparison.index) else {
+            return;
+        };
+        let next = current as isize + delta;
+        if next >= 0 && (next as usize) < self.entries.len() {
+            self.open_compare(next as usize, cx);
+        }
+    }
+
+    fn column_header(&self, column: Column, width: Option<f32>, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.sort.column == column;
+        let arrow = if !active {
+            ""
+        } else if self.sort.descending {
+            " ↓"
+        } else {
+            " ↑"
+        };
+
+        let header = div()
+            .id(gpui::SharedString::from(format!("col-{}", column.title())))
+            .cursor_pointer()
+            .text_size(px(11.))
+            .text_color(if active { rgb(ACCENT) } else { rgba(MUTED) })
+            .hover(|style| style.text_color(white()))
+            .child(format!("{}{arrow}", column.title()))
+            .on_click(cx.listener(move |audit, _, _, cx| audit.set_sort(column, cx)));
+
+        match width {
+            Some(width) => header.w(px(width)),
+            None => header.flex_1().min_w_0(),
+        }
     }
 
     /// Point the audit at a new folder, or a single file. Everything derived from the
@@ -687,6 +804,15 @@ impl Render for Audit {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let count = self.entries.len();
 
+        let title = match self.root.file_name() {
+            Some(name) => format!("{} — ImageGuide", name.to_string_lossy()),
+            None => "ImageGuide".to_string(),
+        };
+        if title != self.titled {
+            window.set_window_title(&title);
+            self.titled = title;
+        }
+
         if self.entries.is_empty() && !self.root.is_dir() {
             return div()
                 .size_full()
@@ -727,7 +853,23 @@ impl Render for Audit {
             // listeners it builds hold a mutable handle to the same entity.
             let view = self.compare_view(&comparison, window, cx);
             self.compare = Some(comparison);
-            return div().size_full().relative().child(view).into_any_element();
+            return div()
+                .size_full()
+                .relative()
+                .track_focus(&self.focus)
+                .on_key_down(cx.listener(|audit, event: &gpui::KeyDownEvent, _, cx| {
+                    match event.keystroke.key.as_str() {
+                        "escape" => {
+                            audit.compare = None;
+                            cx.notify();
+                        }
+                        "right" | "down" => audit.step_compare(1, cx),
+                        "left" | "up" => audit.step_compare(-1, cx),
+                        _ => {}
+                    }
+                }))
+                .child(view)
+                .into_any_element();
         }
 
         div()
@@ -738,6 +880,7 @@ impl Render for Audit {
             .p_4()
             .bg(rgb(BACKGROUND))
             .font_family("sans-serif")
+            .track_focus(&self.focus)
             .on_drop(cx.listener(|audit, paths: &gpui::ExternalPaths, _, cx| {
                 if let Some(path) = paths.paths().first() {
                     audit.open_path(path.clone(), cx);
@@ -856,6 +999,59 @@ impl Render for Audit {
                         }),
                 )
             })
+            .when(self.converting, |shell| {
+                let done = (self.results.len() + self.failed) as f32;
+                let total = self.targets().len().max(1) as f32;
+                shell.child(
+                    div().w_full().h(px(3.)).rounded_full().bg(rgba(0xffffff14)).child(
+                        div()
+                            .h_full()
+                            .w(gpui::relative(done / total))
+                            .rounded_full()
+                            .bg(rgb(ACCENT)),
+                    ),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .pb_1()
+                    .child(
+                        // Tick-all sits where the per-row ticks are.
+                        div()
+                            .id("select-all")
+                            .w(px(16.))
+                            .h(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(rgba(0xffffff33))
+                            .text_size(px(10.))
+                            .text_color(rgba(MUTED))
+                            .child(if self.selected.is_empty() { "" } else { "−" })
+                            .on_click(cx.listener(|audit, _, _, cx| {
+                                if audit.selected.is_empty() {
+                                    audit.selected = (0..audit.entries.len()).collect();
+                                } else {
+                                    audit.selected.clear();
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().w(px(52.)))
+                    .child(self.column_header(Column::Name, None, cx))
+                    .child(self.column_header(Column::Format, Some(52.), cx))
+                    .child(self.column_header(Column::Pixels, Some(96.), cx))
+                    .child(self.column_header(Column::Density, Some(76.), cx))
+                    .child(self.column_header(Column::Weight, Some(76.), cx))
+                    .child(div().w(px(132.))),
+            )
             .child(
                 uniform_list(
                     "images",
@@ -1064,8 +1260,10 @@ fn run_window(
                 app_id: Some("imageguide".to_string()),
                 ..Default::default()
             },
-            |_, cx| {
+            |window, cx| {
                 cx.new(|cx| {
+                    let focus = cx.focus_handle();
+                    focus.focus(window, cx);
                     let mut audit = Audit {
                         root,
                         entries,
@@ -1076,6 +1274,12 @@ fn run_window(
                         quality,
                         max_edge,
                         selected: HashSet::new(),
+                        sort: Sort {
+                            column: Column::Weight,
+                            descending: true,
+                        },
+                        focus,
+                        titled: String::new(),
                         cached: None,
                         results: HashMap::new(),
                         converting: false,
@@ -1092,4 +1296,91 @@ fn run_window(
         .unwrap();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::ImageFormat;
+    use std::path::PathBuf;
+
+    fn entry(name: &str, width: u32, height: u32, bytes: u64, format: ImageFormat) -> Entry {
+        Entry {
+            path: PathBuf::from(name),
+            format,
+            width,
+            height,
+            bytes,
+        }
+    }
+
+    fn names(entries: &[Entry]) -> Vec<String> {
+        entries.iter().map(|entry| entry.name()).collect()
+    }
+
+    #[test]
+    fn weight_sorts_heaviest_first_when_descending() {
+        let mut entries = vec![
+            entry("small.png", 10, 10, 100, ImageFormat::Png),
+            entry("big.png", 10, 10, 900, ImageFormat::Png),
+            entry("mid.png", 10, 10, 500, ImageFormat::Png),
+        ];
+        sort_entries(
+            &mut entries,
+            Sort {
+                column: Column::Weight,
+                descending: true,
+            },
+        );
+        assert_eq!(names(&entries), ["big.png", "mid.png", "small.png"]);
+    }
+
+    #[test]
+    fn name_sorting_ignores_case() {
+        let mut entries = vec![
+            entry("Zebra.png", 1, 1, 1, ImageFormat::Png),
+            entry("apple.png", 1, 1, 1, ImageFormat::Png),
+        ];
+        sort_entries(
+            &mut entries,
+            Sort {
+                column: Column::Name,
+                descending: false,
+            },
+        );
+        assert_eq!(names(&entries), ["apple.png", "Zebra.png"]);
+    }
+
+    /// Equal values must not reshuffle between sorts. A list that reorders itself for
+    /// no visible reason is worse than one sorted badly.
+    #[test]
+    fn ties_fall_back_to_the_filename() {
+        let mut entries = vec![
+            entry("c.png", 4, 4, 200, ImageFormat::Png),
+            entry("a.png", 4, 4, 200, ImageFormat::Png),
+            entry("b.png", 4, 4, 200, ImageFormat::Png),
+        ];
+        let sort = Sort {
+            column: Column::Density,
+            descending: false,
+        };
+        sort_entries(&mut entries, sort);
+        assert_eq!(names(&entries), ["a.png", "b.png", "c.png"]);
+    }
+
+    #[test]
+    fn pixels_sorts_on_area_not_width() {
+        let mut entries = vec![
+            entry("wide.png", 1000, 10, 1, ImageFormat::Png),
+            entry("square.png", 200, 200, 1, ImageFormat::Png),
+        ];
+        sort_entries(
+            &mut entries,
+            Sort {
+                column: Column::Pixels,
+                descending: true,
+            },
+        );
+        assert_eq!(names(&entries), ["square.png", "wide.png"]);
+    }
 }

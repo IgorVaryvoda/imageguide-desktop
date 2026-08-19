@@ -103,6 +103,19 @@ When a size budget is set, the comparison downscales the *original* side too. Ho
 a 6400px source against a 1600px export would measure the resize, not the
 compression, and the resize is not the part you need to eyeball.
 
+### Around the list
+
+Column headers sort. Clicking the active one reverses it; numeric columns open
+largest-first and text columns A to Z. Ties fall back to the filename, so equal values
+never reshuffle themselves between sorts.
+
+In the comparison, **Escape** closes and the **arrow keys** step to the next image,
+which keeps the current format, quality, and size settings — that is the fast way to
+sweep a folder for anything the encoder mangles.
+
+The window title follows the folder, a progress bar runs during conversion, and the
+tick box in the header row selects or clears everything.
+
 ### Choosing what to convert
 
 Tick rows to convert only those. With nothing ticked, Convert takes the whole folder,
