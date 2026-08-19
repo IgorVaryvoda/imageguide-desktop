@@ -91,7 +91,7 @@ mod tests {
         let settings = Settings {
             width: Some(1280.),
             height: Some(720.5),
-            folder: Some(PathBuf::from("/home/igor/Pictures")),
+            folder: Some(PathBuf::from("/photos/library")),
         };
         assert_eq!(parse(&render(&settings)), settings);
     }
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn a_folder_with_spaces_survives() {
         let settings = Settings {
-            folder: Some(PathBuf::from("/home/igor/My Photos")),
+            folder: Some(PathBuf::from("/photos/My Holiday")),
             ..Settings::default()
         };
         assert_eq!(parse(&render(&settings)).folder, settings.folder);
