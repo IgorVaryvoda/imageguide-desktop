@@ -17,6 +17,7 @@ rewrite your files. This one can.
 Audit, thumbnails, and WebP conversion all work.
 
 ```bash
+imageguide                                         # empty state: pick or drop
 imageguide ~/path/to/folder                        # audit, in a window
 imageguide ~/photo.jpg                             # straight into the comparison
 imageguide ~/path/to/folder --convert              # convert to WebP, no window
@@ -24,6 +25,12 @@ imageguide ~/path/to/folder --convert --avif
 imageguide ~/path/to/folder --convert --quality 60
 imageguide ~/path/to/folder --convert --lossless  # WebP only
 ```
+
+Launched with no path it opens on an empty state: **Open folder…**, **Open image…**,
+or drop either onto the window. The same two buttons sit in the toolbar afterwards,
+so you can change folder without restarting. Picking a new one drops every thumbnail
+and result belonging to the old one, because a stale saving next to a new file is a
+lie.
 
 It walks the folder and its subfolders, reads each image's header, and lists what it
 found — heaviest first, because that is where the work is.
@@ -105,7 +112,10 @@ committing to it.
 
 **The view is 1:1.** Fitting a 5568px photo into a 900px window hides exactly the
 artefacts the view exists to show, so both sides are drawn at native size, centred,
-and cropped by the window. Move the pointer to sweep the divider across.
+and cropped by the window.
+
+Move the pointer to sweep the divider across. **Hold the left button and drag to
+pan** — both sides move together, so they never fall out of register.
 
 At q40 on a 12 MB photo the sky goes from grainy to smooth and the file goes to
 262 KB. Whether that is a good trade is a judgement, which is why this shows you
@@ -113,8 +123,10 @@ rather than tells you.
 
 ## Planned
 
-- Panning and zoom in the comparison. It is centred and 1:1 today, with no way to
-  reach a corner of a large image.
+- Zoom in the comparison. It is 1:1 and pannable, but there is no way to back out to
+  a whole-image view.
+- A thumbnail cache. The comparison re-encodes on every open, which stings at AVIF
+  speeds.
 - Spec profiles — "1400×1400, white background, under 250 KB" — for marketplace
   pre-flight.
 
@@ -125,12 +137,21 @@ cargo build --release   # fetches the pinned Rust toolchain on first run
 cargo test
 ```
 
-Needs `nasm` to build `rav1e`'s assembly, and `libwebp` plus `dav1d` at runtime:
+Needs `nasm` to build `rav1e`'s assembly, plus `libwebp` and `dav1d`:
 
 ```bash
-sudo pacman -S nasm libwebp dav1d      # Arch and derivatives
-sudo apt install nasm libwebp-dev libdav1d-dev   # Debian and derivatives
+sudo pacman -S nasm libwebp dav1d                 # Arch and derivatives
+sudo apt install nasm libwebp-dev libdav1d-dev    # Debian and derivatives
+brew install nasm webp dav1d                      # macOS
 ```
+
+Nothing in `src/` is platform-specific. Two dependencies are, and `Cargo.toml` splits
+them by target: gpui's window backends (`wayland` and `x11` are Linux-only features,
+and macOS and Windows pick their own), and `rfd`, whose xdg-portal backend keeps GTK
+out of the Linux build while the other platforms use their native dialogs by default.
+
+Only Linux is tested so far. The macOS and Windows builds are believed-correct, not
+verified.
 
 The UI is [GPUI](https://www.gpui.rs), pinned to a Zed revision because it has no
 crates.io release and its API moves without notice.

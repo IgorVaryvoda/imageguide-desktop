@@ -59,6 +59,10 @@ struct Comparison {
     pair: Option<Pair>,
     /// Where the divider sits, 0 to 1 across the viewport.
     split: f32,
+    /// How far the image is dragged from centre, in pixels.
+    pan: (f32, f32),
+    /// Pointer position when the current drag began, and the pan it started from.
+    drag: Option<((f32, f32), (f32, f32))>,
 }
 
 impl Audit {
@@ -141,6 +145,88 @@ impl Audit {
         .detach();
     }
 
+    /// Point the audit at a new folder, or a single file. Everything derived from the
+    /// old one is dropped: stale thumbnails and conversion results would be lies.
+    fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let single = path.is_file();
+        let (scanned, root) = if single {
+            let Some(entry) = scan::probe(&path) else {
+                return;
+            };
+            let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            (
+                scan::Scan {
+                    entries: vec![entry],
+                    skipped_raw: 0,
+                },
+                parent,
+            )
+        } else if path.is_dir() {
+            (scan::scan(&path), path)
+        } else {
+            return;
+        };
+
+        self.root = root;
+        self.entries = scanned.entries;
+        self.skipped_raw = scanned.skipped_raw;
+        self.thumbs.clear();
+        self.requested.clear();
+        self.results.clear();
+        self.failed = 0;
+        self.compare = None;
+        cx.notify();
+
+        if single {
+            self.open_compare(0, cx);
+        }
+    }
+
+    /// Ask the desktop for a folder or a file. The dialog runs off the main thread so
+    /// the window keeps drawing while it is open.
+    fn pick(&mut self, folders: bool, cx: &mut Context<Self>) {
+        let start = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let chosen = cx
+                .background_executor()
+                .spawn(async move {
+                    let dialog = rfd::FileDialog::new().set_directory(&start);
+                    if folders {
+                        dialog.pick_folder()
+                    } else {
+                        dialog.pick_file()
+                    }
+                })
+                .await;
+
+            if let Some(path) = chosen {
+                let _ = this.update(cx, |audit, cx| audit.open_path(path, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn toolbar_button(
+        &self,
+        id: &'static str,
+        text: &'static str,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(12.))
+            .bg(rgba(0xffffff08))
+            .text_color(rgba(MUTED))
+            .hover(|style| style.bg(rgba(0xffffff1f)).text_color(white()))
+            .child(text)
+            .on_click(cx.listener(move |audit, _, _, cx| on_click(audit, cx)))
+    }
+
     /// Open the side-by-side view for a row and start building both sides.
     fn open_compare(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(path) = self.entries.get(index).map(|entry| entry.path.clone()) else {
@@ -150,6 +236,8 @@ impl Audit {
             index,
             pair: None,
             split: 0.5,
+            pan: (0., 0.),
+            drag: None,
         });
         cx.notify();
 
@@ -195,18 +283,50 @@ impl Audit {
             .inset_0()
             .overflow_hidden()
             .bg(rgb(0x0b0d10))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|audit, event: &gpui::MouseDownEvent, _, cx| {
+                    if let Some(comparison) = audit.compare.as_mut() {
+                        let at = (f32::from(event.position.x), f32::from(event.position.y));
+                        comparison.drag = Some((at, comparison.pan));
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|audit, _: &gpui::MouseUpEvent, _, cx| {
+                    if let Some(comparison) = audit.compare.as_mut() {
+                        comparison.drag = None;
+                        cx.notify();
+                    }
+                }),
+            )
             .on_mouse_move(cx.listener(move |audit, event: &gpui::MouseMoveEvent, _, cx| {
-                if let Some(comparison) = audit.compare.as_mut() {
-                    comparison.split = (f32::from(event.position.x) / view_w).clamp(0., 1.);
-                    cx.notify();
+                let Some(comparison) = audit.compare.as_mut() else {
+                    return;
+                };
+                let at = (f32::from(event.position.x), f32::from(event.position.y));
+
+                match comparison.drag {
+                    // Held: pan both sides together, so they stay in register.
+                    Some((from, start_pan)) => {
+                        comparison.pan = (
+                            start_pan.0 + at.0 - from.0,
+                            start_pan.1 + at.1 - from.1,
+                        );
+                    }
+                    // Free: the divider tracks the pointer.
+                    None => comparison.split = (at.0 / view_w).clamp(0., 1.),
                 }
+                cx.notify();
             }));
 
         if let Some(pair) = comparison.pair.as_ref() {
             let (image_w, image_h) = (pair.width as f32, pair.height as f32);
             // Negative when the image is larger than the window: that is the crop.
-            let left = (view_w - image_w) / 2.;
-            let top = (view_h - image_h) / 2.;
+            let left = (view_w - image_w) / 2. + comparison.pan.0;
+            let top = (view_h - image_h) / 2. + comparison.pan.1;
             let divider = view_w * comparison.split;
 
             let placed = |image: &Arc<gpui::RenderImage>| {
@@ -268,7 +388,12 @@ impl Audit {
                     ),
                     rgb(GOOD),
                 ))
-                .child(label(px(12.), px(view_h - 32.), name, rgba(MUTED)));
+                .child(label(
+                    px(12.),
+                    px(view_h - 32.),
+                    format!("{name} · {image_w}×{image_h} at 1:1 · drag to pan"),
+                    rgba(MUTED),
+                ));
         } else {
             stage = stage.child(label(px(12.), px(12.), "decoding…".to_string(), rgba(MUTED)));
         }
@@ -468,15 +593,53 @@ fn label(left: gpui::Pixels, top: gpui::Pixels, text: String, colour: impl Into<
 }
 
 impl Render for Audit {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    // Three shapes share this method — empty state, comparison, and the list — so it
+    // erases to one type rather than making the caller's `impl Trait` pick a winner.
+    #[allow(refining_impl_trait)]
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let count = self.entries.len();
+
+        if self.entries.is_empty() && !self.root.is_dir() {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_4()
+                .bg(rgb(BACKGROUND))
+                .font_family("sans-serif")
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .text_color(rgba(MUTED))
+                        .child("Drop a folder or an image here"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(self.toolbar_button("empty-folder", "Open folder…", cx, |audit, cx| {
+                            audit.pick(true, cx)
+                        }))
+                        .child(self.toolbar_button("empty-file", "Open image…", cx, |audit, cx| {
+                            audit.pick(false, cx)
+                        })),
+                )
+                .on_drop(cx.listener(|audit, paths: &gpui::ExternalPaths, _, cx| {
+                    if let Some(path) = paths.paths().first() {
+                        audit.open_path(path.clone(), cx);
+                    }
+                }))
+                .into_any_element();
+        }
 
         if let Some(comparison) = self.compare.take() {
             // Taken and put back so the view can borrow `self` immutably while the
             // listeners it builds hold a mutable handle to the same entity.
             let view = self.compare_view(&comparison, window, cx);
             self.compare = Some(comparison);
-            return div().size_full().relative().child(view);
+            return div().size_full().relative().child(view).into_any_element();
         }
 
         div()
@@ -487,10 +650,15 @@ impl Render for Audit {
             .p_4()
             .bg(rgb(BACKGROUND))
             .font_family("sans-serif")
+            .on_drop(cx.listener(|audit, paths: &gpui::ExternalPaths, _, cx| {
+                if let Some(path) = paths.paths().first() {
+                    audit.open_path(path.clone(), cx);
+                }
+            }))
             .child(
                 div()
                     .flex()
-                    .items_baseline()
+                    .items_center()
                     .gap_3()
                     .child(
                         div()
@@ -515,6 +683,13 @@ impl Render for Audit {
                             }),
                     )
                     .child(div().flex_1())
+                    .child(self.toolbar_button("open-folder", "Folder…", cx, |audit, cx| {
+                        audit.pick(true, cx)
+                    }))
+                    .child(self.toolbar_button("open-file", "Image…", cx, |audit, cx| {
+                        audit.pick(false, cx)
+                    }))
+                    .child(div().w(px(12.)))
                     .child(self.format_button(Format::WebP, cx))
                     .child(self.format_button(Format::Avif, cx))
                     .child(div().w(px(12.)))
@@ -584,12 +759,14 @@ impl Render for Audit {
                 )
                 .h_full(),
             )
+            .into_any_element()
     }
 }
 
 /// `imageguide <folder> [--convert] [--quality N | --lossless]`
 struct Args {
-    root: PathBuf,
+    /// `None` when launched with no path: the window opens on its empty state.
+    root: Option<PathBuf>,
     convert: bool,
     format: Format,
     quality: Quality,
@@ -618,7 +795,7 @@ fn parse_args() -> Args {
     }
 
     Args {
-        root: root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+        root,
         convert,
         format,
         quality,
@@ -673,17 +850,26 @@ fn convert_headless(root: &std::path::Path, entries: &[Entry], format: Format, q
 fn main() {
     let args = parse_args();
 
+    let Some(target) = args.root.clone() else {
+        if args.convert {
+            eprintln!("imageguide: --convert needs a folder");
+            std::process::exit(2);
+        }
+        // No path given: open the window on its empty state and let the user pick.
+        return run_window(PathBuf::new(), Vec::new(), 0, false, args.format, args.quality);
+    };
+
     // A single file opens straight into the comparison. A folder opens the audit.
-    let open_single = args.root.is_file();
-    if !args.root.is_dir() && !open_single {
-        eprintln!("imageguide: {} is not a file or folder", args.root.display());
+    let open_single = target.is_file();
+    if !target.is_dir() && !open_single {
+        eprintln!("imageguide: {} is not a file or folder", target.display());
         std::process::exit(2);
     }
 
     let (scanned, root) = if open_single {
-        let parent = args.root.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let Some(entry) = scan::probe(&args.root) else {
-            eprintln!("imageguide: {} is not an image", args.root.display());
+        let parent = target.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let Some(entry) = scan::probe(&target) else {
+            eprintln!("imageguide: {} is not an image", target.display());
             std::process::exit(2);
         };
         (
@@ -694,7 +880,7 @@ fn main() {
             parent,
         )
     } else {
-        (scan::scan(&args.root), args.root.clone())
+        (scan::scan(&target), target.clone())
     };
     let entries = scanned.entries;
     println!(
@@ -709,8 +895,24 @@ fn main() {
         return;
     }
 
-    let quality = args.quality;
-    let format = args.format;
+    run_window(
+        root,
+        entries,
+        scanned.skipped_raw,
+        open_single,
+        args.format,
+        args.quality,
+    );
+}
+
+fn run_window(
+    root: PathBuf,
+    entries: Vec<Entry>,
+    skipped_raw: usize,
+    open_single: bool,
+    format: Format,
+    quality: Quality,
+) {
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
         cx.open_window(
@@ -724,7 +926,7 @@ fn main() {
                     let mut audit = Audit {
                         root,
                         entries,
-                        skipped_raw: scanned.skipped_raw,
+                        skipped_raw,
                         thumbs: HashMap::new(),
                         requested: HashSet::new(),
                         format,
