@@ -7,6 +7,8 @@ to a worker to do the work. That is fine for one screenshot and wrong for a clie
 shoot. This does the same job locally: nothing leaves the machine, and the folder size
 is bounded by the disk rather than by a browser tab.
 
+![The audit](docs/audit.webp)
+
 It is the desktop companion to the site and the
 [Chrome extension](https://chromewebstore.google.com/detail/hinifcidioledficgenmdncpkifnngap).
 The extension audits the images on a page and stops there, because a browser cannot
@@ -179,6 +181,8 @@ current quality setting would produce. The encode happens in memory — nothing 
 written, because the point is to decide whether the trade is acceptable *before*
 committing to it.
 
+![Original against WebP, at 1:1](docs/comparison.webp)
+
 **The view is 1:1.** Fitting a 5568px photo into a 900px window hides exactly the
 artefacts the view exists to show, so both sides are drawn at native size, centred,
 and cropped by the window.
@@ -228,3 +232,10 @@ Neither has a crates.io release, and gpui-component tracks Zed's default branch 
 no revision of its own — pinning one here would hand cargo two different git sources
 for gpui and two incompatible copies of every type in it. `Cargo.lock` pins the
 actual commits; CI builds `--locked`.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
+
+The two screenshots in this README were compressed by this tool — 354 KB of PNG to
+71 KB of WebP at q82.
