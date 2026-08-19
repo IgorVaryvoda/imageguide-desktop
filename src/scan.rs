@@ -9,6 +9,28 @@ use std::path::{Path, PathBuf};
 use image::{ImageFormat, ImageReader};
 use walkdir::WalkDir;
 
+/// Camera raw formats. Most are TIFF containers, so a plain header read reports the
+/// embedded preview — a 6000x4000 NEF comes back as a 160x120 TIFF, which makes every
+/// derived number a lie. They are also not web delivery candidates. Counted, not listed.
+const RAW_EXTENSIONS: [&str; 9] = [
+    "nef", "cr2", "cr3", "arw", "dng", "orf", "rw2", "raf", "srw",
+];
+
+pub fn is_raw(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            RAW_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
+}
+
+/// What a folder holds.
+pub struct Scan {
+    pub entries: Vec<Entry>,
+    /// Camera raw files left out of the list, so the total is not silently short.
+    pub skipped_raw: usize,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     pub path: PathBuf,
@@ -56,18 +78,31 @@ pub fn probe(path: &Path) -> Option<Entry> {
 }
 
 /// Walk a folder and probe every image in it, subfolders included.
-pub fn scan(root: &Path) -> Vec<Entry> {
-    let mut entries: Vec<Entry> = WalkDir::new(root)
+pub fn scan(root: &Path) -> Scan {
+    let mut entries = Vec::new();
+    let mut skipped_raw = 0;
+
+    for file in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
-        .filter_map(|entry| probe(entry.path()))
-        .collect();
+    {
+        if is_raw(file.path()) {
+            skipped_raw += 1;
+            continue;
+        }
+        if let Some(entry) = probe(file.path()) {
+            entries.push(entry);
+        }
+    }
 
     // Heaviest first: the top of the list is the work worth doing.
     entries.sort_by(|a, b| b.bytes.cmp(&a.bytes));
-    entries
+    Scan {
+        entries,
+        skipped_raw,
+    }
 }
 
 /// Human-readable file size. Deliberately not exact: the point is comparison.
@@ -133,9 +168,9 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), "not an image").unwrap();
         write_sample(&dir, "real.png", 8, 8);
 
-        let entries = scan(&dir);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name(), "real.png");
+        let scanned = scan(&dir);
+        assert_eq!(scanned.entries.len(), 1);
+        assert_eq!(scanned.entries[0].name(), "real.png");
     }
 
     #[test]
@@ -145,10 +180,32 @@ mod tests {
         write_sample(&dir, "small.png", 8, 8);
         write_sample(&dir.join("nested"), "big.png", 300, 300);
 
-        let entries = scan(&dir);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name(), "big.png", "heaviest file sorts first");
-        assert!(entries[0].bytes > entries[1].bytes);
+        let scanned = scan(&dir);
+        assert_eq!(scanned.entries.len(), 2);
+        assert_eq!(scanned.entries[0].name(), "big.png", "heaviest file sorts first");
+        assert!(scanned.entries[0].bytes > scanned.entries[1].bytes);
+    }
+
+    #[test]
+    fn camera_raw_is_counted_but_not_listed() {
+        let dir = temp_dir("raw");
+        write_sample(&dir, "keep.png", 8, 8);
+        // A raw file is skipped on its name, before anything tries to decode it.
+        std::fs::write(dir.join("DSC_0001.NEF"), b"not really a nef").unwrap();
+        std::fs::write(dir.join("DSC_0002.cr2"), b"nor this").unwrap();
+
+        let scanned = scan(&dir);
+        assert_eq!(scanned.entries.len(), 1);
+        assert_eq!(scanned.skipped_raw, 2, "raw is counted, not silently dropped");
+    }
+
+    #[test]
+    fn raw_detection_ignores_extension_case() {
+        assert!(is_raw(Path::new("a/DSC_1.NEF")));
+        assert!(is_raw(Path::new("a/DSC_1.nef")));
+        assert!(is_raw(Path::new("a/b.ArW")));
+        assert!(!is_raw(Path::new("a/b.png")));
+        assert!(!is_raw(Path::new("a/b")));
     }
 
     #[test]

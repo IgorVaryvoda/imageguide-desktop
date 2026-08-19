@@ -14,7 +14,7 @@ rewrite your files. This one can.
 
 ## Status
 
-Early. The audit works; conversion is not written yet.
+Early. The audit works, with thumbnails. Conversion is not written yet.
 
 ```bash
 cargo run --release -- ~/path/to/folder
@@ -25,6 +25,7 @@ found — heaviest first, because that is where the work is.
 
 | Column | Meaning |
 |---|---|
+| Thumb | Decoded off the main thread, only for rows the viewport asked for |
 | Format | The real format, read from the file's magic bytes, not its extension |
 | Size | Pixel dimensions |
 | bpp | Bytes on disk per output pixel |
@@ -37,13 +38,21 @@ is a finding, not a display bug. The first folder this was pointed at —
 `bpp` is the quick read on whether a file is carrying weight it does not need. A
 photographic JPEG sits near 0.2. A screenshot saved as PNG can be ten times that.
 
+**Camera raw is counted, not listed.** `.nef`, `.cr2`, `.arw` and friends are TIFF
+containers, so a header read returns the embedded preview — a 6000x4000 NEF reports
+as a 160x120 TIFF and every derived number becomes a lie. They are also not web
+delivery candidates. The header says how many were skipped rather than quietly
+shortening the total.
+
+The list is virtualised, and a row's thumbnail is decoded only once it has been on
+screen. A folder of 6,000 images does not decode 6,000 files.
+
 Reading headers only is deliberate. Decoding a 6000px JPEG to learn that it is 6000px
 wide costs a hundred times what reading its header costs, and a shoot folder holds
 thousands of them.
 
 ## Planned
 
-- Thumbnails, on the GPU, so a folder of a few thousand scrolls at full frame rate.
 - WebP conversion with a real before/after size, written to an output folder.
 - A full-resolution original-versus-converted slider. Judging compression is the
   whole job and it is what a browser is worst at.
