@@ -22,6 +22,7 @@ imageguide ~/path/to/folder                        # audit, in a window
 imageguide ~/photo.jpg                             # straight into the comparison
 imageguide ~/path/to/folder --convert              # convert to WebP, no window
 imageguide ~/path/to/folder --convert --avif
+imageguide ~/path/to/folder --convert --max-edge 1600
 imageguide ~/path/to/folder --convert --quality 60
 imageguide ~/path/to/folder --convert --lossless  # WebP only
 ```
@@ -81,6 +82,33 @@ image paying for a fourth channel.
 A file that grew is reported as grown rather than hidden. Re-encoding an
 already-optimal JPEG usually costs bytes, and that is worth seeing.
 
+### Size first
+
+Most of the weight in a web image is its dimensions, not its format. Re-encoding a
+6400px photo as AVIF still hands back a 6400px photo. The **full / 2400px / 1600px /
+1000px** buttons cap the longest edge before encoding, and that single setting beats
+every format change:
+
+| Same twelve files, q80 | Result |
+|---|---|
+| WebP, full size | 76.0 MB → 4.6 MB (94%) |
+| AVIF, full size | 76.0 MB → 4.1 MB (95%) |
+| AVIF, 1600px | 76.0 MB → **1.1 MB (98%)** |
+
+Downscaling is Lanczos3, not the fast filter used for thumbnails — this one gets
+shipped, and a soft downscale wastes the bytes it saves. It never scales up: an 800px
+source asked to fit 2000px is already inside the budget.
+
+When a size budget is set, the comparison downscales the *original* side too. Holding
+a 6400px source against a 1600px export would measure the resize, not the
+compression, and the resize is not the part you need to eyeball.
+
+### Choosing what to convert
+
+Tick rows to convert only those. With nothing ticked, Convert takes the whole folder,
+so the common case needs no ticking. On a 5,733-image folder you usually want the top
+twenty, which are already at the top.
+
 ### WebP or AVIF
 
 Twelve mixed files from a real photo library — four JPEG photos, four upscaled PNGs,
@@ -125,8 +153,7 @@ rather than tells you.
 
 - Zoom in the comparison. It is 1:1 and pannable, but there is no way to back out to
   a whole-image view.
-- A thumbnail cache. The comparison re-encodes on every open, which stings at AVIF
-  speeds.
+- CI on macOS and Windows. Those builds are believed-correct, not verified.
 - Spec profiles — "1400×1400, white background, under 250 KB" — for marketplace
   pre-flight.
 

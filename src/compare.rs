@@ -9,8 +9,30 @@ use std::sync::Arc;
 use gpui::RenderImage;
 use image::Frame;
 
-use crate::convert::{self, Format, Quality};
+use crate::convert::{self, Format, MaxEdge, Quality};
 use crate::thumbs::to_bgra;
+
+/// Everything that changes what a `Pair` contains. Reopening the same image with the
+/// same settings should not re-encode it, which at AVIF speeds is a two-second wait.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Key {
+    pub path: std::path::PathBuf,
+    pub format: Format,
+    /// Quality as raw bits, because f32 is not `Eq`.
+    pub quality: Option<u32>,
+    pub max_edge: Option<u32>,
+}
+
+impl Key {
+    pub fn new(path: &Path, format: Format, quality: Quality, max_edge: MaxEdge) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            format,
+            quality: quality.0.map(f32::to_bits),
+            max_edge: max_edge.0,
+        }
+    }
+}
 
 pub struct Pair {
     pub original: Arc<RenderImage>,
@@ -33,8 +55,13 @@ impl Pair {
 
 /// Decode `path`, encode it at `quality`, and decode that back, so both sides are
 /// real pixels rather than a promise.
-pub fn build(path: &Path, format: Format, quality: Quality) -> Option<Pair> {
-    let original = image::open(path).ok()?;
+///
+/// When a size budget is set, the *original* side is downscaled too. Comparing a
+/// 6400px source against a 2000px export would measure the resize, not the
+/// compression, and the resize is not the part you need to eyeball. Both sides are
+/// the delivered resolution; only one of them has been through the encoder.
+pub fn build(path: &Path, format: Format, quality: Quality, max_edge: MaxEdge) -> Option<Pair> {
+    let original = max_edge.apply(image::open(path).ok()?);
     let encoded = convert::encode(&original, format, quality)?;
     let decoded = image::load_from_memory(&encoded).ok()?;
 
@@ -69,7 +96,8 @@ mod tests {
         .save(&path)
         .unwrap();
 
-        let pair = build(&path, Format::WebP, Quality::lossy(70.)).expect("pair builds");
+        let pair = build(&path, Format::WebP, Quality::lossy(70.), MaxEdge::FULL)
+            .expect("pair builds");
 
         assert_eq!((pair.width, pair.height), (120, 80));
         // The compare view lines the two up pixel for pixel. If the encoder ever
@@ -78,6 +106,51 @@ mod tests {
         assert_eq!(u32::from(pair.converted.size(0).width), 120);
         assert_eq!(u32::from(pair.converted.size(0).height), 80);
         assert!(pair.converted_bytes > 0);
+    }
+
+    /// The cache is only correct if the key notices every setting that changes the
+    /// output. A missed field would serve a WebP pair for an AVIF request.
+    #[test]
+    fn cache_keys_separate_every_setting() {
+        let path = Path::new("/photos/one.png");
+        let base = Key::new(path, Format::WebP, Quality::lossy(80.), MaxEdge::FULL);
+
+        assert_eq!(
+            base,
+            Key::new(path, Format::WebP, Quality::lossy(80.), MaxEdge::FULL)
+        );
+        assert_ne!(base, Key::new(path, Format::Avif, Quality::lossy(80.), MaxEdge::FULL));
+        assert_ne!(base, Key::new(path, Format::WebP, Quality::lossy(60.), MaxEdge::FULL));
+        assert_ne!(base, Key::new(path, Format::WebP, Quality::LOSSLESS, MaxEdge::FULL));
+        assert_ne!(
+            base,
+            Key::new(path, Format::WebP, Quality::lossy(80.), MaxEdge(Some(1600)))
+        );
+        assert_ne!(
+            base,
+            Key::new(Path::new("/photos/two.png"), Format::WebP, Quality::lossy(80.), MaxEdge::FULL)
+        );
+    }
+
+    #[test]
+    fn a_size_budget_shrinks_both_sides_together() {
+        let dir = std::env::temp_dir().join("imageguide-compare-resize");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide.png");
+        ImageBuffer::from_fn(400, 200, |x, y| Rgb([(x % 256) as u8, (y % 256) as u8, 40]))
+            .save(&path)
+            .unwrap();
+
+        let pair = build(&path, Format::WebP, Quality::lossy(70.), MaxEdge(Some(100)))
+            .expect("pair builds");
+
+        assert_eq!((pair.width, pair.height), (100, 50));
+        assert_eq!(u32::from(pair.original.size(0).width), 100);
+        assert_eq!(
+            u32::from(pair.converted.size(0).width),
+            100,
+            "both sides must be the delivered size or the divider compares nothing"
+        );
     }
 
     #[test]

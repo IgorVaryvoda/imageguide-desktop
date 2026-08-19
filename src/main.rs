@@ -19,7 +19,7 @@ use gpui::{
 };
 use gpui_platform::application;
 use compare::Pair;
-use convert::{Format, Quality};
+use convert::{Format, MaxEdge, Quality};
 use scan::{Entry, format_bytes, format_name};
 
 const BACKGROUND: u32 = 0x14161b;
@@ -44,6 +44,9 @@ struct Audit {
     requested: HashSet<usize>,
     format: Format,
     quality: Quality,
+    max_edge: MaxEdge,
+    /// Rows ticked for conversion. Empty means "all of them".
+    selected: HashSet<usize>,
     /// Encoded size per row, filled in as conversion progresses.
     results: HashMap<usize, u64>,
     converting: bool,
@@ -51,12 +54,16 @@ struct Audit {
     failed: usize,
     /// The open side-by-side view, if any.
     compare: Option<Comparison>,
+    /// The last pair built, kept so closing and reopening the same image is instant.
+    // ponytail: one entry. A pair holds two full-size RGBA buffers — 165 MB for a
+    // 5568x3712 photo — so a bigger cache would need a byte budget, not a count.
+    cached: Option<(compare::Key, Arc<Pair>)>,
 }
 
 struct Comparison {
     index: usize,
     /// `None` while the two sides are still decoding.
-    pair: Option<Pair>,
+    pair: Option<Arc<Pair>>,
     /// Where the divider sits, 0 to 1 across the viewport.
     split: f32,
     /// How far the image is dragged from centre, in pixels.
@@ -68,6 +75,18 @@ struct Comparison {
 impl Audit {
     fn total_bytes(&self) -> u64 {
         self.entries.iter().map(|entry| entry.bytes).sum()
+    }
+
+    /// The rows a conversion would touch. An empty selection means the whole folder,
+    /// so the common case needs no ticking.
+    fn targets(&self) -> Vec<usize> {
+        if self.selected.is_empty() {
+            (0..self.entries.len()).collect()
+        } else {
+            let mut rows: Vec<usize> = self.selected.iter().copied().collect();
+            rows.sort_unstable();
+            rows
+        }
     }
 
     /// Bytes before and after, counting only the files actually converted. Comparing
@@ -92,11 +111,11 @@ impl Audit {
         let out_dir = self.root.join(scan::OUTPUT_DIR);
         let quality = self.quality;
         let format = self.format;
+        let max_edge = self.max_edge;
         let sources: Vec<(usize, PathBuf)> = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (index, entry.path.clone()))
+            .targets()
+            .into_iter()
+            .filter_map(|index| Some((index, self.entries.get(index)?.path.clone())))
             .collect();
 
         cx.spawn(async move |this, cx| {
@@ -109,7 +128,12 @@ impl Audit {
                         let (index, path) = (*index, path.clone());
                         let (root, out_dir) = (root.clone(), out_dir.clone());
                         cx.background_executor().spawn(async move {
-                            (index, convert::convert_file(&root, &path, &out_dir, format, quality))
+                            (
+                                index,
+                                convert::convert_file(
+                                    &root, &path, &out_dir, format, quality, max_edge,
+                                ),
+                            )
                         })
                     })
                     .collect();
@@ -172,9 +196,11 @@ impl Audit {
         self.skipped_raw = scanned.skipped_raw;
         self.thumbs.clear();
         self.requested.clear();
+        self.selected.clear();
         self.results.clear();
         self.failed = 0;
         self.compare = None;
+        self.cached = None;
         cx.notify();
 
         if single {
@@ -243,13 +269,31 @@ impl Audit {
 
         let quality = self.quality;
         let format = self.format;
+        let max_edge = self.max_edge;
+        let key = compare::Key::new(&path, format, quality, max_edge);
+
+        // Same image, same settings: skip the encoder entirely.
+        if let Some((cached_key, pair)) = self.cached.as_ref()
+            && *cached_key == key
+        {
+            if let Some(comparison) = self.compare.as_mut() {
+                comparison.pair = Some(pair.clone());
+            }
+            cx.notify();
+            return;
+        }
+
         cx.spawn(async move |this, cx| {
             let built = cx
                 .background_executor()
-                .spawn(async move { compare::build(&path, format, quality) })
-                .await;
+                .spawn(async move { compare::build(&path, format, quality, max_edge) })
+                .await
+                .map(Arc::new);
 
             let _ = this.update(cx, |audit, cx| {
+                if let Some(pair) = built.as_ref() {
+                    audit.cached = Some((key, pair.clone()));
+                }
                 // Ignore a result the user already navigated away from.
                 if let Some(comparison) = audit.compare.as_mut()
                     && comparison.index == index
@@ -421,6 +465,25 @@ impl Audit {
             .into_any_element()
     }
 
+    fn size_button(&self, max_edge: MaxEdge, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.max_edge == max_edge;
+        div()
+            .id(gpui::SharedString::from(format!("size-{}", max_edge.label())))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(12.))
+            .bg(if selected { rgba(0xffffff1f) } else { rgba(0xffffff08) })
+            .text_color(if selected { rgb(ACCENT) } else { rgba(MUTED) })
+            .child(max_edge.label())
+            .on_click(cx.listener(move |audit, _, _, cx| {
+                audit.max_edge = max_edge;
+                audit.results.clear();
+                cx.notify();
+            }))
+    }
+
     fn format_button(&self, format: Format, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.format == format;
         div()
@@ -504,6 +567,31 @@ impl Audit {
             .hover(|style| style.bg(rgba(0xffffff14)))
             .on_click(cx.listener(move |audit, _, _, cx| audit.open_compare(index, cx)))
             .text_size(px(12.))
+            .child({
+                let ticked = self.selected.contains(&index);
+                div()
+                    .id(("tick", index))
+                    .w(px(16.))
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(if ticked { rgb(ACCENT) } else { rgba(0xffffff33) })
+                    .bg(if ticked { rgb(ACCENT) } else { rgba(0x00000000) })
+                    .text_size(px(10.))
+                    .text_color(rgb(BACKGROUND))
+                    .child(if ticked { "✓" } else { "" })
+                    .on_click(cx.listener(move |audit, _, _, cx| {
+                        // Without this the click also opens the comparison behind it.
+                        cx.stop_propagation();
+                        if !audit.selected.remove(&index) {
+                            audit.selected.insert(index);
+                        }
+                        cx.notify();
+                    }))
+            })
             .child(
                 // A fixed slot, so rows do not jump as thumbnails arrive.
                 div()
@@ -688,7 +776,19 @@ impl Render for Audit {
                     }))
                     .child(self.toolbar_button("open-file", "Image…", cx, |audit, cx| {
                         audit.pick(false, cx)
-                    }))
+                    })),
+            )
+            .child(
+                // Controls get their own line. Thirteen of them on the title row ran
+                // the Convert button off the right edge of the window.
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(self.size_button(MaxEdge::FULL, cx))
+                    .child(self.size_button(MaxEdge(Some(2400)), cx))
+                    .child(self.size_button(MaxEdge(Some(1600)), cx))
+                    .child(self.size_button(MaxEdge(Some(1000)), cx))
                     .child(div().w(px(12.)))
                     .child(self.format_button(Format::WebP, cx))
                     .child(self.format_button(Format::Avif, cx))
@@ -696,6 +796,7 @@ impl Render for Audit {
                     .child(self.quality_button(Quality::lossy(60.), cx))
                     .child(self.quality_button(Quality::lossy(80.), cx))
                     .child(self.quality_button(Quality::LOSSLESS, cx))
+                    .child(div().flex_1())
                     .child(
                         div()
                             .id("convert")
@@ -708,12 +809,24 @@ impl Render for Audit {
                             .text_color(white())
                             .hover(|style| style.bg(rgba(0xffffff33)))
                             .child(if self.converting {
-                                format!("Converting {}/{count}", self.results.len() + self.failed)
+                                format!("Converting {}/{}", self.results.len() + self.failed, self.targets().len())
+                            } else if self.selected.is_empty() {
+                                format!("Convert all to {}", self.format.label().to_uppercase())
                             } else {
-                                format!("Convert to {}", self.format.label().to_uppercase())
+                                format!(
+                                    "Convert {} to {}",
+                                    self.selected.len(),
+                                    self.format.label().to_uppercase()
+                                )
                             })
                             .on_click(cx.listener(|audit, _, _, cx| audit.start_conversion(cx))),
-                    ),
+                    )
+                    .when(!self.selected.is_empty(), |row| {
+                        row.child(self.toolbar_button("select-none", "Clear", cx, |audit, cx| {
+                            audit.selected.clear();
+                            cx.notify();
+                        }))
+                    }),
             )
             .when(!self.results.is_empty(), |shell| {
                 let (before, after) = self.converted_totals();
@@ -757,7 +870,7 @@ impl Render for Audit {
                             .collect::<Vec<_>>()
                     }),
                 )
-                .h_full(),
+                .flex_1(),
             )
             .into_any_element()
     }
@@ -770,6 +883,7 @@ struct Args {
     convert: bool,
     format: Format,
     quality: Quality,
+    max_edge: MaxEdge,
 }
 
 fn parse_args() -> Args {
@@ -777,12 +891,18 @@ fn parse_args() -> Args {
     let mut convert = false;
     let mut format = Format::WebP;
     let mut quality = Quality::lossy(80.);
+    let mut max_edge = MaxEdge::FULL;
     let mut rest = std::env::args().skip(1);
 
     while let Some(argument) = rest.next() {
         match argument.as_str() {
             "--convert" => convert = true,
             "--avif" => format = Format::Avif,
+            "--max-edge" => {
+                if let Some(value) = rest.next().and_then(|value| value.parse().ok()) {
+                    max_edge = MaxEdge(Some(value));
+                }
+            }
             "--webp" => format = Format::WebP,
             "--lossless" => quality = Quality::LOSSLESS,
             "--quality" => {
@@ -799,23 +919,35 @@ fn parse_args() -> Args {
         convert,
         format,
         quality,
+        max_edge,
     }
 }
 
 /// Convert without opening a window, so the same work is scriptable and testable.
-fn convert_headless(root: &std::path::Path, entries: &[Entry], format: Format, quality: Quality) {
+fn convert_headless(
+    root: &std::path::Path,
+    entries: &[Entry],
+    format: Format,
+    quality: Quality,
+    max_edge: MaxEdge,
+) {
     let out_dir = root.join(scan::OUTPUT_DIR);
     let (mut before, mut after, mut failed) = (0u64, 0u64, 0usize);
 
     for entry in entries {
-        match convert::convert_file(root, &entry.path, &out_dir, format, quality) {
+        match convert::convert_file(root, &entry.path, &out_dir, format, quality, max_edge) {
             Some(converted) => {
                 before += entry.bytes;
                 after += converted.bytes;
                 let delta = entry.bytes as i64 - converted.bytes as i64;
                 let percent = delta as f64 / entry.bytes.max(1) as f64 * 100.;
+                let resized = if converted.width == entry.width {
+                    String::new()
+                } else {
+                    format!("  {}x{}", converted.width, converted.height)
+                };
                 println!(
-                    "{:<52} {:>9} -> {:>9}  {percent:+.0}%",
+                    "{:<52} {:>9} -> {:>9}  {percent:+.0}%{resized}",
                     entry.name(),
                     format_bytes(entry.bytes),
                     format_bytes(converted.bytes)
@@ -831,10 +963,11 @@ fn convert_headless(root: &std::path::Path, entries: &[Entry], format: Format, q
     let saved = before.saturating_sub(after);
     let percent = saved as f64 / before.max(1) as f64 * 100.;
     println!(
-        "\n{} converted to {} at {}: {} -> {}, saved {} ({percent:.0}%){}",
+        "\n{} converted to {} at {} ({}): {} -> {}, saved {} ({percent:.0}%){}",
         entries.len() - failed,
         format.label(),
         quality.label(),
+        max_edge.label(),
         format_bytes(before),
         format_bytes(after),
         format_bytes(saved),
@@ -856,7 +989,15 @@ fn main() {
             std::process::exit(2);
         }
         // No path given: open the window on its empty state and let the user pick.
-        return run_window(PathBuf::new(), Vec::new(), 0, false, args.format, args.quality);
+        return run_window(
+            PathBuf::new(),
+            Vec::new(),
+            0,
+            false,
+            args.format,
+            args.quality,
+            args.max_edge,
+        );
     };
 
     // A single file opens straight into the comparison. A folder opens the audit.
@@ -891,7 +1032,7 @@ fn main() {
     );
 
     if args.convert {
-        convert_headless(&root, &entries, args.format, args.quality);
+        convert_headless(&root, &entries, args.format, args.quality, args.max_edge);
         return;
     }
 
@@ -902,6 +1043,7 @@ fn main() {
         open_single,
         args.format,
         args.quality,
+        args.max_edge,
     );
 }
 
@@ -912,6 +1054,7 @@ fn run_window(
     open_single: bool,
     format: Format,
     quality: Quality,
+    max_edge: MaxEdge,
 ) {
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
@@ -931,6 +1074,9 @@ fn run_window(
                         requested: HashSet::new(),
                         format,
                         quality,
+                        max_edge,
+                        selected: HashSet::new(),
+                        cached: None,
                         results: HashMap::new(),
                         converting: false,
                         failed: 0,

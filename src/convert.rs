@@ -35,6 +35,39 @@ impl Quality {
     }
 }
 
+/// Longest edge of the exported image. `None` leaves the source alone.
+///
+/// This is where most of the weight actually is. Re-encoding a 6400px photo as AVIF
+/// still hands back a 6400px photo, which is the wrong image for a web page however
+/// well it is compressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaxEdge(pub Option<u32>);
+
+impl MaxEdge {
+    pub const FULL: Self = Self(None);
+
+    pub fn label(&self) -> String {
+        match self.0 {
+            None => "full".to_string(),
+            Some(edge) => format!("{edge}px"),
+        }
+    }
+
+    /// Scale `image` down to fit. Never scales up: an 800px source asked to fit 2000px
+    /// is already inside the budget, and stretching it would invent detail.
+    pub fn apply(&self, image: DynamicImage) -> DynamicImage {
+        let Some(edge) = self.0 else {
+            return image;
+        };
+        if image.width().max(image.height()) <= edge {
+            return image;
+        }
+        // Lanczos3 rather than the fast filter used for thumbnails: this one is what
+        // gets shipped, and a soft downscale wastes the bytes it saves.
+        image.resize(edge, edge, image::imageops::FilterType::Lanczos3)
+    }
+}
+
 /// The container to write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -63,6 +96,9 @@ impl Format {
 pub struct Converted {
     pub written: PathBuf,
     pub bytes: u64,
+    /// Dimensions actually written, which differ from the source when resizing.
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Encode `image` in `format`. Returns the encoded bytes.
@@ -131,8 +167,10 @@ pub fn convert_file(
     out_dir: &Path,
     format: Format,
     quality: Quality,
+    max_edge: MaxEdge,
 ) -> Option<Converted> {
-    let decoded = image::open(source).ok()?;
+    let decoded = max_edge.apply(image::open(source).ok()?);
+    let (width, height) = (decoded.width(), decoded.height());
     let encoded = encode(&decoded, format, quality)?;
 
     let written = output_path(root, source, out_dir, format);
@@ -142,6 +180,8 @@ pub fn convert_file(
     Some(Converted {
         written,
         bytes: encoded.len() as u64,
+        width,
+        height,
     })
 }
 
@@ -266,8 +306,15 @@ mod tests {
         photo(400, 400).save(&source).unwrap();
         let out = dir.join("optimised");
 
-        let converted = convert_file(&dir, &source, &out, Format::WebP, Quality::lossy(75.))
-            .expect("conversion runs");
+        let converted = convert_file(
+            &dir,
+            &source,
+            &out,
+            Format::WebP,
+            Quality::lossy(75.),
+            MaxEdge::FULL,
+        )
+        .expect("conversion runs");
 
         assert_eq!(converted.written, out.join("big.webp"));
         assert!(converted.written.exists(), "the file is actually on disk");
@@ -279,6 +326,43 @@ mod tests {
         // Not asserting it shrank: this source is pure noise, which is the one input
         // that legitimately does not compress. Size correctness is covered above.
         assert!(converted.bytes > 0);
+    }
+
+    #[test]
+    fn max_edge_scales_down_and_keeps_the_aspect_ratio() {
+        let scaled = MaxEdge(Some(100)).apply(photo(400, 200));
+        assert_eq!((scaled.width(), scaled.height()), (100, 50));
+    }
+
+    #[test]
+    fn max_edge_never_scales_up() {
+        let untouched = MaxEdge(Some(4000)).apply(photo(80, 60));
+        assert_eq!(
+            (untouched.width(), untouched.height()),
+            (80, 60),
+            "a small source must not be stretched to fill the budget"
+        );
+        let full = MaxEdge::FULL.apply(photo(80, 60));
+        assert_eq!((full.width(), full.height()), (80, 60));
+    }
+
+    #[test]
+    fn resizing_is_reported_in_the_result() {
+        let dir = temp_dir("resize");
+        let source = dir.join("wide.png");
+        photo(600, 300).save(&source).unwrap();
+
+        let converted = convert_file(
+            &dir,
+            &source,
+            &dir.join("out"),
+            Format::WebP,
+            Quality::lossy(80.),
+            MaxEdge(Some(200)),
+        )
+        .expect("conversion runs");
+
+        assert_eq!((converted.width, converted.height), (200, 100));
     }
 
     #[test]
