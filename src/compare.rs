@@ -9,7 +9,7 @@ use std::sync::Arc;
 use gpui::RenderImage;
 use image::Frame;
 
-use crate::convert::{self, Quality};
+use crate::convert::{self, Format, Quality};
 use crate::thumbs::to_bgra;
 
 pub struct Pair {
@@ -33,9 +33,9 @@ impl Pair {
 
 /// Decode `path`, encode it at `quality`, and decode that back, so both sides are
 /// real pixels rather than a promise.
-pub fn build(path: &Path, quality: Quality) -> Option<Pair> {
+pub fn build(path: &Path, format: Format, quality: Quality) -> Option<Pair> {
     let original = image::open(path).ok()?;
-    let encoded = convert::encode(&original, quality)?;
+    let encoded = convert::encode(&original, format, quality)?;
     let decoded = image::load_from_memory(&encoded).ok()?;
 
     let (width, height) = (original.width(), original.height());
@@ -69,7 +69,7 @@ mod tests {
         .save(&path)
         .unwrap();
 
-        let pair = build(&path, Quality::lossy(70.)).expect("pair builds");
+        let pair = build(&path, Format::WebP, Quality::lossy(70.)).expect("pair builds");
 
         assert_eq!((pair.width, pair.height), (120, 80));
         // The compare view lines the two up pixel for pixel. If the encoder ever

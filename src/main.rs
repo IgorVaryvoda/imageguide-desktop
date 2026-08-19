@@ -19,7 +19,7 @@ use gpui::{
 };
 use gpui_platform::application;
 use compare::Pair;
-use convert::Quality;
+use convert::{Format, Quality};
 use scan::{Entry, format_bytes, format_name};
 
 const BACKGROUND: u32 = 0x14161b;
@@ -42,6 +42,7 @@ struct Audit {
     /// Rows already handed to a background thread, so scrolling past one twice does
     /// not decode it twice.
     requested: HashSet<usize>,
+    format: Format,
     quality: Quality,
     /// Encoded size per row, filled in as conversion progresses.
     results: HashMap<usize, u64>,
@@ -86,6 +87,7 @@ impl Audit {
         let root = self.root.clone();
         let out_dir = self.root.join(scan::OUTPUT_DIR);
         let quality = self.quality;
+        let format = self.format;
         let sources: Vec<(usize, PathBuf)> = self
             .entries
             .iter()
@@ -103,7 +105,7 @@ impl Audit {
                         let (index, path) = (*index, path.clone());
                         let (root, out_dir) = (root.clone(), out_dir.clone());
                         cx.background_executor().spawn(async move {
-                            (index, convert::convert_file(&root, &path, &out_dir, quality))
+                            (index, convert::convert_file(&root, &path, &out_dir, format, quality))
                         })
                     })
                     .collect();
@@ -152,10 +154,11 @@ impl Audit {
         cx.notify();
 
         let quality = self.quality;
+        let format = self.format;
         cx.spawn(async move |this, cx| {
             let built = cx
                 .background_executor()
-                .spawn(async move { compare::build(&path, quality) })
+                .spawn(async move { compare::build(&path, format, quality) })
                 .await;
 
             let _ = this.update(cx, |audit, cx| {
@@ -257,7 +260,8 @@ impl Audit {
                     px(view_w - 240.),
                     px(12.),
                     format!(
-                        "webp {} · {} · {:+.0}%",
+                        "{} {} · {} · {:+.0}%",
+                        self.format.label(),
                         self.quality.label(),
                         format_bytes(pair.converted_bytes),
                         pair.saving_percent(source_bytes)
@@ -290,6 +294,26 @@ impl Audit {
                 })),
             )
             .into_any_element()
+    }
+
+    fn format_button(&self, format: Format, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.format == format;
+        div()
+            .id(gpui::SharedString::from(format.label()))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(12.))
+            .bg(if selected { rgba(0xffffff1f) } else { rgba(0xffffff08) })
+            .text_color(if selected { rgb(ACCENT) } else { rgba(MUTED) })
+            .child(format.label())
+            .on_click(cx.listener(move |audit, _, _, cx| {
+                audit.format = format;
+                // Results describe the old format; keeping them would mislabel them.
+                audit.results.clear();
+                cx.notify();
+            }))
     }
 
     fn quality_button(&self, quality: Quality, cx: &mut Context<Self>) -> impl IntoElement {
@@ -491,6 +515,9 @@ impl Render for Audit {
                             }),
                     )
                     .child(div().flex_1())
+                    .child(self.format_button(Format::WebP, cx))
+                    .child(self.format_button(Format::Avif, cx))
+                    .child(div().w(px(12.)))
                     .child(self.quality_button(Quality::lossy(60.), cx))
                     .child(self.quality_button(Quality::lossy(80.), cx))
                     .child(self.quality_button(Quality::LOSSLESS, cx))
@@ -508,7 +535,7 @@ impl Render for Audit {
                             .child(if self.converting {
                                 format!("Converting {}/{count}", self.results.len() + self.failed)
                             } else {
-                                "Convert to WebP".to_string()
+                                format!("Convert to {}", self.format.label().to_uppercase())
                             })
                             .on_click(cx.listener(|audit, _, _, cx| audit.start_conversion(cx))),
                     ),
@@ -564,18 +591,22 @@ impl Render for Audit {
 struct Args {
     root: PathBuf,
     convert: bool,
+    format: Format,
     quality: Quality,
 }
 
 fn parse_args() -> Args {
     let mut root = None;
     let mut convert = false;
+    let mut format = Format::WebP;
     let mut quality = Quality::lossy(80.);
     let mut rest = std::env::args().skip(1);
 
     while let Some(argument) = rest.next() {
         match argument.as_str() {
             "--convert" => convert = true,
+            "--avif" => format = Format::Avif,
+            "--webp" => format = Format::WebP,
             "--lossless" => quality = Quality::LOSSLESS,
             "--quality" => {
                 if let Some(value) = rest.next().and_then(|value| value.parse().ok()) {
@@ -589,17 +620,18 @@ fn parse_args() -> Args {
     Args {
         root: root.unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
         convert,
+        format,
         quality,
     }
 }
 
 /// Convert without opening a window, so the same work is scriptable and testable.
-fn convert_headless(root: &std::path::Path, entries: &[Entry], quality: Quality) {
+fn convert_headless(root: &std::path::Path, entries: &[Entry], format: Format, quality: Quality) {
     let out_dir = root.join(scan::OUTPUT_DIR);
     let (mut before, mut after, mut failed) = (0u64, 0u64, 0usize);
 
     for entry in entries {
-        match convert::convert_file(root, &entry.path, &out_dir, quality) {
+        match convert::convert_file(root, &entry.path, &out_dir, format, quality) {
             Some(converted) => {
                 before += entry.bytes;
                 after += converted.bytes;
@@ -622,8 +654,9 @@ fn convert_headless(root: &std::path::Path, entries: &[Entry], quality: Quality)
     let saved = before.saturating_sub(after);
     let percent = saved as f64 / before.max(1) as f64 * 100.;
     println!(
-        "\n{} converted at {}: {} -> {}, saved {} ({percent:.0}%){}",
+        "\n{} converted to {} at {}: {} -> {}, saved {} ({percent:.0}%){}",
         entries.len() - failed,
+        format.label(),
         quality.label(),
         format_bytes(before),
         format_bytes(after),
@@ -672,11 +705,12 @@ fn main() {
     );
 
     if args.convert {
-        convert_headless(&root, &entries, args.quality);
+        convert_headless(&root, &entries, args.format, args.quality);
         return;
     }
 
     let quality = args.quality;
+    let format = args.format;
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
         cx.open_window(
@@ -693,6 +727,7 @@ fn main() {
                         skipped_raw: scanned.skipped_raw,
                         thumbs: HashMap::new(),
                         requested: HashSet::new(),
+                        format,
                         quality,
                         results: HashMap::new(),
                         converting: false,

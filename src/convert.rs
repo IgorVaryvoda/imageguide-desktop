@@ -1,13 +1,20 @@
-//! Re-encode an image to WebP, on this machine.
+//! Re-encode an image, on this machine.
 //!
 //! The `image` crate can only write lossless WebP, which is the wrong tool for the
 //! job — the whole point is trading a little quality for a lot of bytes. This uses
 //! libwebp directly for both, and picks between them by whether the source has
 //! meaningful transparency.
+//!
+//! AVIF goes through `rav1e`, built without its assembly. `rav1e`'s `asm` feature
+//! refuses to build unless `nasm` is installed, and requiring a build tool from every
+//! contributor to save encode time is the wrong trade for a desktop app. It is
+//! noticeably slower than WebP either way — that is AV1, not the missing assembly.
 
 use std::path::{Path, PathBuf};
 
 use image::DynamicImage;
+use ravif::{Encoder as AvifEncoder, Img};
+use rgb::FromSlice;
 
 /// Encoder quality, 1 to 100. `None` means lossless.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,6 +35,29 @@ impl Quality {
     }
 }
 
+/// The container to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    WebP,
+    Avif,
+}
+
+impl Format {
+    pub fn extension(&self) -> &'static str {
+        match self {
+            Format::WebP => "webp",
+            Format::Avif => "avif",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Format::WebP => "webp",
+            Format::Avif => "avif",
+        }
+    }
+}
+
 /// The result of re-encoding one file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Converted {
@@ -35,12 +65,18 @@ pub struct Converted {
     pub bytes: u64,
 }
 
-/// Encode `image` as WebP. Returns the encoded bytes.
-///
+/// Encode `image` in `format`. Returns the encoded bytes.
+pub fn encode(image: &DynamicImage, format: Format, quality: Quality) -> Option<Vec<u8>> {
+    match format {
+        Format::WebP => encode_webp(image, quality),
+        Format::Avif => encode_avif(image, quality),
+    }
+}
+
 /// libwebp's lossy path discards the alpha channel's precision in ways that ruin
 /// cut-outs, so anything carrying real transparency goes lossless regardless of the
 /// requested quality.
-pub fn encode(image: &DynamicImage, quality: Quality) -> Option<Vec<u8>> {
+fn encode_webp(image: &DynamicImage, quality: Quality) -> Option<Vec<u8>> {
     let lossless = quality.0.is_none() || has_transparency(image);
     let encoder = webp::Encoder::from_image(image).ok()?;
 
@@ -50,6 +86,22 @@ pub fn encode(image: &DynamicImage, quality: Quality) -> Option<Vec<u8>> {
         encoder.encode(quality.0.unwrap_or(80.))
     };
     Some(memory.to_vec())
+}
+
+/// AVIF keeps alpha in a separate plane, so transparency needs no special case here.
+/// `quality` maps straight onto rav1e's 1-100 scale; lossless AVIF is not offered
+/// because it is routinely larger than lossless WebP and slower to produce.
+fn encode_avif(image: &DynamicImage, quality: Quality) -> Option<Vec<u8>> {
+    let rgba = image.to_rgba8();
+    let (width, height) = (rgba.width() as usize, rgba.height() as usize);
+
+    let encoded = AvifEncoder::new()
+        .with_quality(quality.0.unwrap_or(90.))
+        .with_speed(6)
+        .encode_rgba(Img::new(rgba.as_raw().as_rgba(), width, height))
+        .ok()?;
+
+    Some(encoded.avif_file)
 }
 
 /// True when any pixel is not fully opaque. A PNG with an alpha channel that is
@@ -67,9 +119,9 @@ fn has_transparency(image: &DynamicImage) -> bool {
 /// Where a converted file goes: the same layout as the source, rooted at `out_dir`,
 /// with a `.webp` extension. Keeping the tree means a folder of albums stays a folder
 /// of albums.
-pub fn output_path(root: &Path, source: &Path, out_dir: &Path) -> PathBuf {
+pub fn output_path(root: &Path, source: &Path, out_dir: &Path, format: Format) -> PathBuf {
     let relative = source.strip_prefix(root).unwrap_or(source);
-    out_dir.join(relative).with_extension("webp")
+    out_dir.join(relative).with_extension(format.extension())
 }
 
 /// Read, encode, and write one file. Returns what was written.
@@ -77,12 +129,13 @@ pub fn convert_file(
     root: &Path,
     source: &Path,
     out_dir: &Path,
+    format: Format,
     quality: Quality,
 ) -> Option<Converted> {
     let decoded = image::open(source).ok()?;
-    let encoded = encode(&decoded, quality)?;
+    let encoded = encode(&decoded, format, quality)?;
 
-    let written = output_path(root, source, out_dir);
+    let written = output_path(root, source, out_dir, format);
     std::fs::create_dir_all(written.parent()?).ok()?;
     std::fs::write(&written, &encoded).ok()?;
 
@@ -121,8 +174,8 @@ mod tests {
     #[test]
     fn lower_quality_produces_fewer_bytes() {
         let image = photo(256, 256);
-        let low = encode(&image, Quality::lossy(20.)).expect("q20 encodes");
-        let high = encode(&image, Quality::lossy(95.)).expect("q95 encodes");
+        let low = encode(&image, Format::WebP, Quality::lossy(20.)).expect("q20 encodes");
+        let high = encode(&image, Format::WebP, Quality::lossy(95.)).expect("q95 encodes");
 
         assert!(
             low.len() < high.len(),
@@ -134,9 +187,44 @@ mod tests {
 
     #[test]
     fn output_is_a_real_webp() {
-        let encoded = encode(&photo(32, 32), Quality::lossy(80.)).unwrap();
+        let encoded = encode(&photo(32, 32), Format::WebP, Quality::lossy(80.)).unwrap();
         assert_eq!(&encoded[0..4], b"RIFF");
         assert_eq!(&encoded[8..12], b"WEBP");
+    }
+
+    #[test]
+    fn output_is_a_real_avif() {
+        let encoded = encode(&photo(32, 32), Format::Avif, Quality::lossy(80.)).unwrap();
+        // ISO base media file format: a 'ftyp' box naming the AVIF brand.
+        assert_eq!(&encoded[4..8], b"ftyp");
+        assert_eq!(&encoded[8..12], b"avif");
+    }
+
+    /// Alpha survives the trip. AVIF carries it in its own plane, so unlike WebP there
+    /// is no lossless fallback protecting it, and a regression here would silently
+    /// flatten every cut-out.
+    #[test]
+    fn avif_keeps_transparency() {
+        let mut buffer: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(64, 64, Rgba([200u8, 30, 40, 255]));
+        for x in 0..32 {
+            for y in 0..64 {
+                buffer.put_pixel(x, y, Rgba([200, 30, 40, 0]));
+            }
+        }
+
+        let encoded = encode(
+            &DynamicImage::ImageRgba8(buffer),
+            Format::Avif,
+            Quality::lossy(90.),
+        )
+        .expect("avif encodes");
+        let decoded = image::load_from_memory(&encoded).expect("avif decodes");
+
+        assert!(
+            has_transparency(&decoded),
+            "the see-through half came back opaque"
+        );
     }
 
     #[test]
@@ -158,8 +246,17 @@ mod tests {
             Path::new("/photos"),
             Path::new("/photos/album/one.PNG"),
             Path::new("/photos/optimised"),
+            Format::WebP,
         );
         assert_eq!(path, Path::new("/photos/optimised/album/one.webp"));
+
+        let avif = output_path(
+            Path::new("/photos"),
+            Path::new("/photos/album/one.PNG"),
+            Path::new("/photos/optimised"),
+            Format::Avif,
+        );
+        assert_eq!(avif, Path::new("/photos/optimised/album/one.avif"));
     }
 
     #[test]
@@ -169,8 +266,8 @@ mod tests {
         photo(400, 400).save(&source).unwrap();
         let out = dir.join("optimised");
 
-        let converted =
-            convert_file(&dir, &source, &out, Quality::lossy(75.)).expect("conversion runs");
+        let converted = convert_file(&dir, &source, &out, Format::WebP, Quality::lossy(75.))
+            .expect("conversion runs");
 
         assert_eq!(converted.written, out.join("big.webp"));
         assert!(converted.written.exists(), "the file is actually on disk");

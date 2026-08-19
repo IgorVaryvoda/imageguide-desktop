@@ -19,9 +19,10 @@ Audit, thumbnails, and WebP conversion all work.
 ```bash
 imageguide ~/path/to/folder                        # audit, in a window
 imageguide ~/photo.jpg                             # straight into the comparison
-imageguide ~/path/to/folder --convert              # convert, no window
+imageguide ~/path/to/folder --convert              # convert to WebP, no window
+imageguide ~/path/to/folder --convert --avif
 imageguide ~/path/to/folder --convert --quality 60
-imageguide ~/path/to/folder --convert --lossless
+imageguide ~/path/to/folder --convert --lossless  # WebP only
 ```
 
 It walks the folder and its subfolders, reads each image's header, and lists what it
@@ -73,11 +74,27 @@ image paying for a fourth channel.
 A file that grew is reported as grown rather than hidden. Re-encoding an
 already-optimal JPEG usually costs bytes, and that is worth seeing.
 
-Twelve mixed files from a real photo library, at q80:
+### WebP or AVIF
 
-```
-12 converted at q80: 76.0 MB -> 4.6 MB, saved 71.4 MB (94%)
-```
+Twelve mixed files from a real photo library — four JPEG photos, four upscaled PNGs,
+four screenshots — at q80, on a 12-thread machine:
+
+| | Result | Wall clock | CPU time |
+|---|---|---|---|
+| WebP | 76.0 MB → **4.6 MB** (94%) | 5.4 s | 5.1 s |
+| AVIF | 76.0 MB → **4.1 MB** (95%) | 26.1 s | 158 s |
+
+AVIF is about 11% smaller and roughly thirty times the CPU. That is AV1 being AV1,
+not a build problem — `rav1e` is compiled with its assembly and used all twelve
+threads. Whether the extra 11% is worth the wait is your call, which is why both are
+one click apart.
+
+AVIF has no lossless option here. Lossless AVIF is routinely larger than lossless
+WebP and much slower to produce, so `--lossless` means WebP.
+
+AVIF carries alpha in its own plane, so unlike WebP it needs no transparency special
+case. A test encodes a half-transparent image and decodes it back, because a
+regression there would silently flatten every cut-out.
 
 ## Comparing
 
@@ -98,8 +115,6 @@ rather than tells you.
 
 - Panning and zoom in the comparison. It is centred and 1:1 today, with no way to
   reach a corner of a large image.
-- AVIF. Deferred: `rav1e` wants `nasm` to build with assembly, and it is worth doing
-  once rather than badly.
 - Spec profiles — "1400×1400, white background, under 250 KB" — for marketplace
   pre-flight.
 
@@ -108,6 +123,13 @@ rather than tells you.
 ```bash
 cargo build --release   # fetches the pinned Rust toolchain on first run
 cargo test
+```
+
+Needs `nasm` to build `rav1e`'s assembly, and `libwebp` plus `dav1d` at runtime:
+
+```bash
+sudo pacman -S nasm libwebp dav1d      # Arch and derivatives
+sudo apt install nasm libwebp-dev libdav1d-dev   # Debian and derivatives
 ```
 
 The UI is [GPUI](https://www.gpui.rs), pinned to a Zed revision because it has no
