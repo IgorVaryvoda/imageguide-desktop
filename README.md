@@ -103,19 +103,46 @@ When a size budget is set, the comparison downscales the *original* side too. Ho
 a 6400px source against a 1600px export would measure the resize, not the
 compression, and the resize is not the part you need to eyeball.
 
+### Two views
+
+**Grid** switches the list for a gallery of tiles, virtualised the same way — a folder
+of 5,700 images decodes only the tiles on screen. `--grid` opens straight into it.
+
+### Before you convert
+
+The toolbar carries a live projection: **≈ 3.1 MB · −96% (from 4)**. Four files are
+encoded in memory, spread across the list rather than taken from the top, and the
+ratio is applied to the whole job. It re-runs when the format, quality, size or
+filter changes, after a short pause so dragging the slider does not start a run per
+pixel.
+
+It is a sample, and it says so — on the twelve-file folder above it projected 3.1 MB
+against an actual 4.6 MB. Right about the order of the saving, not a promise about
+the byte.
+
 ### Around the list
 
-Quality is a slider from 1 to 100, with a separate lossless toggle. Column headers
-sort. Clicking the active one reverses it; numeric columns open
+Quality is a slider from 1 to 100, with a separate lossless toggle. The box at the
+top filters by filename, and narrowing the list narrows what Convert will touch —
+converting files you cannot see would be a nasty surprise. Column headers sort. Clicking the active one reverses it; numeric columns open
 largest-first and text columns A to Z. Ties fall back to the filename, so equal values
 never reshuffle themselves between sorts.
+
+The list takes the keyboard too: arrows and Page Up/Down move, Home and End jump,
+Space ticks the row, Enter opens the comparison.
 
 In the comparison, **Escape** closes and the **arrow keys** step to the next image,
 which keeps the current format, quality, and size settings — that is the fast way to
 sweep a folder for anything the encoder mangles.
 
 The window title follows the folder, a progress bar runs during conversion, and the
-tick box in the header row selects or clears everything.
+tick box in the header row selects or clears everything. Window size and last folder
+are remembered between launches. **Show output** appears once a run has written
+something.
+
+Failures are named, not counted. Files that will not decode are reported at the top
+of the window, and so are the ones a conversion could not read or write — with the
+first few filenames, because "3 failed" is not a report.
 
 ### Choosing what to convert
 
@@ -167,7 +194,8 @@ rather than tells you.
 
 - Zoom in the comparison. It is 1:1 and pannable, but there is no way to back out to
   a whole-image view.
-- CI on macOS and Windows. Those builds are believed-correct, not verified.
+- Windows. dav1d decodes AVIF here and getting it onto a Windows runner means vcpkg;
+  Ubuntu and macOS are both green in CI.
 - Spec profiles — "1400×1400, white background, under 250 KB" — for marketplace
   pre-flight.
 

@@ -7,11 +7,13 @@
 mod compare;
 mod convert;
 mod scan;
+mod settings;
 mod thumbs;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use compare::Pair;
 use convert::{Format, MaxEdge, Quality};
@@ -21,6 +23,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::progress::Progress;
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_component::{ActiveTheme, Root, Selectable, Sizable};
@@ -36,6 +39,15 @@ const GOOD: u32 = 0x5ec27a;
 /// How many files encode at once. Each one holds a fully decoded image in memory, so
 /// this is a memory bound as much as a CPU one.
 const WORKERS: usize = 8;
+/// Gallery tile size, and how many fit a row. Fixed rather than responsive because
+/// `uniform_list` needs every row the same height to virtualise at all.
+const TILE: f32 = 168.;
+const TILE_COLUMNS: usize = 5;
+/// Files encoded to project a total. More is more accurate and much slower — an AVIF
+/// sample is a second or two each.
+const SAMPLE_SIZE: usize = 4;
+/// Settling time before sampling, so dragging the slider does not start a run per pixel.
+const ESTIMATE_DELAY: Duration = Duration::from_millis(400);
 
 struct Audit {
     root: PathBuf,
@@ -58,16 +70,40 @@ struct Audit {
     /// Encoded size per row, filled in as conversion progresses.
     results: HashMap<usize, u64>,
     converting: bool,
-    /// Files that could not be decoded or written, so the count is honest.
-    failed: usize,
+    /// Names of files a conversion could not read or write. Kept rather than counted,
+    /// because "3 failed" without saying which is not a report.
+    failures: Vec<String>,
+    /// Files in the folder that claim to be images and will not decode.
+    unreadable: usize,
+    /// A drag is hovering over the window.
+    drag_over: bool,
     /// The open side-by-side view, if any.
     compare: Option<Comparison>,
     /// How the list is ordered.
     sort: Sort,
+    /// Indices into `entries`, filtered and sorted. `entries` itself never moves, so
+    /// thumbnails, ticks and results stay attached to their file through both.
+    visible: Vec<usize>,
+    /// Substring the name must contain, lowercased. Empty shows everything.
+    filter: String,
+    /// Backs the filter box.
+    filter_input: gpui::Entity<InputState>,
+    /// Row the keyboard is on, as a position in `visible`.
+    cursor: usize,
+    /// List or gallery.
+    grid: bool,
+    /// Projected output size for the current settings, and how many files were
+    /// actually encoded to get it.
+    estimate: Option<(u64, usize)>,
+    /// Bumped on every settings change so a slow sample can tell it is stale. Dragging
+    /// the quality slider fires dozens of these.
+    estimate_generation: u64,
     /// Keyboard target. Without one the window gets no key events at all.
     focus: FocusHandle,
     /// Last title pushed to the compositor, so render does not set it every frame.
     titled: String,
+    /// Last state written to disk, so render only writes when it changes.
+    settings: settings::Settings,
     /// The last pair built, kept so closing and reopening the same image is instant.
     // ponytail: one entry. A pair holds two full-size RGBA buffers — 165 MB for a
     // 5568x3712 photo — so a bigger cache would need a byte budget, not a count.
@@ -102,10 +138,10 @@ impl Column {
     }
 }
 
-/// Order `entries` in place. Ties fall back to the filename so the order is stable
-/// between runs — a list that reshuffles itself is worse than one sorted badly.
-fn sort_entries(entries: &mut [Entry], sort: Sort) {
-    entries.sort_by(|a, b| {
+/// Ties fall back to the filename so the order is stable between runs — a list that
+/// reshuffles itself is worse than one sorted badly.
+fn compare_entries(a: &Entry, b: &Entry, sort: Sort) -> std::cmp::Ordering {
+    {
         let ordering = match sort.column {
             Column::Name => a.name().to_lowercase().cmp(&b.name().to_lowercase()),
             Column::Format => format_name(a.format).cmp(format_name(b.format)),
@@ -125,7 +161,7 @@ fn sort_entries(entries: &mut [Entry], sort: Sort) {
         } else {
             ordering
         }
-    });
+    }
 }
 
 struct Comparison {
@@ -152,7 +188,9 @@ impl Audit {
     /// so the common case needs no ticking.
     fn targets(&self) -> Vec<usize> {
         if self.selected.is_empty() {
-            (0..self.entries.len()).collect()
+            // Everything currently visible, so a filter narrows the job as well as
+            // the list. Converting hidden files would be a nasty surprise.
+            self.visible.clone()
         } else {
             let mut rows: Vec<usize> = self.selected.iter().copied().collect();
             rows.sort_unstable();
@@ -177,7 +215,7 @@ impl Audit {
         }
         self.converting = true;
         self.results.clear();
-        self.failed = 0;
+        self.failures.clear();
         cx.notify();
 
         let root = self.root.clone();
@@ -223,7 +261,14 @@ impl Audit {
                                 Some(converted) => {
                                     audit.results.insert(index, converted.bytes);
                                 }
-                                None => audit.failed += 1,
+                                None => {
+                                    let name = audit
+                                        .entries
+                                        .get(index)
+                                        .map(|entry| entry.name())
+                                        .unwrap_or_default();
+                                    audit.failures.push(name);
+                                }
                             }
                         }
                         cx.notify();
@@ -242,8 +287,26 @@ impl Audit {
         .detach();
     }
 
-    /// Re-order the list. Everything keyed by row index is dropped, because those
-    /// indices now point at different files.
+    /// Rebuild the filtered, sorted view. Nothing keyed by entry index is touched:
+    /// a file keeps its thumbnail, its tick and its result through any re-ordering.
+    fn refresh_visible(&mut self) {
+        let needle = self.filter.to_lowercase();
+        let mut visible: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| needle.is_empty() || entry.name().to_lowercase().contains(&needle))
+            .map(|(index, _)| index)
+            .collect();
+
+        let entries = &self.entries;
+        let sort = self.sort;
+        visible.sort_by(|a, b| compare_entries(&entries[*a], &entries[*b], sort));
+
+        self.cursor = self.cursor.min(visible.len().saturating_sub(1));
+        self.visible = visible;
+    }
+
     fn set_sort(&mut self, column: Column, cx: &mut Context<Self>) {
         self.sort = if self.sort.column == column {
             Sort {
@@ -257,23 +320,202 @@ impl Audit {
                 descending: !matches!(column, Column::Name | Column::Format),
             }
         };
-        sort_entries(&mut self.entries, self.sort);
-        self.thumbs.clear();
-        self.requested.clear();
-        self.selected.clear();
-        self.results.clear();
+        self.refresh_visible();
         cx.notify();
+    }
+
+    fn set_filter(&mut self, filter: String, cx: &mut Context<Self>) {
+        self.filter = filter;
+        self.refresh_visible();
+        self.schedule_estimate(cx);
+        cx.notify();
+    }
+
+    /// Encode a handful of files in memory to project what a full run would produce.
+    /// Nothing is written; this only exists so the quality slider means something
+    /// before you commit to it.
+    fn schedule_estimate(&mut self, cx: &mut Context<Self>) {
+        self.estimate_generation += 1;
+        self.estimate = None;
+        let generation = self.estimate_generation;
+
+        let targets = self.targets();
+        if targets.is_empty() {
+            return;
+        }
+
+        // Spread the sample across the list rather than taking the heaviest few: the
+        // top of a folder is often one outlier.
+        let stride = targets.len().div_ceil(SAMPLE_SIZE).max(1);
+        let sample: Vec<(PathBuf, u64)> = targets
+            .iter()
+            .step_by(stride)
+            .take(SAMPLE_SIZE)
+            .filter_map(|index| {
+                let entry = self.entries.get(*index)?;
+                Some((entry.path.clone(), entry.bytes))
+            })
+            .collect();
+        let total: u64 = targets
+            .iter()
+            .filter_map(|index| self.entries.get(*index))
+            .map(|entry| entry.bytes)
+            .sum();
+
+        let (format, quality, max_edge) = (self.format, self.quality, self.max_edge);
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ESTIMATE_DELAY).await;
+            if this
+                .read_with(cx, |audit, _| audit.estimate_generation != generation)
+                .unwrap_or(true)
+            {
+                return;
+            }
+
+            let sampled = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut source = 0u64;
+                    let mut encoded = 0u64;
+                    let mut counted = 0usize;
+                    for (path, bytes) in sample {
+                        let Some(image) = image::open(&path).ok().map(|i| max_edge.apply(i)) else {
+                            continue;
+                        };
+                        let Some(output) = convert::encode(&image, format, quality) else {
+                            continue;
+                        };
+                        source += bytes;
+                        encoded += output.len() as u64;
+                        counted += 1;
+                    }
+                    (source, encoded, counted)
+                })
+                .await;
+
+            let (source, encoded, counted) = sampled;
+            if counted == 0 || source == 0 {
+                return;
+            }
+
+            let projected = (total as f64 * (encoded as f64 / source as f64)) as u64;
+            let _ = this.update(cx, |audit, cx| {
+                // A newer change started while this was encoding.
+                if audit.estimate_generation == generation {
+                    audit.estimate = Some((projected, counted));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Move the keyboard cursor, clamped to the list.
+    fn move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.visible.is_empty() {
+            return;
+        }
+        let last = self.visible.len() - 1;
+        self.cursor = (self.cursor as isize + delta).clamp(0, last as isize) as usize;
+        cx.notify();
+    }
+
+    fn toggle_cursor_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(entry) = self.entry_at(self.cursor)
+            && !self.selected.remove(&entry)
+        {
+            self.selected.insert(entry);
+        }
+        cx.notify();
+    }
+
+    /// The entry a visible row points at.
+    fn entry_at(&self, row: usize) -> Option<usize> {
+        self.visible.get(row).copied()
+    }
+
+    /// Where an entry currently sits in the view, if the filter has not hidden it.
+    fn row_of(&self, entry: usize) -> Option<usize> {
+        self.visible.iter().position(|index| *index == entry)
     }
 
     /// Step to the next or previous image while the comparison is open.
     fn step_compare(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let Some(current) = self.compare.as_ref().map(|comparison| comparison.index) else {
+        let Some(entry) = self.compare.as_ref().map(|comparison| comparison.index) else {
             return;
         };
-        let next = current as isize + delta;
-        if next >= 0 && (next as usize) < self.entries.len() {
-            self.open_compare(next as usize, cx);
+        // Step through what is on screen, not through the underlying scan order.
+        let Some(row) = self.row_of(entry) else {
+            return;
+        };
+        let next = row as isize + delta;
+        if next >= 0
+            && let Some(entry) = self.entry_at(next as usize)
+        {
+            self.cursor = next as usize;
+            self.open_compare(entry, cx);
         }
+    }
+
+    /// One gallery tile: the picture, with its name and weight under it.
+    fn tile(&self, row: usize, index: usize, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let Some(entry) = self.entries.get(index) else {
+            return div().id(("tile", row));
+        };
+        let thumb = self.thumbs.get(&index).cloned();
+        let ticked = self.selected.contains(&index);
+
+        div()
+            .id(("tile", row))
+            .w(px(TILE))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_1()
+            .rounded_md()
+            .cursor_pointer()
+            .when(row == self.cursor, |tile| {
+                tile.border_1().border_color(rgb(ACCENT))
+            })
+            .when(ticked, |tile| tile.bg(rgba(0xffffff1f)))
+            .hover(|style| style.bg(rgba(0xffffff14)))
+            .on_click(cx.listener(move |audit, _, _, cx| {
+                if let Some(position) = audit.row_of(index) {
+                    audit.cursor = position;
+                }
+                audit.open_compare(index, cx)
+            }))
+            .child(
+                div()
+                    .w_full()
+                    .h(px(TILE - 44.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .bg(rgba(0xffffff0d))
+                    .when_some(thumb, |slot, image| {
+                        slot.child(img(image).max_w(px(TILE - 12.)).max_h(px(TILE - 48.)))
+                    }),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_size(px(10.))
+                    .text_color(white())
+                    .child(entry.name()),
+            )
+            .child(div().text_size(px(10.)).text_color(rgba(MUTED)).child(
+                match self.results.get(&index) {
+                    Some(bytes) => {
+                        format!("{} → {}", format_bytes(entry.bytes), format_bytes(*bytes))
+                    }
+                    None => format_bytes(entry.bytes),
+                },
+            ))
     }
 
     fn column_header(
@@ -319,6 +561,7 @@ impl Audit {
                 scan::Scan {
                     entries: vec![entry],
                     skipped_raw: 0,
+                    unreadable: 0,
                 },
                 parent,
             )
@@ -331,18 +574,39 @@ impl Audit {
         self.root = root;
         self.entries = scanned.entries;
         self.skipped_raw = scanned.skipped_raw;
+        self.unreadable = scanned.unreadable;
         self.thumbs.clear();
         self.requested.clear();
         self.selected.clear();
         self.results.clear();
-        self.failed = 0;
+        self.failures.clear();
         self.compare = None;
         self.cached = None;
+        self.filter.clear();
+        self.cursor = 0;
+        self.refresh_visible();
         cx.notify();
 
         if single {
             self.open_compare(0, cx);
         }
+    }
+
+    /// Hand the output folder to the desktop's file manager.
+    // ponytail: three names for one idea, and no crate needed for it.
+    fn reveal_output(&self) {
+        let path = self.root.join(scan::OUTPUT_DIR);
+        if !path.exists() {
+            return;
+        }
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(target_os = "windows") {
+            "explorer"
+        } else {
+            "xdg-open"
+        };
+        let _ = std::process::Command::new(opener).arg(path).spawn();
     }
 
     /// Ask the desktop for a folder or a file. The dialog runs off the main thread so
@@ -676,6 +940,7 @@ impl Audit {
             move |audit, cx| {
                 audit.max_edge = max_edge;
                 audit.results.clear();
+                audit.schedule_estimate(cx);
                 cx.notify();
             },
         )
@@ -691,6 +956,7 @@ impl Audit {
                 audit.format = format;
                 // Results describe the old format; keeping them would mislabel them.
                 audit.results.clear();
+                audit.schedule_estimate(cx);
                 cx.notify();
             },
         )
@@ -705,6 +971,7 @@ impl Audit {
             move |audit, cx| {
                 audit.quality = quality;
                 audit.results.clear();
+                audit.schedule_estimate(cx);
                 cx.notify();
             },
         )
@@ -735,14 +1002,15 @@ impl Audit {
         .detach();
     }
 
-    fn row(&self, index: usize, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn row(&self, row: usize, index: usize, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let Some(entry) = self.entries.get(index) else {
-            return div().id(index);
+            return div().id(row);
         };
         let thumb = self.thumbs.get(&index).cloned();
+        let on_cursor = row == self.cursor;
 
         div()
-            .id(index)
+            .id(row)
             .flex()
             .w_full()
             .items_center()
@@ -751,9 +1019,19 @@ impl Audit {
             .h(px(ROW_HEIGHT - 4.))
             .rounded_md()
             .bg(rgb(ROW))
+            .when(on_cursor, |row| {
+                row.border_1()
+                    .border_color(rgb(ACCENT))
+                    .bg(rgba(0xffffff0f))
+            })
             .cursor_pointer()
             .hover(|style| style.bg(rgba(0xffffff14)))
-            .on_click(cx.listener(move |audit, _, _, cx| audit.open_compare(index, cx)))
+            .on_click(cx.listener(move |audit, _, _, cx| {
+                if let Some(position) = audit.row_of(index) {
+                    audit.cursor = position;
+                }
+                audit.open_compare(index, cx)
+            }))
             .text_size(px(12.))
             .child({
                 let ticked = self.selected.contains(&index);
@@ -886,7 +1164,7 @@ impl Render for Audit {
     // erases to one type rather than making the caller's `impl Trait` pick a winner.
     #[allow(refining_impl_trait)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let count = self.entries.len();
+        let count = self.visible.len();
 
         let title = match self.root.file_name() {
             Some(name) => format!("{} — ImageGuide", name.to_string_lossy()),
@@ -895,6 +1173,19 @@ impl Render for Audit {
         if title != self.titled {
             window.set_window_title(&title);
             self.titled = title;
+        }
+
+        // Cheap enough to check every frame, and it means a crash still leaves the
+        // last good size and folder on disk.
+        let viewport = window.viewport_size();
+        let current = settings::Settings {
+            width: Some(f32::from(viewport.width)),
+            height: Some(f32::from(viewport.height)),
+            folder: self.root.is_dir().then(|| self.root.clone()),
+        };
+        if current != self.settings {
+            settings::save(&current);
+            self.settings = current;
         }
 
         if self.entries.is_empty() && !self.root.is_dir() {
@@ -985,7 +1276,38 @@ impl Render for Audit {
             .bg(cx.theme().background)
             .font_family("sans-serif")
             .track_focus(&self.focus)
+            .when(self.drag_over, |shell| {
+                shell.border_2().border_color(rgb(ACCENT))
+            })
+            .on_drag_move(cx.listener(
+                |audit, _: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                    if !audit.drag_over {
+                        audit.drag_over = true;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_key_down(cx.listener(|audit, event: &gpui::KeyDownEvent, _, cx| {
+                // The filter box swallows its own keys, so these only fire when the
+                // list itself has focus.
+                match event.keystroke.key.as_str() {
+                    "down" => audit.move_cursor(1, cx),
+                    "up" => audit.move_cursor(-1, cx),
+                    "pagedown" => audit.move_cursor(10, cx),
+                    "pageup" => audit.move_cursor(-10, cx),
+                    "home" => audit.move_cursor(isize::MIN / 2, cx),
+                    "end" => audit.move_cursor(isize::MAX / 2, cx),
+                    "space" => audit.toggle_cursor_selection(cx),
+                    "enter" => {
+                        if let Some(entry) = audit.entry_at(audit.cursor) {
+                            audit.open_compare(entry, cx);
+                        }
+                    }
+                    _ => {}
+                }
+            }))
             .on_drop(cx.listener(|audit, paths: &gpui::ExternalPaths, _, cx| {
+                audit.drag_over = false;
                 if let Some(path) = paths.paths().first() {
                     audit.open_path(path.clone(), cx);
                 }
@@ -1012,6 +1334,21 @@ impl Render for Audit {
                         },
                     ))
                     .child(div().flex_1())
+                    .child(
+                        div()
+                            .w(px(170.))
+                            .child(Input::new(&self.filter_input).xsmall()),
+                    )
+                    .child(self.choice_button(
+                        "view-grid",
+                        if self.grid { "List" } else { "Grid" }.to_string(),
+                        self.grid,
+                        cx,
+                        |audit, cx| {
+                            audit.grid = !audit.grid;
+                            cx.notify();
+                        },
+                    ))
                     .child(
                         self.toolbar_button("open-folder", "Folder…", cx, |audit, cx| {
                             audit.pick(true, cx)
@@ -1064,7 +1401,7 @@ impl Render for Audit {
                             .child(if self.converting {
                                 format!(
                                     "Converting {}/{}",
-                                    self.results.len() + self.failed,
+                                    self.results.len() + self.failures.len(),
                                     self.targets().len()
                                 )
                             } else if self.selected.is_empty() {
@@ -1078,6 +1415,26 @@ impl Render for Audit {
                             })
                             .on_click(cx.listener(|audit, _, _, cx| audit.start_conversion(cx))),
                     )
+                    .when(!self.converting && self.results.is_empty(), |row| {
+                        let source: u64 = self
+                            .targets()
+                            .iter()
+                            .filter_map(|index| self.entries.get(*index))
+                            .map(|entry| entry.bytes)
+                            .sum();
+                        row.child(div().text_size(px(12.)).text_color(rgba(MUTED)).child(
+                            match self.estimate {
+                                None => "estimating…".to_string(),
+                                Some((projected, sampled)) => format!(
+                                    "≈ {} · −{:.0}% (from {sampled})",
+                                    format_bytes(projected),
+                                    (source.saturating_sub(projected)) as f32
+                                        / source.max(1) as f32
+                                        * 100.
+                                ),
+                            },
+                        ))
+                    })
                     .when(!self.selected.is_empty(), |row| {
                         row.child(
                             self.toolbar_button("select-none", "Clear", cx, |audit, cx| {
@@ -1085,8 +1442,41 @@ impl Render for Audit {
                                 cx.notify();
                             }),
                         )
+                    })
+                    .when(!self.results.is_empty() && !self.converting, |row| {
+                        row.child(
+                            self.toolbar_button("reveal", "Show output", cx, |audit, _| {
+                                audit.reveal_output()
+                            }),
+                        )
                     }),
             )
+            .when(!self.failures.is_empty() || self.unreadable > 0, |shell| {
+                let mut parts = Vec::new();
+                if self.unreadable > 0 {
+                    parts.push(format!("{} would not decode", self.unreadable));
+                }
+                if !self.failures.is_empty() {
+                    // Name a few. A bare count is not a report.
+                    let named: Vec<&str> = self
+                        .failures
+                        .iter()
+                        .take(3)
+                        .map(|name| name.as_str())
+                        .collect();
+                    let rest = self.failures.len().saturating_sub(named.len());
+                    parts.push(match rest {
+                        0 => format!("failed: {}", named.join(", ")),
+                        rest => format!("failed: {} and {rest} more", named.join(", ")),
+                    });
+                }
+                shell.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(0xe0a34a))
+                        .child(parts.join(" · ")),
+                )
+            })
             .when(!self.results.is_empty(), |shell| {
                 let (before, after) = self.converted_totals();
                 let saved = before.saturating_sub(after);
@@ -1096,7 +1486,7 @@ impl Render for Audit {
                     saved as f32 / before as f32 * 100.
                 };
                 shell.child(div().text_size(px(12.)).text_color(rgb(GOOD)).child(
-                    match self.failed {
+                    match self.failures.len() {
                         0 => format!(
                             "{} converted · {} → {} · saved {} ({percent:.0}%)",
                             self.results.len(),
@@ -1113,54 +1503,87 @@ impl Render for Audit {
                 ))
             })
             .when(self.converting, |shell| {
-                let done = (self.results.len() + self.failed) as f32;
+                let done = (self.results.len() + self.failures.len()) as f32;
                 let total = self.targets().len().max(1) as f32;
                 shell.child(Progress::new("convert-progress").value(done / total * 100.))
             })
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_3()
-                    .pb_1()
-                    .child(
-                        // Tick-all sits where the per-row ticks are.
-                        Checkbox::new("select-all")
-                            .checked(!self.selected.is_empty())
-                            .on_click(cx.listener(|audit, _: &bool, _, cx| {
-                                if audit.selected.is_empty() {
-                                    audit.selected = (0..audit.entries.len()).collect();
-                                } else {
-                                    audit.selected.clear();
+            .when(!self.grid, |shell| {
+                shell.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .pb_1()
+                        .child(
+                            // Tick-all sits where the per-row ticks are.
+                            Checkbox::new("select-all")
+                                .checked(!self.selected.is_empty())
+                                .on_click(cx.listener(|audit, _: &bool, _, cx| {
+                                    if audit.selected.is_empty() {
+                                        audit.selected = (0..audit.entries.len()).collect();
+                                    } else {
+                                        audit.selected.clear();
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(div().w(px(52.)))
+                        .child(self.column_header(Column::Name, None, cx))
+                        .child(self.column_header(Column::Format, Some(52.), cx))
+                        .child(self.column_header(Column::Pixels, Some(96.), cx))
+                        .child(self.column_header(Column::Density, Some(76.), cx))
+                        .child(self.column_header(Column::Weight, Some(76.), cx))
+                        .child(div().w(px(132.))),
+                )
+            })
+            .child(if self.grid {
+                // Same virtualisation, one row of tiles per list row.
+                let rows = count.div_ceil(TILE_COLUMNS);
+                uniform_list(
+                    "gallery",
+                    rows,
+                    cx.processor(|audit, range: std::ops::Range<usize>, _window, cx| {
+                        range
+                            .map(|band| {
+                                // A plain loop: the closure form borrows `audit`
+                                // mutably for `request_thumb` and immutably for
+                                // `tile`, which nested closures cannot express.
+                                let first = band * TILE_COLUMNS;
+                                let last = (first + TILE_COLUMNS).min(audit.visible.len());
+                                let mut tiles = Vec::new();
+                                for row in first..last {
+                                    let Some(entry) = audit.entry_at(row) else {
+                                        continue;
+                                    };
+                                    audit.request_thumb(entry, cx);
+                                    tiles.push(audit.tile(row, entry, cx));
                                 }
-                                cx.notify();
-                            })),
-                    )
-                    .child(div().w(px(52.)))
-                    .child(self.column_header(Column::Name, None, cx))
-                    .child(self.column_header(Column::Format, Some(52.), cx))
-                    .child(self.column_header(Column::Pixels, Some(96.), cx))
-                    .child(self.column_header(Column::Density, Some(76.), cx))
-                    .child(self.column_header(Column::Weight, Some(76.), cx))
-                    .child(div().w(px(132.))),
-            )
-            .child(
+                                div().flex().gap_2().children(tiles)
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .flex_1()
+                .into_any_element()
+            } else {
                 uniform_list(
                     "images",
                     count,
                     cx.processor(|audit, range: std::ops::Range<usize>, _window, cx| {
                         // Decode only what the viewport asked for.
                         range
-                            .map(|index| {
-                                audit.request_thumb(index, cx);
-                                audit.row(index, cx)
+                            .filter_map(|row| {
+                                let entry = audit.entry_at(row)?;
+                                audit.request_thumb(entry, cx);
+                                Some(audit.row(row, entry, cx))
                             })
                             .collect::<Vec<_>>()
                     }),
                 )
-                .flex_1(),
-            )
+                .flex_1()
+                .into_any_element()
+            })
             .into_any_element()
     }
 }
@@ -1173,6 +1596,7 @@ struct Args {
     format: Format,
     quality: Quality,
     max_edge: MaxEdge,
+    grid: bool,
 }
 
 fn parse_args() -> Args {
@@ -1181,6 +1605,7 @@ fn parse_args() -> Args {
     let mut format = Format::WebP;
     let mut quality = Quality::lossy(80.);
     let mut max_edge = MaxEdge::FULL;
+    let mut grid = false;
     let mut rest = std::env::args().skip(1);
 
     while let Some(argument) = rest.next() {
@@ -1193,6 +1618,7 @@ fn parse_args() -> Args {
                 }
             }
             "--webp" => format = Format::WebP,
+            "--grid" => grid = true,
             "--lossless" => quality = Quality::LOSSLESS,
             "--quality" => {
                 if let Some(value) = rest.next().and_then(|value| value.parse().ok()) {
@@ -1209,6 +1635,7 @@ fn parse_args() -> Args {
         format,
         quality,
         max_edge,
+        grid,
     }
 }
 
@@ -1272,21 +1699,31 @@ fn convert_headless(
 fn main() {
     let args = parse_args();
 
-    let Some(target) = args.root.clone() else {
+    let remembered = settings::load();
+    let target = args.root.clone().or_else(|| {
+        remembered
+            .folder
+            .clone()
+            .filter(|folder| folder.is_dir() && !args.convert)
+    });
+
+    let Some(target) = target else {
         if args.convert {
             eprintln!("imageguide: --convert needs a folder");
             std::process::exit(2);
         }
         // No path given: open the window on its empty state and let the user pick.
-        return run_window(
-            PathBuf::new(),
-            Vec::new(),
-            0,
-            false,
-            args.format,
-            args.quality,
-            args.max_edge,
-        );
+        return run_window(Launch {
+            root: PathBuf::new(),
+            entries: Vec::new(),
+            skipped_raw: 0,
+            unreadable: 0,
+            open_single: false,
+            format: args.format,
+            quality: args.quality,
+            max_edge: args.max_edge,
+            grid: args.grid,
+        });
     };
 
     // A single file opens straight into the comparison. A folder opens the audit.
@@ -1306,6 +1743,7 @@ fn main() {
             scan::Scan {
                 entries: vec![entry],
                 skipped_raw: 0,
+                unreadable: 0,
             },
             parent,
         )
@@ -1325,26 +1763,46 @@ fn main() {
         return;
     }
 
-    run_window(
+    run_window(Launch {
         root,
         entries,
-        scanned.skipped_raw,
+        skipped_raw: scanned.skipped_raw,
+        unreadable: scanned.unreadable,
         open_single,
-        args.format,
-        args.quality,
-        args.max_edge,
-    );
+        format: args.format,
+        quality: args.quality,
+        max_edge: args.max_edge,
+        grid: args.grid,
+    });
 }
 
-fn run_window(
+/// Everything the window needs to open. A struct rather than nine positional
+/// arguments, three of which are `usize` and two of which are `bool`.
+struct Launch {
     root: PathBuf,
     entries: Vec<Entry>,
     skipped_raw: usize,
+    unreadable: usize,
     open_single: bool,
     format: Format,
     quality: Quality,
     max_edge: MaxEdge,
-) {
+    grid: bool,
+}
+
+fn run_window(launch: Launch) {
+    let Launch {
+        root,
+        entries,
+        skipped_raw,
+        unreadable,
+        open_single,
+        format,
+        quality,
+        max_edge,
+        grid,
+    } = launch;
+
     application().run(move |cx: &mut App| {
         // Must run before any gpui-component type is constructed.
         gpui_component::init(cx);
@@ -1352,7 +1810,15 @@ fn run_window(
         // and the comparison view is full-bleed imagery either way.
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
 
-        let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
+        let remembered = settings::load();
+        let bounds = Bounds::centered(
+            None,
+            size(
+                px(remembered.width.unwrap_or(900.)),
+                px(remembered.height.unwrap_or(640.)),
+            ),
+            cx,
+        );
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -1363,6 +1829,19 @@ fn run_window(
                 let audit = cx.new(|cx| {
                     let focus = cx.focus_handle();
                     focus.focus(window, cx);
+
+                    let filter_input =
+                        cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name"));
+                    cx.subscribe(
+                        &filter_input,
+                        |audit: &mut Audit, input, event: &InputEvent, cx| {
+                            if matches!(event, InputEvent::Change) {
+                                let value = input.read(cx).value().to_string();
+                                audit.set_filter(value, cx);
+                            }
+                        },
+                    )
+                    .detach();
 
                     let quality_slider = cx.new(|_| {
                         SliderState::new()
@@ -1381,6 +1860,7 @@ fn run_window(
                             };
                             audit.quality = Quality::lossy(value.start());
                             audit.results.clear();
+                            audit.schedule_estimate(cx);
                             cx.notify();
                         },
                     )
@@ -1400,14 +1880,26 @@ fn run_window(
                             column: Column::Weight,
                             descending: true,
                         },
+                        visible: Vec::new(),
+                        filter: String::new(),
+                        filter_input,
+                        cursor: 0,
+                        grid,
+                        estimate: None,
+                        estimate_generation: 0,
                         focus,
                         titled: String::new(),
+                        settings: settings::Settings::default(),
                         cached: None,
                         results: HashMap::new(),
                         converting: false,
-                        failed: 0,
+                        failures: Vec::new(),
+                        unreadable,
+                        drag_over: false,
                         compare: None,
                     };
+                    audit.refresh_visible();
+                    audit.schedule_estimate(cx);
                     if open_single {
                         audit.open_compare(0, cx);
                     }
@@ -1442,6 +1934,12 @@ mod tests {
 
     fn names(entries: &[Entry]) -> Vec<String> {
         entries.iter().map(|entry| entry.name()).collect()
+    }
+
+    /// The app sorts indices into an unmoved `entries`; these tests sort the data
+    /// directly, which is the same comparator either way.
+    fn sort_entries(entries: &mut [Entry], sort: Sort) {
+        entries.sort_by(|a, b| compare_entries(a, b, sort));
     }
 
     #[test]

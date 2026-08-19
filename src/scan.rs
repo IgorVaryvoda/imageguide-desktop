@@ -31,6 +31,10 @@ pub struct Scan {
     pub entries: Vec<Entry>,
     /// Camera raw files left out of the list, so the total is not silently short.
     pub skipped_raw: usize,
+    /// Files that look like images by extension but would not decode. Counted rather
+    /// than dropped in silence, because a folder that reports fewer files than it
+    /// holds is a bug report waiting to happen.
+    pub unreadable: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -83,6 +87,7 @@ pub fn probe(path: &Path) -> Option<Entry> {
 pub fn scan(root: &Path) -> Scan {
     let mut entries = Vec::new();
     let mut skipped_raw = 0;
+    let mut unreadable = 0;
 
     for file in WalkDir::new(root)
         .follow_links(false)
@@ -101,8 +106,11 @@ pub fn scan(root: &Path) -> Scan {
             skipped_raw += 1;
             continue;
         }
-        if let Some(entry) = probe(file.path()) {
-            entries.push(entry);
+        match probe(file.path()) {
+            Some(entry) => entries.push(entry),
+            // Only count things that claimed to be images. A README is not a failure.
+            None if looks_like_an_image(file.path()) => unreadable += 1,
+            None => {}
         }
     }
 
@@ -111,7 +119,18 @@ pub fn scan(root: &Path) -> Scan {
     Scan {
         entries,
         skipped_raw,
+        unreadable,
     }
+}
+
+/// Extension-only guess, used to decide whether a decode failure is worth reporting.
+fn looks_like_an_image(path: &Path) -> bool {
+    const EXTENSIONS: [&str; 9] = [
+        "jpg", "jpeg", "png", "webp", "avif", "gif", "tif", "tiff", "bmp",
+    ];
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
 }
 
 /// Human-readable file size. Deliberately not exact: the point is comparison.
@@ -227,6 +246,21 @@ mod tests {
         assert_eq!(
             scanned.skipped_raw, 2,
             "raw is counted, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn a_broken_image_is_counted_not_dropped() {
+        let dir = temp_dir("unreadable");
+        write_sample(&dir, "good.png", 8, 8);
+        std::fs::write(dir.join("truncated.png"), b"not a png at all").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"plain text").unwrap();
+
+        let scanned = scan(&dir);
+        assert_eq!(scanned.entries.len(), 1);
+        assert_eq!(
+            scanned.unreadable, 1,
+            "a broken png counts; a text file is not a failure"
         );
     }
 
