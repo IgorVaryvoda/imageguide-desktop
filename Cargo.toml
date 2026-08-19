@@ -16,6 +16,9 @@ path = "src/main.rs"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+# The icon SVGs `IconName` refers to. Without an asset source registered on the
+# application every icon resolves to nothing and renders as empty space.
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 image = { version = "0.25", features = ["avif-native"] }
 ravif = "0.13.0"
 rgb = "0.8.53"

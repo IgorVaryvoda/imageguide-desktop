@@ -17,7 +17,7 @@ pub const THUMB_EDGE: u32 = 96;
 /// Returns `None` for anything that fails to decode, which the caller shows as a gap
 /// rather than an error — a folder of holiday photos will contain a broken file.
 pub fn load(path: &Path, edge: u32) -> Option<Arc<RenderImage>> {
-    let decoded = image::open(path).ok()?;
+    let decoded = crate::scan::decode(path)?;
     // `thumbnail` preserves the aspect ratio and fits inside the box.
     let scaled = decoded.thumbnail(edge, edge).into_rgba8();
     Some(Arc::new(RenderImage::new(vec![Frame::new(to_bgra(
