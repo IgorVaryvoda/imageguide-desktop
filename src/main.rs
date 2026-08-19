@@ -4,12 +4,13 @@
 //! does the same work locally, so nothing leaves the machine and the folder size is
 //! bounded by the disk rather than by a tab.
 
+mod compare;
 mod convert;
 mod scan;
 mod thumbs;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
@@ -17,6 +18,7 @@ use gpui::{
     prelude::*, px, rgb, rgba, size, uniform_list, white,
 };
 use gpui_platform::application;
+use compare::Pair;
 use convert::Quality;
 use scan::{Entry, format_bytes, format_name};
 
@@ -46,6 +48,16 @@ struct Audit {
     converting: bool,
     /// Files that could not be decoded or written, so the count is honest.
     failed: usize,
+    /// The open side-by-side view, if any.
+    compare: Option<Comparison>,
+}
+
+struct Comparison {
+    index: usize,
+    /// `None` while the two sides are still decoding.
+    pair: Option<Pair>,
+    /// Where the divider sits, 0 to 1 across the viewport.
+    split: f32,
 }
 
 impl Audit {
@@ -127,6 +139,159 @@ impl Audit {
         .detach();
     }
 
+    /// Open the side-by-side view for a row and start building both sides.
+    fn open_compare(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(path) = self.entries.get(index).map(|entry| entry.path.clone()) else {
+            return;
+        };
+        self.compare = Some(Comparison {
+            index,
+            pair: None,
+            split: 0.5,
+        });
+        cx.notify();
+
+        let quality = self.quality;
+        cx.spawn(async move |this, cx| {
+            let built = cx
+                .background_executor()
+                .spawn(async move { compare::build(&path, quality) })
+                .await;
+
+            let _ = this.update(cx, |audit, cx| {
+                // Ignore a result the user already navigated away from.
+                if let Some(comparison) = audit.compare.as_mut()
+                    && comparison.index == index
+                {
+                    comparison.pair = built;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Full-window, 1:1 pixels. Fitting a 5568px photo into a 900px window would hide
+    /// exactly the artefacts this view exists to show, so the image is drawn at native
+    /// size and centred, and the divider follows the pointer.
+    fn compare_view(
+        &self,
+        comparison: &Comparison,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let viewport = window.viewport_size();
+        let (view_w, view_h) = (f32::from(viewport.width), f32::from(viewport.height));
+        let entry = self.entries.get(comparison.index);
+        let source_bytes = entry.map_or(0, |entry| entry.bytes);
+        let name = entry.map(|entry| entry.name()).unwrap_or_default();
+
+        let mut stage = div()
+            .id("compare-stage")
+            .absolute()
+            .inset_0()
+            .overflow_hidden()
+            .bg(rgb(0x0b0d10))
+            .on_mouse_move(cx.listener(move |audit, event: &gpui::MouseMoveEvent, _, cx| {
+                if let Some(comparison) = audit.compare.as_mut() {
+                    comparison.split = (f32::from(event.position.x) / view_w).clamp(0., 1.);
+                    cx.notify();
+                }
+            }));
+
+        if let Some(pair) = comparison.pair.as_ref() {
+            let (image_w, image_h) = (pair.width as f32, pair.height as f32);
+            // Negative when the image is larger than the window: that is the crop.
+            let left = (view_w - image_w) / 2.;
+            let top = (view_h - image_h) / 2.;
+            let divider = view_w * comparison.split;
+
+            let placed = |image: &Arc<gpui::RenderImage>| {
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(image_w))
+                    .h(px(image_h))
+                    .child(img(image.clone()).w(px(image_w)).h(px(image_h)))
+            };
+
+            stage = stage
+                .child(placed(&pair.converted))
+                .child(
+                    // The original, clipped to everything left of the divider. Its
+                    // child keeps full width so both sides stay in register.
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .h_full()
+                        .w(px(divider))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .w(px(view_w))
+                                .h(px(view_h))
+                                .child(placed(&pair.original)),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(px(divider - 1.))
+                        .w(px(2.))
+                        .h_full()
+                        .bg(rgba(0xffffffcc)),
+                )
+                .child(label(
+                    px(12.),
+                    px(12.),
+                    format!("original · {}", format_bytes(source_bytes)),
+                    white(),
+                ))
+                .child(label(
+                    px(view_w - 240.),
+                    px(12.),
+                    format!(
+                        "webp {} · {} · {:+.0}%",
+                        self.quality.label(),
+                        format_bytes(pair.converted_bytes),
+                        pair.saving_percent(source_bytes)
+                    ),
+                    rgb(GOOD),
+                ))
+                .child(label(px(12.), px(view_h - 32.), name, rgba(MUTED)));
+        } else {
+            stage = stage.child(label(px(12.), px(12.), "decoding…".to_string(), rgba(MUTED)));
+        }
+
+        stage
+            .child(
+            div()
+                .id("compare-close")
+                .absolute()
+                .top(px(8.))
+                .right(px(8.))
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(12.))
+                .bg(rgba(0x000000aa))
+                .text_color(white())
+                .child("close")
+                .on_click(cx.listener(|audit, _, _, cx| {
+                    audit.compare = None;
+                    cx.notify();
+                })),
+            )
+            .into_any_element()
+    }
+
     fn quality_button(&self, quality: Quality, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.quality == quality;
         div()
@@ -170,7 +335,7 @@ impl Audit {
         .detach();
     }
 
-    fn row(&self, index: usize) -> gpui::Stateful<gpui::Div> {
+    fn row(&self, index: usize, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let Some(entry) = self.entries.get(index) else {
             return div().id(index);
         };
@@ -186,6 +351,9 @@ impl Audit {
             .h(px(ROW_HEIGHT - 4.))
             .rounded_md()
             .bg(rgb(ROW))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgba(0xffffff14)))
+            .on_click(cx.listener(move |audit, _, _, cx| audit.open_compare(index, cx)))
             .text_size(px(12.))
             .child(
                 // A fixed slot, so rows do not jump as thumbnails arrive.
@@ -260,9 +428,32 @@ impl Audit {
     }
 }
 
+/// A positioned text overlay for the compare view.
+fn label(left: gpui::Pixels, top: gpui::Pixels, text: String, colour: impl Into<gpui::Hsla>) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(left)
+        .top(top)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .bg(rgba(0x000000aa))
+        .text_size(px(12.))
+        .text_color(colour)
+        .child(text)
+}
+
 impl Render for Audit {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.entries.len();
+
+        if let Some(comparison) = self.compare.take() {
+            // Taken and put back so the view can borrow `self` immutably while the
+            // listeners it builds hold a mutable handle to the same entity.
+            let view = self.compare_view(&comparison, window, cx);
+            self.compare = Some(comparison);
+            return div().size_full().relative().child(view);
+        }
 
         div()
             .size_full()
@@ -359,7 +550,7 @@ impl Render for Audit {
                         range
                             .map(|index| {
                                 audit.request_thumb(index, cx);
-                                audit.row(index)
+                                audit.row(index, cx)
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -449,12 +640,29 @@ fn convert_headless(root: &std::path::Path, entries: &[Entry], quality: Quality)
 fn main() {
     let args = parse_args();
 
-    if !args.root.is_dir() {
-        eprintln!("imageguide: {} is not a folder", args.root.display());
+    // A single file opens straight into the comparison. A folder opens the audit.
+    let open_single = args.root.is_file();
+    if !args.root.is_dir() && !open_single {
+        eprintln!("imageguide: {} is not a file or folder", args.root.display());
         std::process::exit(2);
     }
 
-    let scanned = scan::scan(&args.root);
+    let (scanned, root) = if open_single {
+        let parent = args.root.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let Some(entry) = scan::probe(&args.root) else {
+            eprintln!("imageguide: {} is not an image", args.root.display());
+            std::process::exit(2);
+        };
+        (
+            scan::Scan {
+                entries: vec![entry],
+                skipped_raw: 0,
+            },
+            parent,
+        )
+    } else {
+        (scan::scan(&args.root), args.root.clone())
+    };
     let entries = scanned.entries;
     println!(
         "{} images, {} on disk, {} camera raw skipped",
@@ -464,11 +672,10 @@ fn main() {
     );
 
     if args.convert {
-        convert_headless(&args.root, &entries, args.quality);
+        convert_headless(&root, &entries, args.quality);
         return;
     }
 
-    let root = args.root;
     let quality = args.quality;
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
@@ -479,16 +686,23 @@ fn main() {
                 ..Default::default()
             },
             |_, cx| {
-                cx.new(|_| Audit {
-                    root,
-                    entries,
-                    skipped_raw: scanned.skipped_raw,
-                    thumbs: HashMap::new(),
-                    requested: HashSet::new(),
-                    quality,
-                    results: HashMap::new(),
-                    converting: false,
-                    failed: 0,
+                cx.new(|cx| {
+                    let mut audit = Audit {
+                        root,
+                        entries,
+                        skipped_raw: scanned.skipped_raw,
+                        thumbs: HashMap::new(),
+                        requested: HashSet::new(),
+                        quality,
+                        results: HashMap::new(),
+                        converting: false,
+                        failed: 0,
+                        compare: None,
+                    };
+                    if open_single {
+                        audit.open_compare(0, cx);
+                    }
+                    audit
                 })
             },
         )

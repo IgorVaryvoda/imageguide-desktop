@@ -25,7 +25,7 @@ pub fn load(path: &Path, edge: u32) -> Option<Arc<RenderImage>> {
 
 /// `RenderImage` wants BGRA. The `image` crate gives RGBA. Swap in place rather than
 /// allocating a second buffer per thumbnail.
-fn to_bgra(mut image: RgbaImage) -> RgbaImage {
+pub(crate) fn to_bgra(mut image: RgbaImage) -> RgbaImage {
     for pixel in image.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }

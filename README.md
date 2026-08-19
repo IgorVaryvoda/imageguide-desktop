@@ -18,6 +18,7 @@ Audit, thumbnails, and WebP conversion all work.
 
 ```bash
 imageguide ~/path/to/folder                        # audit, in a window
+imageguide ~/photo.jpg                             # straight into the comparison
 imageguide ~/path/to/folder --convert              # convert, no window
 imageguide ~/path/to/folder --convert --quality 60
 imageguide ~/path/to/folder --convert --lossless
@@ -78,10 +79,25 @@ Twelve mixed files from a real photo library, at q80:
 12 converted at q80: 76.0 MB -> 4.6 MB, saved 71.4 MB (94%)
 ```
 
+## Comparing
+
+Click any row, or pass a single file, to open the original against the WebP the
+current quality setting would produce. The encode happens in memory — nothing is
+written, because the point is to decide whether the trade is acceptable *before*
+committing to it.
+
+**The view is 1:1.** Fitting a 5568px photo into a 900px window hides exactly the
+artefacts the view exists to show, so both sides are drawn at native size, centred,
+and cropped by the window. Move the pointer to sweep the divider across.
+
+At q40 on a 12 MB photo the sky goes from grainy to smooth and the file goes to
+262 KB. Whether that is a good trade is a judgement, which is why this shows you
+rather than tells you.
+
 ## Planned
 
-- A full-resolution original-versus-converted slider. Judging compression is the
-  whole job and it is what a browser is worst at.
+- Panning and zoom in the comparison. It is centred and 1:1 today, with no way to
+  reach a corner of a large image.
 - AVIF. Deferred: `rav1e` wants `nasm` to build with assembly, and it is worth doing
   once rather than badly.
 - Spec profiles — "1400×1400, white background, under 250 KB" — for marketplace
