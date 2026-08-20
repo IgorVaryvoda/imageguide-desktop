@@ -31,7 +31,7 @@ use gpui_component::progress::Progress;
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_component::table::{Column as TableCol, ColumnSort, DataTable, TableDelegate, TableState};
 use gpui_component::tag::Tag;
-use gpui_component::{ActiveTheme, IconName, Root, Selectable, Sizable};
+use gpui_component::{ActiveTheme, Disableable, IconName, Root, Selectable, Sizable};
 use gpui_platform::application;
 use image::ImageFormat;
 use scan::{Entry, format_bytes, format_name};
@@ -282,6 +282,8 @@ struct Audit {
     /// Encoded size per row, filled in as conversion progresses.
     results: HashMap<usize, u64>,
     converting: bool,
+    /// The immutable denominator owned by the active conversion.
+    active_target_count: Option<usize>,
     /// Names of files a conversion could not read or write. Kept rather than counted,
     /// because "3 failed" without saying which is not a report.
     failures: Vec<String>,
@@ -320,6 +322,12 @@ struct Audit {
     /// Bumped on every settings change so a slow sample can tell it is stale. Dragging
     /// the quality slider fires dozens of these.
     estimate_generation: u64,
+    /// Invalidates detached work when a new folder or file is installed.
+    dataset_generation: u64,
+    /// Invalidates older folder-open requests while a newer scan is pending.
+    scan_generation: u64,
+    /// The path currently being scanned, if any.
+    scanning: Option<String>,
     /// Keyboard target. Without one the window gets no key events at all.
     focus: FocusHandle,
     /// Last title pushed to the compositor, so render does not set it every frame.
@@ -389,6 +397,8 @@ fn compare_entries(a: &Entry, b: &Entry, sort: Sort) -> std::cmp::Ordering {
 
 struct Comparison {
     index: usize,
+    dataset_generation: u64,
+    key: compare::Key,
     /// `None` while the two sides are still decoding.
     pair: Option<Arc<Pair>>,
     /// Where the divider sits, 0 to 1 across the viewport.
@@ -415,15 +425,7 @@ impl Audit {
     /// The rows a conversion would touch. An empty selection means the whole folder,
     /// so the common case needs no ticking.
     fn targets(&self) -> Vec<usize> {
-        if self.selected.is_empty() {
-            // Everything currently visible, so a filter narrows the job as well as
-            // the list. Converting hidden files would be a nasty surprise.
-            self.visible.clone()
-        } else {
-            let mut rows: Vec<usize> = self.selected.iter().copied().collect();
-            rows.sort_unstable();
-            rows
-        }
+        conversion_targets(&self.visible, &self.selected)
     }
 
     /// Bytes before and after, counting only the files actually converted. Comparing
@@ -438,10 +440,17 @@ impl Audit {
     }
 
     fn start_conversion(&mut self, cx: &mut Context<Self>) {
-        if self.converting {
+        if self.converting || self.scanning.is_some() {
             return;
         }
+        let targets = self.targets();
+        if targets.is_empty() {
+            return;
+        }
+        let target_count = targets.len();
+        let dataset_generation = self.dataset_generation;
         self.converting = true;
+        self.active_target_count = Some(target_count);
         self.results.clear();
         self.failures.clear();
         cx.notify();
@@ -451,8 +460,7 @@ impl Audit {
         let quality = self.quality;
         let format = self.format;
         let max_edge = self.max_edge;
-        let sources: Vec<(usize, PathBuf)> = self
-            .targets()
+        let sources: Vec<(usize, PathBuf)> = targets
             .into_iter()
             .filter_map(|index| Some((index, self.entries.get(index)?.path.clone())))
             .collect();
@@ -484,6 +492,9 @@ impl Audit {
 
                 if this
                     .update(cx, |audit, cx| {
+                        if audit.dataset_generation != dataset_generation {
+                            return;
+                        }
                         for (index, result) in done {
                             match result {
                                 Some(converted) => {
@@ -508,7 +519,10 @@ impl Audit {
             }
 
             let _ = this.update(cx, |audit, cx| {
-                audit.converting = false;
+                if audit.dataset_generation == dataset_generation {
+                    audit.converting = false;
+                    audit.active_target_count = None;
+                }
                 cx.notify();
             });
         })
@@ -562,6 +576,9 @@ impl Audit {
     }
 
     fn set_filter(&mut self, filter: String, cx: &mut Context<Self>) {
+        if self.converting {
+            return;
+        }
         self.filter = filter;
         self.refresh_visible();
         self.schedule_estimate(cx);
@@ -575,6 +592,7 @@ impl Audit {
         self.estimate_generation += 1;
         self.estimate = None;
         let generation = self.estimate_generation;
+        let dataset_generation = self.dataset_generation;
 
         let targets = self.targets();
         if targets.is_empty() {
@@ -604,7 +622,10 @@ impl Audit {
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(ESTIMATE_DELAY).await;
             if this
-                .read_with(cx, |audit, _| audit.estimate_generation != generation)
+                .read_with(cx, |audit, _| {
+                    audit.estimate_generation != generation
+                        || audit.dataset_generation != dataset_generation
+                })
                 .unwrap_or(true)
             {
                 return;
@@ -639,7 +660,9 @@ impl Audit {
             let projected = (total as f64 * (encoded as f64 / source as f64)) as u64;
             let _ = this.update(cx, |audit, cx| {
                 // A newer change started while this was encoding.
-                if audit.estimate_generation == generation {
+                if audit.estimate_generation == generation
+                    && audit.dataset_generation == dataset_generation
+                {
                     audit.estimate = Some((projected, counted));
                     cx.notify();
                 }
@@ -676,6 +699,10 @@ impl Audit {
             return;
         }
 
+        if self.converting {
+            return;
+        }
+
         if modifiers.platform || modifiers.control {
             if !self.selected.remove(&entry) {
                 self.selected.insert(entry);
@@ -702,6 +729,9 @@ impl Audit {
     }
 
     fn toggle_cursor_selection(&mut self, cx: &mut Context<Self>) {
+        if self.converting {
+            return;
+        }
         if let Some(entry) = self.entry_at(self.cursor)
             && !self.selected.remove(&entry)
         {
@@ -812,6 +842,9 @@ impl Audit {
                                     .checked(ticked)
                                     .on_click(cx.listener(move |audit, _: &bool, _, cx| {
                                         cx.stop_propagation();
+                                        if audit.converting {
+                                            return;
+                                        }
                                         if !audit.selected.remove(&index) {
                                             audit.selected.insert(index);
                                         }
@@ -866,29 +899,21 @@ impl Audit {
             )
     }
 
-    /// Point the audit at a new folder, or a single file. Everything derived from the
-    /// old one is dropped: stale thumbnails and conversion results would be lies.
-    fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let single = path.is_file();
-        let (scanned, root) = if single {
-            let Some(entry) = scan::probe(&path) else {
-                return;
-            };
-            let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-            (
-                scan::Scan {
-                    entries: vec![entry],
-                    skipped_raw: 0,
-                    unreadable: 0,
-                },
-                parent,
-            )
-        } else if path.is_dir() {
-            (scan::scan(&path), path)
-        } else {
-            return;
-        };
-
+    /// Install a completed scan. This is the one state transition that replaces the
+    /// dataset and invalidates every detached job derived from the old rows.
+    fn install_dataset(
+        &mut self,
+        scanned: scan::Scan,
+        root: PathBuf,
+        single: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dataset_generation = self.dataset_generation.wrapping_add(1);
+        self.estimate_generation = self.estimate_generation.wrapping_add(1);
+        self.estimate = None;
+        self.converting = false;
+        self.active_target_count = None;
         self.root = root;
         self.mislabelled = scanned
             .entries
@@ -911,13 +936,74 @@ impl Audit {
         self.compare = None;
         self.cached = None;
         self.filter.clear();
+        self.filter_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
         self.cursor = 0;
+        self.anchor = 0;
         self.refresh_visible();
+        self.schedule_estimate(cx);
         cx.notify();
 
         if single {
             self.open_compare(0, cx);
         }
+    }
+
+    /// Scan a requested path away from the UI thread. A newer request wins, while a
+    /// failed current request leaves the last usable dataset in place.
+    fn request_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.converting {
+            return;
+        }
+        let single = path.is_file();
+        if !single && !path.is_dir() {
+            return;
+        }
+        self.scan_generation = self.scan_generation.wrapping_add(1);
+        let request = self.scan_generation;
+        let label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.scanning = Some(label);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if single {
+                        let entry = scan::probe(&path)?;
+                        let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+                        Some((
+                            scan::Scan {
+                                entries: vec![entry],
+                                skipped_raw: 0,
+                                unreadable: 0,
+                            },
+                            root,
+                            true,
+                        ))
+                    } else {
+                        Some((scan::scan(&path), path, false))
+                    }
+                })
+                .await;
+
+            let _ = this.update_in(cx, |audit, window, cx| {
+                if audit.scan_generation != request {
+                    return;
+                }
+                audit.scanning = None;
+                if let Some((scanned, root, single)) = result {
+                    audit.install_dataset(scanned, root, single, window, cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Hand the output folder to the desktop's file manager.
@@ -940,6 +1026,9 @@ impl Audit {
     /// Ask the desktop for a folder or a file. The dialog runs off the main thread so
     /// the window keeps drawing while it is open.
     fn pick(&mut self, folders: bool, cx: &mut Context<Self>) {
+        if self.converting {
+            return;
+        }
         let start = self.root.clone();
         cx.spawn(async move |this, cx| {
             let chosen = cx
@@ -955,7 +1044,10 @@ impl Audit {
                 .await;
 
             if let Some(path) = chosen {
-                let _ = this.update(cx, |audit, cx| audit.open_path(path, cx));
+                let _ = this.update_in(cx, |audit, window, cx| {
+                    audit.request_path(path, cx);
+                    window.refresh();
+                });
             }
         })
         .detach();
@@ -1000,8 +1092,12 @@ impl Audit {
         let Some(path) = self.entries.get(index).map(|entry| entry.path.clone()) else {
             return;
         };
+        let dataset_generation = self.dataset_generation;
+        let key = compare::Key::new(&path, self.format, self.quality, self.max_edge);
         self.compare = Some(Comparison {
             index,
+            dataset_generation,
+            key: key.clone(),
             pair: None,
             split: 0.5,
             pan: (0., 0.),
@@ -1014,8 +1110,6 @@ impl Audit {
         let quality = self.quality;
         let format = self.format;
         let max_edge = self.max_edge;
-        let key = compare::Key::new(&path, format, quality, max_edge);
-
         // Same image, same settings: skip the encoder entirely.
         if let Some((cached_key, pair)) = self.cached.as_ref()
             && *cached_key == key
@@ -1036,11 +1130,13 @@ impl Audit {
 
             let _ = this.update(cx, |audit, cx| {
                 if let Some(pair) = built.as_ref() {
-                    audit.cached = Some((key, pair.clone()));
+                    audit.cached = Some((key.clone(), pair.clone()));
                 }
                 // Ignore a result the user already navigated away from.
                 if let Some(comparison) = audit.compare.as_mut()
                     && comparison.index == index
+                    && comparison.dataset_generation == dataset_generation
+                    && comparison.key == key
                 {
                     comparison.pair = built;
                     cx.notify();
@@ -1395,8 +1491,12 @@ impl Audit {
                     edge.label(),
                     self.max_edge == *edge,
                 )
+                .disabled(self.converting)
             }))
             .on_click(cx.listener(move |audit, clicked: &Vec<usize>, _, cx| {
+                if audit.converting {
+                    return;
+                }
                 let Some(edge) = clicked.first().and_then(|index| options.get(*index)) else {
                     return;
                 };
@@ -1416,8 +1516,12 @@ impl Audit {
                     format.label().to_uppercase(),
                     self.format == *format,
                 )
+                .disabled(self.converting)
             }))
             .on_click(cx.listener(move |audit, clicked: &Vec<usize>, _, cx| {
+                if audit.converting {
+                    return;
+                }
                 let Some(format) = clicked.first().and_then(|index| options.get(*index)) else {
                     return;
                 };
@@ -1519,6 +1623,7 @@ impl Audit {
                     Input::new(&self.filter_input)
                         .small()
                         .cleanable(true)
+                        .disabled(self.converting)
                         .prefix(IconName::Search),
                 ),
             )
@@ -1541,22 +1646,28 @@ impl Audit {
                     cx.notify();
                 },
             ))
-            .child(self.toolbar_button(
-                "open-folder",
-                "Folder",
-                "Audit a different folder",
-                IconName::Folder,
-                cx,
-                |audit, cx| audit.pick(true, cx),
-            ))
-            .child(self.toolbar_button(
-                "open-file",
-                "Image",
-                "Open a single image in the comparison",
-                IconName::File,
-                cx,
-                |audit, cx| audit.pick(false, cx),
-            ))
+            .child(
+                self.toolbar_button(
+                    "open-folder",
+                    "Folder",
+                    "Audit a different folder",
+                    IconName::Folder,
+                    cx,
+                    |audit, cx| audit.pick(true, cx),
+                )
+                .disabled(self.converting),
+            )
+            .child(
+                self.toolbar_button(
+                    "open-file",
+                    "Image",
+                    "Open a single image in the comparison",
+                    IconName::File,
+                    cx,
+                    |audit, cx| audit.pick(false, cx),
+                )
+                .disabled(self.converting),
+            )
     }
 
     /// The three knobs that decide what a conversion produces, each under its own
@@ -1584,9 +1695,11 @@ impl Audit {
                     .flex_shrink_0()
                     .child(group_label("Quality", cx))
                     .child(
-                        div()
-                            .w(px(130.))
-                            .child(Slider::new(&self.quality_slider).horizontal()),
+                        div().w(px(130.)).child(
+                            Slider::new(&self.quality_slider)
+                                .horizontal()
+                                .disabled(self.converting),
+                        ),
                     )
                     .child(
                         div()
@@ -1604,20 +1717,26 @@ impl Audit {
                                 None => "—".to_string(),
                             }),
                     )
-                    .child(segment("lossless", "Lossless", lossless).small().on_click(
-                        cx.listener(|audit, _, _, cx| {
-                            // A second click on a lit toggle has to turn it off,
-                            // or lossless is a one-way door.
-                            audit.quality = if audit.quality == Quality::LOSSLESS {
-                                Quality::lossy(audit.slider_quality)
-                            } else {
-                                Quality::LOSSLESS
-                            };
-                            audit.results.clear();
-                            audit.schedule_estimate(cx);
-                            cx.notify();
-                        }),
-                    )),
+                    .child(
+                        segment("lossless", "Lossless", lossless)
+                            .small()
+                            .disabled(self.converting)
+                            .on_click(cx.listener(|audit, _, _, cx| {
+                                if audit.converting {
+                                    return;
+                                }
+                                // A second click on a lit toggle has to turn it off,
+                                // or lossless is a one-way door.
+                                audit.quality = if audit.quality == Quality::LOSSLESS {
+                                    Quality::lossy(audit.slider_quality)
+                                } else {
+                                    Quality::LOSSLESS
+                                };
+                                audit.results.clear();
+                                audit.schedule_estimate(cx);
+                                cx.notify();
+                            })),
+                    ),
             )
     }
 
@@ -1635,40 +1754,67 @@ impl Audit {
 
         // Four states, one shape: a headline, the share it leaves behind, and a
         // sentence of detail.
-        let (headline, tone, detail, bar) = if self.converting {
+        let (headline, tone, detail, bar, tag) = if self.converting {
             let done = self.results.len() + self.failures.len();
+            let total = self.active_target_count.unwrap_or(targets.len());
             (
-                format!("{done} of {}", targets.len()),
+                format!("{done} of {total}"),
                 cx.theme().foreground,
                 format!(
                     "Converting to {} {}…",
                     self.format.label().to_uppercase(),
                     self.quality.label()
                 ),
-                Some((
-                    done as f32 / targets.len().max(1) as f32,
-                    cx.theme().primary,
-                )),
+                Some((done as f32 / total.max(1) as f32, cx.theme().primary)),
+                None,
             )
         } else if !self.results.is_empty() {
             let (before, after) = self.converted_totals();
-            let saved = before.saturating_sub(after);
+            let growth = after > before;
+            let delta = before.abs_diff(after);
+            let percent = delta as f32 / before.max(1) as f32 * 100.;
             (
-                format!("{} saved", format_bytes(saved)),
-                cx.theme().green,
+                format!(
+                    "{} {}",
+                    format_bytes(delta),
+                    if growth { "larger" } else { "saved" }
+                ),
+                if growth {
+                    cx.theme().yellow
+                } else {
+                    cx.theme().green
+                },
                 format!(
                     "{} converted · {} → {}",
                     self.results.len(),
                     format_bytes(before),
                     format_bytes(after)
                 ),
-                Some((after as f32 / before.max(1) as f32, cx.theme().green)),
+                Some((
+                    after as f32 / before.max(1) as f32,
+                    if growth {
+                        cx.theme().yellow
+                    } else {
+                        cx.theme().green
+                    },
+                )),
+                Some((growth, percent)),
             )
         } else if let Some((projected, sampled)) = self.estimate {
-            let saved = source.saturating_sub(projected);
+            let growth = projected > source;
+            let delta = source.abs_diff(projected);
+            let percent = delta as f32 / source.max(1) as f32 * 100.;
             (
-                format!("{} to save", format_bytes(saved)),
-                cx.theme().green,
+                format!(
+                    "{} to {}",
+                    format_bytes(delta),
+                    if growth { "grow" } else { "save" }
+                ),
+                if growth {
+                    cx.theme().yellow
+                } else {
+                    cx.theme().green
+                },
                 format!(
                     "{} now → ≈{} as {} {} · sampled {sampled}",
                     format_bytes(source),
@@ -1676,13 +1822,22 @@ impl Audit {
                     self.format.label().to_uppercase(),
                     self.quality.label()
                 ),
-                Some((projected as f32 / source.max(1) as f32, cx.theme().green)),
+                Some((
+                    projected as f32 / source.max(1) as f32,
+                    if growth {
+                        cx.theme().yellow
+                    } else {
+                        cx.theme().green
+                    },
+                )),
+                Some((growth, percent)),
             )
         } else {
             (
                 "Sizing it up…".to_string(),
                 cx.theme().muted_foreground,
                 format!("{} on disk", format_bytes(source)),
+                None,
                 None,
             )
         };
@@ -1713,10 +1868,17 @@ impl Audit {
                             .child(headline),
                     )
                     // The share saved, which is the number people actually quote.
-                    .children(bar.map(|(remaining, _)| {
-                        Tag::success()
-                            .small()
-                            .child(format!("−{:.0}%", (1. - remaining).max(0.) * 100.))
+                    .children(tag.map(|(growth, percent)| {
+                        let tag = if growth {
+                            Tag::warning()
+                        } else {
+                            Tag::success()
+                        };
+                        tag.small().child(if growth {
+                            format!("+{percent:.0}%")
+                        } else {
+                            format!("−{percent:.0}%")
+                        })
                     }))
                     .child(
                         div()
@@ -1766,10 +1928,13 @@ impl Audit {
                             } else {
                                 format!(
                                     "Convert {} to {}",
-                                    self.selected.len(),
+                                    targets.len(),
                                     self.format.label().to_uppercase()
                                 )
                             })
+                            .disabled(
+                                self.converting || self.scanning.is_some() || targets.is_empty(),
+                            )
                             .on_click(cx.listener(|audit, _, _, cx| audit.start_conversion(cx))),
                     ),
             )
@@ -1822,6 +1987,7 @@ impl Audit {
         if self.thumbs.contains_key(&index) || !self.requested.insert(index) {
             return;
         }
+        let dataset_generation = self.dataset_generation;
         let Some(path) = self.entries.get(index).map(|entry| entry.path.clone()) else {
             return;
         };
@@ -1834,12 +2000,26 @@ impl Audit {
 
             if let Some(image) = loaded {
                 let _ = this.update(cx, |audit, cx| {
-                    audit.thumbs.insert(index, image);
-                    cx.notify();
+                    if audit.dataset_generation == dataset_generation {
+                        audit.thumbs.insert(index, image);
+                        cx.notify();
+                    }
                 });
             }
         })
         .detach();
+    }
+}
+
+fn conversion_targets(visible: &[usize], selected: &HashSet<usize>) -> Vec<usize> {
+    if selected.is_empty() {
+        visible.to_vec()
+    } else {
+        visible
+            .iter()
+            .copied()
+            .filter(|index| selected.contains(index))
+            .collect()
     }
 }
 
@@ -2114,6 +2294,9 @@ impl TableDelegate for AuditTable {
                                     return;
                                 };
                                 audit.update(cx, |audit, cx| {
+                                    if audit.converting {
+                                        return;
+                                    }
                                     if !audit.selected.remove(&index) {
                                         audit.selected.insert(index);
                                     }
@@ -2281,6 +2464,53 @@ impl Render for Audit {
             });
         }
 
+        if let Some(scanning) = self.scanning.as_ref() {
+            let label = scanning.clone();
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .bg(cx.theme().background)
+                .font_family("sans-serif")
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .w(px(420.))
+                        .px_4()
+                        .py_4()
+                        .rounded_lg()
+                        .bg(cx.theme().secondary)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .text_size(px(18.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(cx.theme().foreground)
+                                .child(format!("Scanning {label}…")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(
+                                    "The current folder stays untouched until the scan finishes.",
+                                ),
+                        ),
+                )
+                .on_drop(cx.listener(|audit, paths: &gpui::ExternalPaths, _, cx| {
+                    if let Some(path) = paths.paths().first() {
+                        audit.request_path(path.clone(), cx);
+                    }
+                }))
+                .into_any_element();
+        }
+
         if self.entries.is_empty() && !self.root.is_dir() {
             return div()
                 .size_full()
@@ -2369,7 +2599,7 @@ impl Render for Audit {
                 .on_drop(cx.listener(|audit, paths: &gpui::ExternalPaths, _, cx| {
                     audit.drag_over = false;
                     if let Some(path) = paths.paths().first() {
-                        audit.open_path(path.clone(), cx);
+                        audit.request_path(path.clone(), cx);
                     }
                 }))
                 .into_any_element();
@@ -2460,7 +2690,7 @@ impl Render for Audit {
             .on_drop(cx.listener(|audit, paths: &gpui::ExternalPaths, _, cx| {
                 audit.drag_over = false;
                 if let Some(path) = paths.paths().first() {
-                    audit.open_path(path.clone(), cx);
+                    audit.request_path(path.clone(), cx);
                 }
             }))
             .child(self.header(count, cx))
@@ -2633,17 +2863,19 @@ fn convert_headless(
         }
     }
 
-    let saved = before.saturating_sub(after);
-    let percent = saved as f64 / before.max(1) as f64 * 100.;
+    let growth = after > before;
+    let delta = before.abs_diff(after);
+    let percent = delta as f64 / before.max(1) as f64 * 100.;
     println!(
-        "\n{} converted to {} at {} ({}): {} -> {}, saved {} ({percent:.0}%){}",
+        "\n{} converted to {} at {} ({}): {} -> {}, {} {} ({percent:.0}%){}",
         entries.len() - failed,
         format.label(),
         quality.label(),
         max_edge.label(),
         format_bytes(before),
         format_bytes(after),
-        format_bytes(saved),
+        if growth { "grew" } else { "saved" },
+        format_bytes(delta),
         if failed == 0 {
             String::new()
         } else {
@@ -2779,6 +3011,9 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
                 let SliderEvent::Change(value) = event else {
                     return;
                 };
+                if audit.converting {
+                    return;
+                }
                 audit.quality = Quality::lossy(value.start());
                 audit.slider_quality = value.start();
                 audit.results.clear();
@@ -2820,12 +3055,16 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
             gallery_columns: None,
             estimate: None,
             estimate_generation: 0,
+            dataset_generation: 0,
+            scan_generation: 0,
+            scanning: None,
             focus,
             titled: String::new(),
             settings: settings::Settings::default(),
             cached: None,
             results: HashMap::new(),
             converting: false,
+            active_target_count: None,
             failures: Vec::new(),
             unreadable,
             drag_over: false,
@@ -3073,6 +3312,18 @@ mod tests {
 
     fn names(entries: &[Entry]) -> Vec<String> {
         entries.iter().map(|entry| entry.name()).collect()
+    }
+
+    #[test]
+    fn conversion_targets_follow_visible_order() {
+        let visible = [2, 0, 1];
+        assert_eq!(conversion_targets(&visible, &HashSet::new()), vec![2, 0, 1]);
+
+        let selected = HashSet::from([0, 3]);
+        assert_eq!(conversion_targets(&visible, &selected), vec![0]);
+
+        let hidden = HashSet::from([3]);
+        assert!(conversion_targets(&visible, &hidden).is_empty());
     }
 
     /// The app sorts indices into an unmoved `entries`; these tests sort the data
@@ -3419,8 +3670,9 @@ mod tests {
         cx.run_until_parked();
         cx.simulate_resize(size(px(873.), px(720.)));
         cx.run_until_parked();
+        let first_scan = scan::scan(&first_folder);
         audit.update_in(cx, |audit, window, cx| {
-            audit.open_path(first_folder, cx);
+            audit.install_dataset(first_scan, first_folder.clone(), false, window, cx);
             window.refresh();
         });
         cx.simulate_resize(size(px(873.), px(720.)));
@@ -3437,8 +3689,9 @@ mod tests {
             audit.gallery_scroll.0.borrow().base_handle.offset().y < px(0.)
         }));
 
+        let second_scan = scan::scan(&second_folder);
         audit.update_in(cx, |audit, window, cx| {
-            audit.open_path(second_folder, cx);
+            audit.install_dataset(second_scan, second_folder.clone(), false, window, cx);
             window.refresh();
         });
         cx.simulate_resize(size(px(873.), px(720.)));
