@@ -777,17 +777,23 @@ impl Audit {
                     // The grid had no way to tick anything; the keyboard was the
                     // only route to a selection you could see in the list.
                     .child(
-                        div().absolute().top(px(4.)).left(px(4.)).child(
-                            Checkbox::new(("tile-tick", index))
-                                .checked(ticked)
-                                .on_click(cx.listener(move |audit, _: &bool, _, cx| {
-                                    if !audit.selected.remove(&index) {
-                                        audit.selected.insert(index);
-                                    }
-                                    audit.schedule_estimate(cx);
-                                    cx.notify();
-                                })),
-                        ),
+                        div()
+                            .absolute()
+                            .top(px(4.))
+                            .left(px(4.))
+                            .debug_selector(move || format!("grid-checkbox-{index}"))
+                            .child(
+                                Checkbox::new(("tile-tick", index))
+                                    .checked(ticked)
+                                    .on_click(cx.listener(move |audit, _: &bool, _, cx| {
+                                        cx.stop_propagation();
+                                        if !audit.selected.remove(&index) {
+                                            audit.selected.insert(index);
+                                        }
+                                        audit.schedule_estimate(cx);
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                     .child(
                         div().absolute().bottom(px(4.)).right(px(4.)).child(
@@ -1973,20 +1979,25 @@ impl TableDelegate for AuditTable {
         match column {
             TableColumn::Tick => {
                 let ticked = audit.selected.contains(&index);
-                Checkbox::new(("tick", index))
-                    .checked(ticked)
-                    .on_click(cx.listener(move |table, _: &bool, _, cx| {
-                        let Some(audit) = table.delegate().audit.upgrade() else {
-                            return;
-                        };
-                        audit.update(cx, |audit, cx| {
-                            if !audit.selected.remove(&index) {
-                                audit.selected.insert(index);
-                            }
-                            audit.schedule_estimate(cx);
-                            cx.notify();
-                        });
-                    }))
+                div()
+                    .debug_selector(move || format!("table-checkbox-{index}"))
+                    .child(
+                        Checkbox::new(("tick", index))
+                            .checked(ticked)
+                            .on_click(cx.listener(move |table, _: &bool, _, cx| {
+                                cx.stop_propagation();
+                                let Some(audit) = table.delegate().audit.upgrade() else {
+                                    return;
+                                };
+                                audit.update(cx, |audit, cx| {
+                                    if !audit.selected.remove(&index) {
+                                        audit.selected.insert(index);
+                                    }
+                                    audit.schedule_estimate(cx);
+                                    cx.notify();
+                                });
+                            })),
+                    )
                     .into_any_element()
             }
             TableColumn::Thumb => div()
@@ -2879,8 +2890,19 @@ mod screenshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
     use image::ImageFormat;
     use std::path::PathBuf;
+
+    struct AuditHarness {
+        audit: gpui::Entity<Audit>,
+    }
+
+    impl gpui::Render for AuditHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.audit.clone()
+        }
+    }
 
     fn entry(name: &str, width: u32, height: u32, bytes: u64, format: ImageFormat) -> Entry {
         Entry {
@@ -2900,6 +2922,81 @@ mod tests {
     /// directly, which is the same comparator either way.
     fn sort_entries(entries: &mut [Entry], sort: Sort) {
         entries.sort_by(|a, b| compare_entries(a, b, sort));
+    }
+
+    fn pointer_checkbox_audit(
+        grid: bool,
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<Audit>, &mut gpui::VisualTestContext) {
+        cx.update(init_theme);
+        let launch = Launch {
+            root: PathBuf::new(),
+            entries: vec![
+                entry("first.png", 10, 10, 100, ImageFormat::Png),
+                entry("second.png", 10, 10, 200, ImageFormat::Png),
+            ],
+            skipped_raw: 0,
+            unreadable: 0,
+            open_single: false,
+            format: Format::WebP,
+            quality: Quality::lossy(80.),
+            max_edge: MaxEdge::FULL,
+            grid,
+        };
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            let built = build_audit(launch, window, cx);
+            AuditHarness { audit: built }
+        });
+        let audit = harness.read_with(cx, |harness, _| harness.audit.clone());
+        audit.update(cx, |audit, _| {
+            audit.selected.extend([0, 1]);
+            audit.estimate = Some((123, 2));
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (audit, cx)
+    }
+
+    fn assert_pointer_checkbox_toggle(
+        audit: &gpui::Entity<Audit>,
+        selector: &'static str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let checkbox = cx
+            .debug_bounds(selector)
+            .expect("the checkbox must be rendered in its parent event tree");
+        let before = audit.read_with(cx, |audit, _| audit.estimate_generation);
+
+        cx.simulate_click(checkbox.center(), gpui::Modifiers::none());
+        audit.read_with(cx, |audit, _| {
+            assert_eq!(audit.selected, [1].into_iter().collect());
+            assert!(audit.compare.is_none());
+            assert_eq!(audit.estimate_generation, before + 1);
+            assert_eq!(audit.estimate, None);
+        });
+
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let checkbox = cx
+            .debug_bounds(selector)
+            .expect("the checkbox must remain rendered after its controlled state changes");
+        cx.simulate_click(checkbox.center(), gpui::Modifiers::none());
+        audit.read_with(cx, |audit, _| {
+            assert_eq!(audit.selected, [0, 1].into_iter().collect());
+            assert!(audit.compare.is_none());
+            assert_eq!(audit.estimate_generation, before + 2);
+            assert_eq!(audit.estimate, None);
+        });
+    }
+
+    #[gpui::test]
+    fn grid_checkbox_pointer_click_stays_inside_checkbox(cx: &mut TestAppContext) {
+        let (audit, cx) = pointer_checkbox_audit(true, cx);
+        assert_pointer_checkbox_toggle(&audit, "grid-checkbox-0", cx);
+    }
+
+    #[gpui::test]
+    fn table_checkbox_pointer_click_stays_inside_checkbox(cx: &mut TestAppContext) {
+        let (audit, cx) = pointer_checkbox_audit(false, cx);
+        assert_pointer_checkbox_toggle(&audit, "table-checkbox-0", cx);
     }
 
     #[test]
