@@ -871,6 +871,11 @@ impl Audit {
             .filter(|entry| entry.extension_lies())
             .count();
         self.entries = scanned.entries;
+        // The scroll handle belongs to the gallery rather than its data. A new folder
+        // can have the same column count, so a render-time column transition cannot
+        // be relied on to bring its first image into view.
+        self.gallery_scroll
+            .scroll_to_item_strict(0, ScrollStrategy::Top);
         self.skipped_raw = scanned.skipped_raw;
         self.unreadable = scanned.unreadable;
         self.thumbs.clear();
@@ -3203,5 +3208,100 @@ mod tests {
         assert!(audit.read_with(cx, |audit, _| {
             audit.gallery_scroll.0.borrow().base_handle.offset().y < px(0.)
         }));
+    }
+
+    #[gpui::test]
+    fn opening_another_large_folder_resets_gallery_scroll_at_the_same_column_count(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0xfc, 0xff, 0x9f, 0x01, 0x00, 0x03, 0x03, 0x02, 0x00, 0xee, 0xfe, 0x3d,
+            0x68, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+
+        let test_root = std::env::temp_dir().join(format!(
+            "imageguide-open-path-scroll-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the system clock is after the Unix epoch")
+                .as_nanos()
+        ));
+        let first_folder = test_root.join("first");
+        let second_folder = test_root.join("second");
+        for folder in [&first_folder, &second_folder] {
+            std::fs::create_dir_all(folder).expect("the test gallery folder is created");
+            for index in 0..120 {
+                std::fs::write(folder.join(format!("image-{index}.png")), PNG)
+                    .expect("the test gallery image is written");
+            }
+        }
+
+        cx.update(init_theme);
+        let mut audit_entity = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let audit = build_audit(
+                Launch {
+                    root: PathBuf::new(),
+                    entries: Vec::new(),
+                    skipped_raw: 0,
+                    unreadable: 0,
+                    open_single: false,
+                    format: Format::WebP,
+                    quality: Quality::lossy(80.),
+                    max_edge: MaxEdge::FULL,
+                    grid: true,
+                },
+                window,
+                cx,
+            );
+            audit_entity = Some(audit.clone());
+            Root::new(audit, window, cx).bg(cx.theme().background)
+        });
+        let audit = audit_entity.expect("audit is built for the production Root");
+
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        audit.update_in(cx, |audit, window, cx| {
+            audit.open_path(first_folder, cx);
+            window.refresh();
+        });
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        audit.update_in(cx, |audit, window, _| {
+            audit
+                .gallery_scroll
+                .scroll_to_item_strict(12, ScrollStrategy::Top);
+            window.refresh();
+        });
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        assert!(audit.read_with(cx, |audit, _| {
+            audit.gallery_scroll.0.borrow().base_handle.offset().y < px(0.)
+        }));
+
+        audit.update_in(cx, |audit, window, cx| {
+            audit.open_path(second_folder, cx);
+            window.refresh();
+        });
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        assert_eq!(
+            audit.read_with(cx, |audit, _| audit
+                .gallery_scroll
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y),
+            px(0.)
+        );
+
+        std::fs::remove_dir_all(test_root).expect("the test gallery folders are removed");
     }
 }
