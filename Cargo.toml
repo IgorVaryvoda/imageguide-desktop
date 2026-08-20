@@ -16,6 +16,9 @@ path = "src/main.rs"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+# The icon SVGs `IconName` refers to. Without an asset source registered on the
+# application every icon resolves to nothing and renders as empty space.
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 image = { version = "0.25", features = ["avif-native"] }
 ravif = "0.13.0"
 rgb = "0.8.53"
@@ -31,6 +34,13 @@ rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] 
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = "0.17.2"
+
+# gpui can render a frame to an image and hand back the pixels, but only with
+# `test-support` on. That is how `cargo test --bin imageguide -- --ignored
+# screenshot` gets a picture of the real window without needing the screen.
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
 
 [profile.release]
 opt-level = 2

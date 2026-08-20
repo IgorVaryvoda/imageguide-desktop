@@ -19,23 +19,52 @@ use compare::Pair;
 use convert::{Format, MaxEdge, Quality};
 use gpui::{
     App, Bounds, Context, FocusHandle, FontWeight, RenderImage, Window, WindowBounds,
-    WindowOptions, div, img, prelude::*, px, rgb, rgba, size, uniform_list, white,
+    WindowOptions, div, img, prelude::*, px, rgb, rgba, size, uniform_list,
 };
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::alert::Alert;
+use gpui_component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::progress::Progress;
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
-use gpui_component::{ActiveTheme, Root, Selectable, Sizable};
+use gpui_component::table::{Column as TableCol, ColumnSort, DataTable, TableDelegate, TableState};
+use gpui_component::tag::Tag;
+use gpui_component::{ActiveTheme, IconName, Root, Selectable, Sizable};
 use gpui_platform::application;
+use image::ImageFormat;
 use scan::{Entry, format_bytes, format_name};
 
-const BACKGROUND: u32 = 0x14161b;
-const ROW: u32 = 0x1b1e25;
-const MUTED: u32 = 0xffffff77;
-const ROW_HEIGHT: f32 = 60.;
-const ACCENT: u32 = 0x8ab4ff;
-const GOOD: u32 = 0x5ec27a;
+// Colours come from `cx.theme()` rather than a private palette. The window is
+// built out of this library's buttons, inputs and tags, and a hand-picked set of
+// greys sitting behind them agreed with nothing — the chrome and the controls were
+// two designs in one window.
+
+/// Rows are for scanning a folder of thousands, so they are sized to fit as many
+/// as possible while still showing a thumbnail you can recognise.
+const ROW_HEIGHT: f32 = 40.;
+const THUMB_SLOT: f32 = 34.;
+
+// ── Column widths ───────────────────────────────────────────────────────────
+// One constant per column, shared by the header and every row. They used to be
+// written twice and had already drifted; a header that sits over the wrong column
+// is worse than no header.
+const W_TICK: f32 = 34.;
+const W_FORMAT: f32 = 82.;
+const W_PIXELS: f32 = 96.;
+const W_DENSITY: f32 = 74.;
+const W_WEIGHT: f32 = 100.;
+const W_RESULT: f32 = 112.;
+/// The weight bar gets a column of its own. Sharing a cell with the figure meant a
+/// left-grown bar under a right-aligned number — an underline for the heaviest file
+/// and a stub stranded half a column from its own number for the lightest.
+const W_BAR: f32 = 140.;
+
+/// Bytes per output pixel, banded. A photographic JPEG lands near 0.2; a
+/// screenshot saved as PNG can be ten times that. The number was already in the
+/// list and every row printed it in the same grey, which made the app's one
+/// diagnostic something you had to read rather than see.
+const DENSITY_GOOD: f32 = 0.5;
+const DENSITY_HEAVY: f32 = 1.5;
 /// How many files encode at once. Each one holds a fully decoded image in memory, so
 /// this is a memory bound as much as a CPU one.
 const WORKERS: usize = 8;
@@ -48,6 +77,95 @@ const TILE_COLUMNS: usize = 5;
 const SAMPLE_SIZE: usize = 4;
 /// Settling time before sampling, so dragging the slider does not start a run per pixel.
 const ESTIMATE_DELAY: Duration = Duration::from_millis(400);
+
+/// Which band a file's byte density falls in. Green is carrying its weight, amber
+/// is suspicious, red is a screenshot saved as a PNG.
+fn density_colour(density: f32, cx: &App) -> gpui::Hsla {
+    if density <= DENSITY_GOOD {
+        cx.theme().green
+    } else if density <= DENSITY_HEAVY {
+        cx.theme().yellow
+    } else {
+        cx.theme().red
+    }
+}
+
+/// Modern formats are the destination, JPEG is a reasonable place to be, and the
+/// rest are the reason this app exists. Colouring the column turns it from a label
+/// into the finding the audit is actually making.
+fn format_colour(format: ImageFormat, cx: &App) -> gpui::Hsla {
+    match format {
+        ImageFormat::WebP | ImageFormat::Avif => cx.theme().green,
+        ImageFormat::Jpeg => cx.theme().blue,
+        _ => cx.theme().yellow,
+    }
+}
+
+/// A label for the comparison view, which floats over the picture rather than over
+/// a theme surface, so it carries its own dark backing.
+fn compare_chip(text: impl Into<gpui::SharedString>, colour: gpui::Hsla, _cx: &App) -> gpui::Div {
+    div()
+        .h(px(18.))
+        .px_2()
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .rounded_md()
+        .bg(rgba(0x000000b8))
+        .text_size(px(10.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(colour)
+        .child(text.into())
+}
+
+/// A proportional bar. The audit is a ranking and a column of numbers does not
+/// rank — 632 KB and 104 KB were set in the same size and colour, so the shape of
+/// the folder was invisible in a list sorted by exactly that.
+fn meter(
+    id: impl Into<gpui::ElementId>,
+    fraction: f32,
+    colour: gpui::Hsla,
+    height: f32,
+) -> Progress {
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0., 1.)
+    } else {
+        0.
+    };
+    Progress::new(id)
+        .value(fraction * 100.)
+        .color(colour)
+        .h(px(height))
+}
+
+/// One option in a segmented control.
+///
+/// The variant is set per option rather than on the group, because a group applies
+/// its own variant to every child — and an outlined group draws the selected child
+/// in the *active* style, which on a near-black theme is the same colour as the
+/// unselected ones. Which option was chosen has to be legible.
+fn segment(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    selected: bool,
+) -> Button {
+    let button = Button::new(id).label(label).selected(selected);
+    if selected {
+        button.primary()
+    } else {
+        button.ghost()
+    }
+}
+
+/// The faint word that says what a group of controls is for.
+fn group_label(text: &'static str, cx: &App) -> gpui::Div {
+    div()
+        .text_size(px(10.))
+        .text_color(cx.theme().muted_foreground)
+        .whitespace_nowrap()
+        .flex_shrink_0()
+        .child(text)
+}
 
 struct Audit {
     root: PathBuf,
@@ -90,6 +208,12 @@ struct Audit {
     filter_input: gpui::Entity<InputState>,
     /// Row the keyboard is on, as a position in `visible`.
     cursor: usize,
+    /// Where the last plain click landed, which is the fixed end of a shift-click
+    /// range. Separate from `cursor` so arrowing around does not move the anchor.
+    anchor: usize,
+    /// The last quality the slider was set to, so turning Lossless off goes back to
+    /// where you were rather than to an arbitrary default.
+    slider_quality: f32,
     /// List or gallery.
     grid: bool,
     /// Projected output size for the current settings, and how many files were
@@ -108,6 +232,19 @@ struct Audit {
     // ponytail: one entry. A pair holds two full-size RGBA buffers — 165 MB for a
     // 5568x3712 photo — so a bigger cache would need a byte budget, not a count.
     cached: Option<(compare::Key, Arc<Pair>)>,
+    /// Bytes of the heaviest visible file, so every row's weight bar is drawn
+    /// against the same scale. Cached because the alternative is a scan of the
+    /// whole list once per row.
+    heaviest: u64,
+    /// Files whose extension disagrees with their contents. Counted once when the
+    /// folder is read, because the check allocates and the filter box would
+    /// otherwise redo it for every entry on every keystroke.
+    mislabelled: usize,
+    /// The list, which the component library owns. It holds a weak handle back to
+    /// this audit and reads its rows through that, so it cannot be built until this
+    /// audit is a live entity: `TableState::new` asks the delegate for its row and
+    /// column counts straight away, and answering that means reading the audit.
+    table: Option<gpui::Entity<TableState<AuditTable>>>,
 }
 
 /// List order. Every column is sortable, and clicking the active one reverses it.
@@ -124,18 +261,6 @@ pub enum Column {
     Pixels,
     Density,
     Weight,
-}
-
-impl Column {
-    fn title(&self) -> &'static str {
-        match self {
-            Column::Name => "Name",
-            Column::Format => "Format",
-            Column::Pixels => "Size",
-            Column::Density => "bpp",
-            Column::Weight => "Weight",
-        }
-    }
 }
 
 /// Ties fall back to the filename so the order is stable between runs — a list that
@@ -180,10 +305,6 @@ struct Comparison {
 }
 
 impl Audit {
-    fn total_bytes(&self) -> u64 {
-        self.entries.iter().map(|entry| entry.bytes).sum()
-    }
-
     /// The rows a conversion would touch. An empty selection means the whole folder,
     /// so the common case needs no ticking.
     fn targets(&self) -> Vec<usize> {
@@ -304,6 +425,15 @@ impl Audit {
         visible.sort_by(|a, b| compare_entries(&entries[*a], &entries[*b], sort));
 
         self.cursor = self.cursor.min(visible.len().saturating_sub(1));
+        // Weight bars are drawn against the heaviest file on screen, so filtering
+        // down to the small ones still spreads them across the column instead of
+        // leaving every bar a stub.
+        self.heaviest = visible
+            .iter()
+            .filter_map(|index| self.entries.get(*index))
+            .map(|entry| entry.bytes)
+            .max()
+            .unwrap_or(0);
         self.visible = visible;
     }
 
@@ -380,7 +510,7 @@ impl Audit {
                     let mut encoded = 0u64;
                     let mut counted = 0usize;
                     for (path, bytes) in sample {
-                        let Some(image) = image::open(&path).ok().map(|i| max_edge.apply(i)) else {
+                        let Some(image) = scan::decode(&path).map(|i| max_edge.apply(i)) else {
                             continue;
                         };
                         let Some(output) = convert::encode(&image, format, quality) else {
@@ -418,6 +548,49 @@ impl Audit {
         }
         let last = self.visible.len() - 1;
         self.cursor = (self.cursor as isize + delta).clamp(0, last as isize) as usize;
+        cx.notify();
+    }
+
+    /// What a click on a row means, by the rules every file list uses: plain click
+    /// selects just that row, the platform modifier adds or removes one, shift takes
+    /// the run from the last click, and a second click opens it.
+    ///
+    /// A plain click used to open the comparison, which made picking a few files to
+    /// convert a fight with a full-screen preview.
+    fn click_row(&mut self, row: usize, event: &gpui::ClickEvent, cx: &mut Context<Self>) {
+        let Some(entry) = self.entry_at(row) else {
+            return;
+        };
+        let modifiers = event.modifiers();
+
+        if event.click_count() >= 2 {
+            self.cursor = row;
+            self.open_compare(entry, cx);
+            return;
+        }
+
+        if modifiers.platform || modifiers.control {
+            if !self.selected.remove(&entry) {
+                self.selected.insert(entry);
+            }
+        } else if modifiers.shift {
+            // From wherever the last plain click landed to here, inclusive, so a
+            // run of heavy files is two clicks rather than twenty.
+            let (from, to) = if self.anchor <= row {
+                (self.anchor, row)
+            } else {
+                (row, self.anchor)
+            };
+            let run: Vec<usize> = (from..=to).filter_map(|row| self.entry_at(row)).collect();
+            self.selected.extend(run);
+        } else {
+            self.selected.clear();
+            self.selected.insert(entry);
+            self.anchor = row;
+        }
+
+        self.cursor = row;
+        self.schedule_estimate(cx);
         cx.notify();
     }
 
@@ -466,86 +639,106 @@ impl Audit {
         let thumb = self.thumbs.get(&index).cloned();
         let ticked = self.selected.contains(&index);
 
+        let density = entry.bytes_per_pixel();
+
         div()
             .id(("tile", row))
             .w(px(TILE))
             .flex()
             .flex_col()
-            .gap_1()
-            .p_1()
-            .rounded_md()
+            .gap_2()
+            .p_2()
+            .rounded_lg()
             .cursor_pointer()
+            .bg(cx.theme().secondary)
+            // Always bordered, in nothing, so arrowing onto a tile does not shunt
+            // its contents a pixel down and right.
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .when(ticked, |tile| tile.bg(cx.theme().list_active))
             .when(row == self.cursor, |tile| {
-                tile.border_1().border_color(rgb(ACCENT))
+                tile.border_color(cx.theme().primary)
+                    .bg(cx.theme().list_active)
             })
-            .when(ticked, |tile| tile.bg(rgba(0xffffff1f)))
-            .hover(|style| style.bg(rgba(0xffffff14)))
-            .on_click(cx.listener(move |audit, _, _, cx| {
+            .hover(|style| style.bg(cx.theme().list_hover))
+            .on_click(cx.listener(move |audit, event: &gpui::ClickEvent, _, cx| {
                 if let Some(position) = audit.row_of(index) {
-                    audit.cursor = position;
+                    audit.click_row(position, event, cx);
                 }
-                audit.open_compare(index, cx)
             }))
             .child(
                 div()
+                    .relative()
                     .w_full()
-                    .h(px(TILE - 44.))
+                    .h(px(TILE - 68.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded_sm()
-                    .bg(rgba(0xffffff0d))
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(cx.theme().background)
                     .when_some(thumb, |slot, image| {
-                        slot.child(img(image).max_w(px(TILE - 12.)).max_h(px(TILE - 48.)))
-                    }),
+                        slot.child(img(image).max_w(px(TILE - 16.)).max_h(px(TILE - 68.)))
+                    })
+                    // The grid had no way to tick anything; the keyboard was the
+                    // only route to a selection you could see in the list.
+                    .child(
+                        div().absolute().top(px(4.)).left(px(4.)).child(
+                            Checkbox::new(("tile-tick", index))
+                                .checked(ticked)
+                                .on_click(cx.listener(move |audit, _: &bool, _, cx| {
+                                    if !audit.selected.remove(&index) {
+                                        audit.selected.insert(index);
+                                    }
+                                    audit.schedule_estimate(cx);
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .child(
+                        div().absolute().bottom(px(4.)).right(px(4.)).child(
+                            div()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(cx.theme().background.opacity(0.8))
+                                .text_size(px(9.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(format_colour(entry.format, cx))
+                                .child(format_name(entry.format)),
+                        ),
+                    ),
             )
             .child(
                 div()
                     .w_full()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .text_size(px(10.))
-                    .text_color(white())
+                    .whitespace_nowrap()
+                    .text_size(px(11.))
+                    .text_color(cx.theme().foreground)
                     .child(entry.name()),
             )
-            .child(div().text_size(px(10.)).text_color(rgba(MUTED)).child(
-                match self.results.get(&index) {
-                    Some(bytes) => {
-                        format!("{} → {}", format_bytes(entry.bytes), format_bytes(*bytes))
-                    }
-                    None => format_bytes(entry.bytes),
-                },
-            ))
-    }
-
-    fn column_header(
-        &self,
-        column: Column,
-        width: Option<f32>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let active = self.sort.column == column;
-        let arrow = if !active {
-            ""
-        } else if self.sort.descending {
-            " ↓"
-        } else {
-            " ↑"
-        };
-
-        let header = div()
-            .id(gpui::SharedString::from(format!("col-{}", column.title())))
-            .cursor_pointer()
-            .text_size(px(11.))
-            .text_color(if active { rgb(ACCENT) } else { rgba(MUTED) })
-            .hover(|style| style.text_color(white()))
-            .child(format!("{}{arrow}", column.title()))
-            .on_click(cx.listener(move |audit, _, _, cx| audit.set_sort(column, cx)));
-
-        match width {
-            Some(width) => header.w(px(width)),
-            None => header.flex_1().min_w_0(),
-        }
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(10.))
+                    .child(div().text_color(cx.theme().muted_foreground).child(
+                        match self.results.get(&index) {
+                            Some(bytes) => {
+                                format!("{} → {}", format_bytes(entry.bytes), format_bytes(*bytes))
+                            }
+                            None => format_bytes(entry.bytes),
+                        },
+                    ))
+                    .child(
+                        div()
+                            .text_color(density_colour(density, cx))
+                            .child(format!("{density:.2}")),
+                    ),
+            )
     }
 
     /// Point the audit at a new folder, or a single file. Everything derived from the
@@ -572,6 +765,11 @@ impl Audit {
         };
 
         self.root = root;
+        self.mislabelled = scanned
+            .entries
+            .iter()
+            .filter(|entry| entry.extension_lies())
+            .count();
         self.entries = scanned.entries;
         self.skipped_raw = scanned.skipped_raw;
         self.unreadable = scanned.unreadable;
@@ -633,35 +831,40 @@ impl Audit {
         .detach();
     }
 
+    /// A quiet button, for the things that move you around rather than commit work.
     fn toolbar_button(
         &self,
         id: &'static str,
         text: &'static str,
+        tooltip: &'static str,
+        icon: IconName,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-    ) -> impl IntoElement {
+    ) -> Button {
         Button::new(id)
-            .ghost()
-            .xsmall()
+            .small()
+            .icon(icon)
             .label(text)
+            .tooltip(tooltip)
             .on_click(cx.listener(move |audit, _, _, cx| on_click(audit, cx)))
     }
 
-    /// A button that stays lit while its value is the active one.
-    fn choice_button(
+    /// Several exclusive options as one control, under the word for what they choose.
+    /// The old toolbar was thirteen identical ghost buttons in a row with a 12px gap
+    /// standing in for grouping, and nothing said which was which.
+    fn control_group(
         &self,
-        id: impl Into<gpui::ElementId>,
-        label: String,
-        selected: bool,
+        label: &'static str,
+        group: ButtonGroup,
         cx: &mut Context<Self>,
-        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
-        Button::new(id)
-            .ghost()
-            .xsmall()
-            .selected(selected)
-            .label(label)
-            .on_click(cx.listener(move |audit, _, _, cx| on_click(audit, cx)))
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .child(group_label(label, cx))
+            .child(group.small().compact())
     }
 
     /// Open the side-by-side view for a row and start building both sides.
@@ -817,12 +1020,18 @@ impl Audit {
                 }),
             );
 
-        if let Some(pair) = comparison.pair.as_ref() {
+        // Fit never scales up: a 400px thumbnail blown across a 4K window is just a
+        // blurry 400px thumbnail. Computed before the branch because the chrome
+        // reports the zoom as well as the image using it.
+        let scale = comparison.pair.as_ref().map(|pair| {
+            let fit = (view_w / pair.width as f32)
+                .min(view_h / pair.height as f32)
+                .min(1.);
+            comparison.zoom.unwrap_or(fit)
+        });
+
+        if let (Some(pair), Some(scale)) = (comparison.pair.as_ref(), scale) {
             let natural = (pair.width as f32, pair.height as f32);
-            // Fit never scales up: a 400px thumbnail blown across a 4K window is just
-            // a blurry 400px thumbnail.
-            let fit = (view_w / natural.0).min(view_h / natural.1).min(1.);
-            let scale = comparison.zoom.unwrap_or(fit);
             let (image_w, image_h) = (natural.0 * scale, natural.1 * scale);
             // Negative when the image is larger than the window: that is the crop.
             let left = (view_w - image_w) / 2. + comparison.pan.0;
@@ -839,141 +1048,577 @@ impl Audit {
                     .child(img(image.clone()).w(px(image_w)).h(px(image_h)))
             };
 
-            stage = stage
-                .child(placed(&pair.converted))
-                .child(
-                    // The original, clipped to everything left of the divider. Its
-                    // child keeps full width so both sides stay in register.
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .h_full()
-                        .w(px(divider))
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .w(px(view_w))
-                                .h(px(view_h))
-                                .child(placed(&pair.original)),
-                        ),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left(px(divider - 1.))
-                        .w(px(2.))
-                        .h_full()
-                        .bg(rgba(0xffffffcc)),
-                )
-                .child(label(
-                    px(12.),
-                    px(12.),
-                    format!("original · {}", format_bytes(source_bytes)),
-                    white(),
-                ))
-                .child(label(
-                    px(view_w - 240.),
-                    px(12.),
-                    format!(
-                        "{} {} · {} · {:+.0}%",
-                        self.format.label(),
-                        self.quality.label(),
-                        format_bytes(pair.converted_bytes),
-                        pair.saving_percent(source_bytes)
-                    ),
-                    rgb(GOOD),
-                ))
-                .child(label(
-                    px(12.),
-                    px(view_h - 32.),
-                    format!(
-                        "{name} · {}×{} · {:.0}%  ·  scroll to zoom · drag to pan · F fit · 1 actual · ← → next",
-                        pair.width,
-                        pair.height,
-                        scale * 100.
-                    ),
-                    rgba(MUTED),
-                ));
-        } else {
-            stage = stage.child(label(
-                px(12.),
-                px(12.),
-                "decoding…".to_string(),
-                rgba(MUTED),
-            ));
+            stage =
+                stage
+                    .child(placed(&pair.converted))
+                    .child(
+                        // The original, clipped to everything left of the divider. Its
+                        // child keeps full width so both sides stay in register.
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .h_full()
+                            .w(px(divider))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .w(px(view_w))
+                                    .h(px(view_h))
+                                    .child(placed(&pair.original)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left(px(divider - 1.))
+                            .w(px(2.))
+                            .h_full()
+                            .bg(rgba(0xffffffcc)),
+                    )
+                    .child(
+                        // Which side is which, pinned to the divider rather than to the
+                        // window, so it stays true as the divider moves.
+                        div()
+                            .absolute()
+                            .top(px(48.))
+                            .left(px(divider - 76.))
+                            .w(px(64.))
+                            .flex()
+                            .justify_end()
+                            .child(compare_chip("original", cx.theme().foreground, cx)),
+                    )
+                    .child(div().absolute().top(px(48.)).left(px(divider + 12.)).child(
+                        compare_chip(self.format.label().to_uppercase(), cx.theme().green, cx),
+                    ));
         }
+
+        // Chrome as two full-width bars. These were black boxes pinned at
+        // hand-computed offsets, the right-hand one at `view_w - 240` — a number
+        // that stopped being the right edge the moment the text or window changed.
+        let (saving_text, saving_colour) = match comparison.pair.as_ref() {
+            Some(pair) => {
+                let saving = pair.saving_percent(source_bytes);
+                if saving >= 0. {
+                    (format!("−{saving:.0}%"), cx.theme().green)
+                } else {
+                    (format!("+{:.0}%", -saving), cx.theme().yellow)
+                }
+            }
+            None => (String::new(), cx.theme().green),
+        };
 
         stage
             .child(
                 div()
-                    .id("compare-close")
                     .absolute()
-                    .top(px(8.))
-                    .right(px(8.))
+                    .left_0()
+                    .right_0()
+                    .top_0()
+                    .flex()
+                    .items_center()
+                    .gap_3()
                     .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
+                    .py_2()
+                    .bg(rgba(0x000000bf))
                     .text_size(px(12.))
-                    .bg(rgba(0x000000aa))
-                    .text_color(white())
-                    .child("close")
-                    .on_click(cx.listener(|audit, _, _, cx| {
-                        audit.compare = None;
-                        cx.notify();
-                    })),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_color(cx.theme().foreground)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(name.clone()),
+                    )
+                    .children(comparison.pair.as_ref().map(|pair| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .text_color(cx.theme().muted_foreground)
+                            .whitespace_nowrap()
+                            .child(format!(
+                                "{} → {} {} · {}",
+                                format_bytes(source_bytes),
+                                self.format.label().to_uppercase(),
+                                self.quality.label(),
+                                format_bytes(pair.converted_bytes)
+                            ))
+                            .child(compare_chip(saving_text, saving_colour, cx))
+                    }))
+                    .child(
+                        Button::new("compare-close")
+                            .small()
+                            .icon(IconName::Close)
+                            .tooltip("Back to the audit")
+                            .on_click(cx.listener(|audit, _, _, cx| {
+                                audit.compare = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .bg(rgba(0x000000bf))
+                    .text_size(px(11.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .text_color(rgba(0xffffffcc))
+                            .child(match (comparison.pair.as_ref(), scale) {
+                                (Some(pair), Some(scale)) => {
+                                    format!("{}×{} · {:.0}%", pair.width, pair.height, scale * 100.)
+                                }
+                                _ => "decoding…".to_string(),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .whitespace_nowrap()
+                            .text_color(rgba(0xffffff8a))
+                            .child(
+                                "scroll zoom · drag pan · F fit · 1 actual · ←→ next · esc close",
+                            ),
+                    ),
             )
             .into_any_element()
     }
 
-    fn size_button(&self, max_edge: MaxEdge, cx: &mut Context<Self>) -> impl IntoElement {
-        self.choice_button(
-            gpui::SharedString::from(format!("size-{}", max_edge.label())),
-            max_edge.label(),
-            self.max_edge == max_edge,
-            cx,
-            move |audit, cx| {
-                audit.max_edge = max_edge;
+    /// The resize presets, as one segmented control. `ButtonGroup` reports the index
+    /// that was clicked, so the options are listed once and read back by position.
+    fn resize_group(&self, cx: &mut Context<Self>) -> ButtonGroup {
+        let options = MaxEdge::PRESETS;
+        ButtonGroup::new("resize")
+            .children(options.iter().map(|edge| {
+                segment(
+                    gpui::SharedString::from(edge.label()),
+                    edge.label(),
+                    self.max_edge == *edge,
+                )
+            }))
+            .on_click(cx.listener(move |audit, clicked: &Vec<usize>, _, cx| {
+                let Some(edge) = clicked.first().and_then(|index| options.get(*index)) else {
+                    return;
+                };
+                audit.max_edge = *edge;
                 audit.results.clear();
                 audit.schedule_estimate(cx);
                 cx.notify();
-            },
-        )
+            }))
     }
 
-    fn format_button(&self, format: Format, cx: &mut Context<Self>) -> impl IntoElement {
-        self.choice_button(
-            gpui::SharedString::from(format.label()),
-            format.label().to_string(),
-            self.format == format,
-            cx,
-            move |audit, cx| {
-                audit.format = format;
+    fn format_group(&self, cx: &mut Context<Self>) -> ButtonGroup {
+        let options = [Format::WebP, Format::Avif];
+        ButtonGroup::new("format")
+            .children(options.iter().map(|format| {
+                segment(
+                    format.label(),
+                    format.label().to_uppercase(),
+                    self.format == *format,
+                )
+            }))
+            .on_click(cx.listener(move |audit, clicked: &Vec<usize>, _, cx| {
+                let Some(format) = clicked.first().and_then(|index| options.get(*index)) else {
+                    return;
+                };
+                audit.format = *format;
                 // Results describe the old format; keeping them would mislabel them.
                 audit.results.clear();
                 audit.schedule_estimate(cx);
                 cx.notify();
-            },
-        )
+            }))
     }
 
-    fn quality_button(&self, quality: Quality, cx: &mut Context<Self>) -> impl IntoElement {
-        self.choice_button(
-            gpui::SharedString::from(quality.label()),
-            quality.label(),
-            self.quality == quality,
-            cx,
-            move |audit, cx| {
-                audit.quality = quality;
-                audit.results.clear();
-                audit.schedule_estimate(cx);
-                cx.notify();
-            },
+    /// Bytes of what is on screen. With a filter active the folder total would be
+    /// describing files the list is not showing.
+    fn visible_bytes(&self) -> u64 {
+        self.visible
+            .iter()
+            .filter_map(|index| self.entries.get(*index))
+            .map(|entry| entry.bytes)
+            .sum()
+    }
+
+    /// Which folder this is, and how to get to another one.
+    fn header(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let folder = self
+            .root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.root.display().to_string());
+
+        let mut stats = if count == self.entries.len() {
+            format!("{count} images · {}", format_bytes(self.visible_bytes()))
+        } else {
+            format!(
+                "{count} of {} images · {}",
+                self.entries.len(),
+                format_bytes(self.visible_bytes())
+            )
+        };
+        if self.skipped_raw > 0 {
+            stats.push_str(&format!(" · {} camera raw skipped", self.skipped_raw));
+        }
+
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                // The folder name identifies it; the full path only locates it, so
+                // it goes underneath at a size that says so.
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().foreground)
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(folder),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .whitespace_nowrap()
+                                    .flex_shrink_0()
+                                    .child(stats),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(cx.theme().muted_foreground.opacity(0.7))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(self.root.display().to_string()),
+                    ),
+            )
+            .child(
+                div().w(px(190.)).flex_shrink_0().child(
+                    Input::new(&self.filter_input)
+                        .small()
+                        .cleanable(true)
+                        .prefix(IconName::Search),
+                ),
+            )
+            .child(self.toolbar_button(
+                "view-grid",
+                if self.grid { "List" } else { "Grid" },
+                if self.grid {
+                    "Show the audit as a list"
+                } else {
+                    "Show the images as a gallery"
+                },
+                if self.grid {
+                    IconName::Menu
+                } else {
+                    IconName::LayoutDashboard
+                },
+                cx,
+                |audit, cx| {
+                    audit.grid = !audit.grid;
+                    cx.notify();
+                },
+            ))
+            .child(self.toolbar_button(
+                "open-folder",
+                "Folder",
+                "Audit a different folder",
+                IconName::Folder,
+                cx,
+                |audit, cx| audit.pick(true, cx),
+            ))
+            .child(self.toolbar_button(
+                "open-file",
+                "Image",
+                "Open a single image in the comparison",
+                IconName::File,
+                cx,
+                |audit, cx| audit.pick(false, cx),
+            ))
+    }
+
+    /// The three knobs that decide what a conversion produces, each under its own
+    /// name and drawn as one control rather than a run of loose buttons.
+    fn controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let lossless = self.quality == Quality::LOSSLESS;
+        div()
+            .flex()
+            .items_center()
+            .gap_4()
+            .child(self.control_group("Resize", self.resize_group(cx), cx))
+            .child(self.control_group("Format", self.format_group(cx), cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .child(group_label("Quality", cx))
+                    .child(
+                        div()
+                            .w(px(130.))
+                            .child(Slider::new(&self.quality_slider).horizontal()),
+                    )
+                    .child(
+                        div()
+                            .w(px(26.))
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .whitespace_nowrap()
+                            .text_color(if lossless {
+                                cx.theme().muted_foreground
+                            } else {
+                                cx.theme().foreground
+                            })
+                            .child(match self.quality.0 {
+                                Some(value) => format!("{}", value.round() as u32),
+                                None => "—".to_string(),
+                            }),
+                    )
+                    .child(segment("lossless", "Lossless", lossless).small().on_click(
+                        cx.listener(|audit, _, _, cx| {
+                            // A second click on a lit toggle has to turn it off,
+                            // or lossless is a one-way door.
+                            audit.quality = if audit.quality == Quality::LOSSLESS {
+                                Quality::lossy(audit.slider_quality)
+                            } else {
+                                Quality::LOSSLESS
+                            };
+                            audit.results.clear();
+                            audit.schedule_estimate(cx);
+                            cx.notify();
+                        }),
+                    )),
+            )
+    }
+
+    /// The payoff, said once and out loud: what the folder costs now, what it would
+    /// cost converted, and the button that does it. This used to be 11px of grey
+    /// wedged between the button and the window edge — the wrong volume for the only
+    /// number the app exists to produce.
+    fn summary(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let targets = self.targets();
+        let source: u64 = targets
+            .iter()
+            .filter_map(|index| self.entries.get(*index))
+            .map(|entry| entry.bytes)
+            .sum();
+
+        // Four states, one shape: a headline, the share it leaves behind, and a
+        // sentence of detail.
+        let (headline, tone, detail, bar) = if self.converting {
+            let done = self.results.len() + self.failures.len();
+            (
+                format!("{done} of {}", targets.len()),
+                cx.theme().foreground,
+                format!(
+                    "Converting to {} {}…",
+                    self.format.label().to_uppercase(),
+                    self.quality.label()
+                ),
+                Some((
+                    done as f32 / targets.len().max(1) as f32,
+                    cx.theme().primary,
+                )),
+            )
+        } else if !self.results.is_empty() {
+            let (before, after) = self.converted_totals();
+            let saved = before.saturating_sub(after);
+            (
+                format!("{} saved", format_bytes(saved)),
+                cx.theme().green,
+                format!(
+                    "{} converted · {} → {}",
+                    self.results.len(),
+                    format_bytes(before),
+                    format_bytes(after)
+                ),
+                Some((after as f32 / before.max(1) as f32, cx.theme().green)),
+            )
+        } else if let Some((projected, sampled)) = self.estimate {
+            let saved = source.saturating_sub(projected);
+            (
+                format!("{} to save", format_bytes(saved)),
+                cx.theme().green,
+                format!(
+                    "{} now → ≈{} as {} {} · sampled {sampled}",
+                    format_bytes(source),
+                    format_bytes(projected),
+                    self.format.label().to_uppercase(),
+                    self.quality.label()
+                ),
+                Some((projected as f32 / source.max(1) as f32, cx.theme().green)),
+            )
+        } else {
+            (
+                "Sizing it up…".to_string(),
+                cx.theme().muted_foreground,
+                format!("{} on disk", format_bytes(source)),
+                None,
+            )
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .bg(cx.theme().secondary)
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(17.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tone)
+                            .whitespace_nowrap()
+                            .flex_shrink_0()
+                            .child(headline),
+                    )
+                    // The share saved, which is the number people actually quote.
+                    .children(bar.map(|(remaining, _)| {
+                        Tag::success()
+                            .small()
+                            .child(format!("−{:.0}%", (1. - remaining).max(0.) * 100.))
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(11.))
+                            .text_color(cx.theme().muted_foreground)
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(detail),
+                    )
+                    .when(!self.selected.is_empty() && !self.converting, |row| {
+                        row.child(
+                            Button::new("select-none")
+                                .ghost()
+                                .small()
+                                .label(format!("Clear {}", self.selected.len()))
+                                .on_click(cx.listener(|audit, _, _, cx| {
+                                    audit.selected.clear();
+                                    audit.schedule_estimate(cx);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when(!self.results.is_empty() && !self.converting, |row| {
+                        row.child(
+                            Button::new("reveal")
+                                .outline()
+                                .small()
+                                .icon(IconName::FolderOpen)
+                                .label("Show output")
+                                .on_click(cx.listener(|audit, _, _, _| audit.reveal_output())),
+                        )
+                    })
+                    .child(
+                        Button::new("convert")
+                            .primary()
+                            .small()
+                            .when(self.converting || targets.is_empty(), |button| {
+                                button.ghost()
+                            })
+                            .label(if self.converting {
+                                "Converting…".to_string()
+                            } else if self.selected.is_empty() {
+                                format!("Convert all to {}", self.format.label().to_uppercase())
+                            } else {
+                                format!(
+                                    "Convert {} to {}",
+                                    self.selected.len(),
+                                    self.format.label().to_uppercase()
+                                )
+                            })
+                            .on_click(cx.listener(|audit, _, _, cx| audit.start_conversion(cx))),
+                    ),
+            )
+            .children(bar.map(|(remaining, colour)| meter("saving", 1. - remaining, colour, 4.)))
+    }
+
+    /// Everything the scan could not take at face value, in one line rather than
+    /// three scattered ones.
+    fn notices(&self) -> Option<gpui::AnyElement> {
+        let mut parts = Vec::new();
+        if self.mislabelled > 0 {
+            parts.push(match self.mislabelled {
+                1 => "1 file is not the format its extension claims".to_string(),
+                many => format!("{many} files are not the format their extension claims"),
+            });
+        }
+        if self.unreadable > 0 {
+            parts.push(format!("{} would not decode", self.unreadable));
+        }
+        if !self.failures.is_empty() {
+            // Name a few. A bare count is not a report.
+            let named: Vec<&str> = self
+                .failures
+                .iter()
+                .take(3)
+                .map(|name| name.as_str())
+                .collect();
+            let rest = self.failures.len().saturating_sub(named.len());
+            parts.push(match rest {
+                0 => format!("failed: {}", named.join(", ")),
+                rest => format!("failed: {} and {rest} more", named.join(", ")),
+            });
+        }
+        if parts.is_empty() {
+            return None;
+        }
+
+        // Left-aligned and only as wide as its text. A full-bleed box for six words
+        // was a bigger shape on screen than the finding it was reporting.
+        Some(
+            Alert::warning("notices", parts.join("  ·  "))
+                .icon(IconName::TriangleAlert)
+                .py_1()
+                .into_any_element(),
         )
     }
 
@@ -1001,162 +1646,374 @@ impl Audit {
         })
         .detach();
     }
+}
 
-    fn row(&self, row: usize, index: usize, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let Some(entry) = self.entries.get(index) else {
-            return div().id(row);
-        };
-        let thumb = self.thumbs.get(&index).cloned();
-        let on_cursor = row == self.cursor;
+/// The audit list, as the component library's virtualised table.
+///
+/// It was a `uniform_list` with the header, the column widths, the sort arrows and
+/// the hit testing all written by hand and kept in step by hand. The delegate hands
+/// all of that to the library, which is also where column resizing and dragging come
+/// from for free.
+struct AuditTable {
+    /// Weak, because the audit owns the table state, which owns this.
+    audit: gpui::WeakEntity<Audit>,
+    columns: Vec<TableColumn>,
+    /// Width for the name column, recomputed from the window so the fixed columns
+    /// do not leave an empty strip on the right. Columns here take a width, not a
+    /// share, so somebody has to do the arithmetic.
+    name_width: f32,
+}
 
-        div()
-            .id(row)
-            .flex()
-            .w_full()
-            .items_center()
-            .gap_3()
-            .px_3()
-            .h(px(ROW_HEIGHT - 4.))
-            .rounded_md()
-            .bg(rgb(ROW))
-            .when(on_cursor, |row| {
-                row.border_1()
-                    .border_color(rgb(ACCENT))
-                    .bg(rgba(0xffffff0f))
-            })
-            .cursor_pointer()
-            .hover(|style| style.bg(rgba(0xffffff14)))
-            .on_click(cx.listener(move |audit, _, _, cx| {
-                if let Some(position) = audit.row_of(index) {
-                    audit.cursor = position;
-                }
-                audit.open_compare(index, cx)
-            }))
-            .text_size(px(12.))
-            .child({
-                let ticked = self.selected.contains(&index);
-                div()
-                    .id(("tick", index))
-                    .w(px(16.))
-                    .h(px(16.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if ticked {
-                        rgb(ACCENT)
-                    } else {
-                        rgba(0xffffff33)
-                    })
-                    .bg(if ticked {
-                        rgb(ACCENT)
-                    } else {
-                        rgba(0x00000000)
-                    })
-                    .text_size(px(10.))
-                    .text_color(rgb(BACKGROUND))
-                    .child(if ticked { "✓" } else { "" })
-                    .on_click(cx.listener(move |audit, _, _, cx| {
-                        // Without this the click also opens the comparison behind it.
-                        cx.stop_propagation();
-                        if !audit.selected.remove(&index) {
-                            audit.selected.insert(index);
-                        }
-                        cx.notify();
-                    }))
-            })
-            .child(
-                // A fixed slot, so rows do not jump as thumbnails arrive.
-                div()
-                    .w(px(52.))
-                    .h(px(48.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .bg(rgba(0xffffff0d))
-                    .when_some(thumb, |slot, image| {
-                        slot.child(img(image).max_w(px(52.)).max_h(px(48.)))
-                    }),
-            )
-            .child(
-                // min_w_0 lets a long filename shrink instead of shoving the
-                // number columns off the right edge.
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_color(white())
-                    .child(entry.name()),
-            )
-            .child(
-                div()
-                    .w(px(52.))
-                    .text_color(rgb(0x8ab4ff))
-                    .child(format_name(entry.format)),
-            )
-            .child(
-                div()
-                    .w(px(96.))
-                    .text_color(rgba(MUTED))
-                    .child(format!("{}×{}", entry.width, entry.height)),
-            )
-            .child(
-                div()
-                    .w(px(76.))
-                    .text_color(rgba(MUTED))
-                    .child(format!("{:.2} bpp", entry.bytes_per_pixel())),
-            )
-            .child(
-                div()
-                    .w(px(76.))
-                    .text_color(white())
-                    .child(format_bytes(entry.bytes)),
-            )
-            .child(
-                div()
-                    .w(px(132.))
-                    .when_some(self.results.get(&index), |slot, converted| {
-                        let saved = entry.bytes.saturating_sub(*converted);
-                        let percent = if entry.bytes == 0 {
-                            0.
-                        } else {
-                            saved as f32 / entry.bytes as f32 * 100.
-                        };
-                        // A file that grew is a real outcome, not a rounding error:
-                        // re-encoding an already-optimal JPEG usually costs bytes.
-                        let grew = *converted > entry.bytes;
-                        slot.text_color(if grew { rgba(MUTED) } else { rgb(GOOD) })
-                            .child(if grew {
-                                format!("→ {} (larger)", format_bytes(*converted))
-                            } else {
-                                format!("→ {}  −{percent:.0}%", format_bytes(*converted))
-                            })
-                    }),
-            )
+/// The columns, in display order. `Column` is what the audit sorts by; this adds the
+/// ones that carry no sortable value of their own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableColumn {
+    Tick,
+    Thumb,
+    Name,
+    Format,
+    Pixels,
+    Density,
+    Bar,
+    Weight,
+    Result,
+}
+
+impl TableColumn {
+    /// The audit column this sorts by, if it sorts.
+    fn sorts_by(&self) -> Option<Column> {
+        match self {
+            TableColumn::Name => Some(Column::Name),
+            TableColumn::Format => Some(Column::Format),
+            TableColumn::Pixels => Some(Column::Pixels),
+            TableColumn::Density => Some(Column::Density),
+            TableColumn::Weight => Some(Column::Weight),
+            _ => None,
+        }
+    }
+
+    fn spec(&self, name_width: f32) -> TableCol {
+        match self {
+            TableColumn::Tick => TableCol::new("tick", "").width(px(W_TICK)),
+            TableColumn::Thumb => TableCol::new("thumb", "").width(px(THUMB_SLOT + 12.)).p_0(),
+            // Name takes whatever the other columns leave, so the window has no dead
+            // strip down its right-hand side.
+            TableColumn::Name => TableCol::new("name", "Name")
+                .width(px(name_width))
+                .min_width(px(140.))
+                .sortable()
+                .resizable(true),
+            TableColumn::Format => TableCol::new("format", "Format")
+                .width(px(W_FORMAT))
+                .sortable(),
+            TableColumn::Pixels => TableCol::new("pixels", "Size")
+                .width(px(W_PIXELS))
+                .text_right()
+                .sortable(),
+            TableColumn::Density => TableCol::new("density", "bpp")
+                .width(px(W_DENSITY))
+                .text_right()
+                .sortable(),
+            TableColumn::Bar => TableCol::new("bar", "").width(px(W_BAR)),
+            TableColumn::Weight => TableCol::new("weight", "Weight")
+                .width(px(W_WEIGHT))
+                .text_right()
+                .sortable(),
+            TableColumn::Result => TableCol::new("result", "Result")
+                .width(px(W_RESULT))
+                .text_right(),
+        }
     }
 }
 
-/// A positioned text overlay for the compare view.
-fn label(
-    left: gpui::Pixels,
-    top: gpui::Pixels,
-    text: String,
-    colour: impl Into<gpui::Hsla>,
-) -> impl IntoElement {
-    div()
-        .absolute()
-        .left(left)
-        .top(top)
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .bg(rgba(0x000000aa))
-        .text_size(px(12.))
-        .text_color(colour)
-        .child(text)
+impl AuditTable {
+    /// Everything except the name, which gets the remainder.
+    const FIXED_WIDTH: f32 =
+        W_TICK + THUMB_SLOT + 12. + W_FORMAT + W_PIXELS + W_DENSITY + W_BAR + W_WEIGHT;
+
+    /// Chrome the table spends on gaps, cell padding and its own border.
+    const CHROME: f32 = 30.;
+
+    /// The width left for the name once the fixed columns have taken theirs.
+    ///
+    /// Measured once, when the table is built. It cannot be recomputed during the
+    /// audit's own render: telling the table to re-lay-out makes it ask the delegate
+    /// for its row count, and answering that reads the audit that is mid-render. The
+    /// column is resizable, which covers the rest.
+    fn name_width(window: &Window) -> f32 {
+        (f32::from(window.viewport_size().width) - Self::FIXED_WIDTH - Self::CHROME).max(140.)
+    }
+
+    fn new(audit: gpui::WeakEntity<Audit>, window: &Window) -> Self {
+        Self {
+            audit,
+            name_width: Self::name_width(window),
+            columns: vec![
+                TableColumn::Tick,
+                TableColumn::Thumb,
+                TableColumn::Name,
+                TableColumn::Format,
+                TableColumn::Pixels,
+                TableColumn::Density,
+                TableColumn::Bar,
+                TableColumn::Weight,
+                TableColumn::Result,
+            ],
+        }
+    }
+}
+
+impl TableDelegate for AuditTable {
+    fn columns_count(&self, cx: &App) -> usize {
+        // The result column only exists once there is something to put in it.
+        // Reserving its width up front left a fifth of the window empty in the
+        // common case.
+        let shown = self
+            .audit
+            .upgrade()
+            .is_some_and(|audit| !audit.read(cx).results.is_empty());
+        if shown {
+            self.columns.len()
+        } else {
+            self.columns.len() - 1
+        }
+    }
+
+    fn rows_count(&self, cx: &App) -> usize {
+        self.audit
+            .upgrade()
+            .map_or(0, |audit| audit.read(cx).visible.len())
+    }
+
+    fn column(&self, col_ix: usize, cx: &App) -> TableCol {
+        let Some(column) = self.columns.get(col_ix) else {
+            return TableCol::new("none", "");
+        };
+        let mut spec = column.spec(self.name_width);
+        // Show the arrow on whichever column the audit is actually ordered by.
+        if let Some(sort) = column.sorts_by()
+            && let Some(audit) = self.audit.upgrade()
+        {
+            let audit = audit.read(cx);
+            if audit.sort.column == sort {
+                spec = if audit.sort.descending {
+                    spec.descending()
+                } else {
+                    spec.ascending()
+                };
+            }
+        }
+        spec
+    }
+
+    fn perform_sort(
+        &mut self,
+        col_ix: usize,
+        _sort: ColumnSort,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let Some(column) = self.columns.get(col_ix).and_then(TableColumn::sorts_by) else {
+            return;
+        };
+        let Some(audit) = self.audit.upgrade() else {
+            return;
+        };
+        audit.update(cx, |audit, cx| audit.set_sort(column, cx));
+    }
+
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let row = div().id(("row", row_ix));
+        let Some(audit) = self.audit.upgrade() else {
+            return row;
+        };
+        let ticked = audit
+            .read(cx)
+            .entry_at(row_ix)
+            .is_some_and(|entry| audit.read(cx).selected.contains(&entry));
+
+        row.h(px(ROW_HEIGHT))
+            .when(ticked, |row| row.bg(cx.theme().list_active))
+            .on_click(cx.listener(move |table, event: &gpui::ClickEvent, _, cx| {
+                let Some(audit) = table.delegate().audit.upgrade() else {
+                    return;
+                };
+                audit.update(cx, |audit, cx| audit.click_row(row_ix, event, cx));
+            }))
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let Some(column) = self.columns.get(col_ix).copied() else {
+            return div().into_any_element();
+        };
+        let Some(handle) = self.audit.upgrade() else {
+            return div().into_any_element();
+        };
+
+        // The row the viewport asked for is the row worth decoding.
+        handle.update(cx, |audit, cx| {
+            if let Some(entry) = audit.entry_at(row_ix) {
+                audit.request_thumb(entry, cx);
+            }
+        });
+
+        let audit = handle.read(cx);
+        let Some(index) = audit.entry_at(row_ix) else {
+            return div().into_any_element();
+        };
+        let Some(entry) = audit.entries.get(index) else {
+            return div().into_any_element();
+        };
+
+        match column {
+            TableColumn::Tick => {
+                let ticked = audit.selected.contains(&index);
+                Checkbox::new(("tick", index))
+                    .checked(ticked)
+                    .on_click(cx.listener(move |table, _: &bool, _, cx| {
+                        let Some(audit) = table.delegate().audit.upgrade() else {
+                            return;
+                        };
+                        audit.update(cx, |audit, cx| {
+                            if !audit.selected.remove(&index) {
+                                audit.selected.insert(index);
+                            }
+                            audit.schedule_estimate(cx);
+                            cx.notify();
+                        });
+                    }))
+                    .into_any_element()
+            }
+            TableColumn::Thumb => div()
+                .w(px(THUMB_SLOT))
+                .h(px(THUMB_SLOT))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .bg(cx.theme().background)
+                // A fixed slot, so rows do not jump as thumbnails arrive.
+                .when_some(audit.thumbs.get(&index).cloned(), |slot, image| {
+                    slot.child(img(image).max_w(px(THUMB_SLOT)).max_h(px(THUMB_SLOT)))
+                })
+                .into_any_element(),
+            TableColumn::Name => div()
+                .w_full()
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_color(cx.theme().foreground)
+                .child(entry.name())
+                .into_any_element(),
+            TableColumn::Format => {
+                let lies = entry.extension_lies();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .whitespace_nowrap()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if lies {
+                        cx.theme().yellow
+                    } else {
+                        format_colour(entry.format, cx)
+                    })
+                    .child(format_name(entry.format))
+                    // The extension disagrees with the bytes. The mark is small
+                    // because the count in the notice above is what raises it.
+                    .when(lies, |cell| cell.child(div().text_size(px(11.)).child("≠")))
+                    .into_any_element()
+            }
+            TableColumn::Pixels => div()
+                .text_color(cx.theme().muted_foreground)
+                .whitespace_nowrap()
+                .child(format!("{}×{}", entry.width, entry.height))
+                .into_any_element(),
+            TableColumn::Density => {
+                let density = entry.bytes_per_pixel();
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .whitespace_nowrap()
+                    .text_color(density_colour(density, cx))
+                    .child(format!("{density:.2}"))
+                    .into_any_element()
+            }
+            // Against the heaviest file on screen, so the column shows the shape of
+            // the folder and not just its numbers. All the bars share a left edge,
+            // which is the whole point of drawing them.
+            TableColumn::Bar => div()
+                .w_full()
+                .flex()
+                .items_center()
+                .child(meter(
+                    ("weight", index),
+                    entry.bytes as f32 / audit.heaviest.max(1) as f32,
+                    cx.theme().primary,
+                    4.,
+                ))
+                .into_any_element(),
+            TableColumn::Weight => div()
+                .font_weight(FontWeight::MEDIUM)
+                .whitespace_nowrap()
+                .text_color(cx.theme().foreground)
+                .child(format_bytes(entry.bytes))
+                .into_any_element(),
+            TableColumn::Result => div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .whitespace_nowrap()
+                .when_some(audit.results.get(&index), |slot, converted| {
+                    let saved = entry.bytes.saturating_sub(*converted);
+                    let percent = if entry.bytes == 0 {
+                        0.
+                    } else {
+                        saved as f32 / entry.bytes as f32 * 100.
+                    };
+                    // A file that grew is a real outcome, not a rounding error:
+                    // re-encoding an already-optimal JPEG usually costs bytes.
+                    let grew = *converted > entry.bytes;
+                    slot.child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format_bytes(*converted)),
+                    )
+                    .child(if grew {
+                        Tag::warning().small().child("larger")
+                    } else {
+                        Tag::success().small().child(format!("−{percent:.0}%"))
+                    })
+                })
+                .into_any_element(),
+        }
+    }
+
+    fn render_empty(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        div()
+            .p_4()
+            .w_full()
+            .flex()
+            .justify_center()
+            .text_size(px(12.))
+            .text_color(cx.theme().muted_foreground)
+            .child("Nothing matches that filter")
+    }
 }
 
 impl Render for Audit {
@@ -1192,36 +2049,89 @@ impl Render for Audit {
             return div()
                 .size_full()
                 .flex()
-                .flex_col()
                 .items_center()
                 .justify_center()
-                .gap_4()
+                .p_4()
                 .bg(cx.theme().background)
                 .font_family("sans-serif")
                 .child(
-                    div()
-                        .text_size(px(14.))
-                        .text_color(rgba(MUTED))
-                        .child("Drop a folder or an image here"),
-                )
-                .child(
+                    // A panel rather than loose text, so the window has something in
+                    // it and the drop target has an edge you can see.
                     div()
                         .flex()
+                        .flex_col()
+                        .items_center()
                         .gap_2()
-                        .child(self.toolbar_button(
-                            "empty-folder",
-                            "Open folder…",
-                            cx,
-                            |audit, cx| audit.pick(true, cx),
-                        ))
-                        .child(self.toolbar_button(
-                            "empty-file",
-                            "Open image…",
-                            cx,
-                            |audit, cx| audit.pick(false, cx),
-                        )),
+                        .w(px(400.))
+                        .px_4()
+                        .py_4()
+                        .rounded_lg()
+                        .bg(cx.theme().secondary)
+                        .border_1()
+                        .border_color(if self.drag_over {
+                            cx.theme().drag_border
+                        } else {
+                            cx.theme().border
+                        })
+                        .child(
+                            div()
+                                .text_size(px(17.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(cx.theme().foreground)
+                                .child("Audit a folder of images"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().muted_foreground)
+                                .text_center()
+                                .child(
+                                    "Nothing is uploaded. Every file is read, resized and \
+                                     re-encoded on this machine.",
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .pt_2()
+                                .child(
+                                    Button::new("empty-folder")
+                                        .primary()
+                                        .icon(IconName::Folder)
+                                        .label("Open folder…")
+                                        .on_click(
+                                            cx.listener(|audit, _, _, cx| audit.pick(true, cx)),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("empty-file")
+                                        .outline()
+                                        .icon(IconName::File)
+                                        .label("Open image…")
+                                        .on_click(
+                                            cx.listener(|audit, _, _, cx| audit.pick(false, cx)),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .pt_2()
+                                .text_size(px(11.))
+                                .text_color(cx.theme().muted_foreground.opacity(0.7))
+                                .child("or drop one anywhere in this window"),
+                        ),
                 )
+                .on_drag_move(cx.listener(
+                    |audit, _: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                        if !audit.drag_over {
+                            audit.drag_over = true;
+                            cx.notify();
+                        }
+                    },
+                ))
                 .on_drop(cx.listener(|audit, paths: &gpui::ExternalPaths, _, cx| {
+                    audit.drag_over = false;
                     if let Some(path) = paths.paths().first() {
                         audit.open_path(path.clone(), cx);
                     }
@@ -1272,12 +2182,17 @@ impl Render for Audit {
             .flex()
             .flex_col()
             .gap_2()
-            .p_4()
+            .p_3()
             .bg(cx.theme().background)
             .font_family("sans-serif")
             .track_focus(&self.focus)
-            .when(self.drag_over, |shell| {
-                shell.border_2().border_color(rgb(ACCENT))
+            // Always bordered, so a hovering drag recolours the frame instead of
+            // shifting the whole window's contents inward by two pixels.
+            .border_2()
+            .border_color(if self.drag_over {
+                cx.theme().drag_border
+            } else {
+                gpui::transparent_black()
             })
             .on_drag_move(cx.listener(
                 |audit, _: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
@@ -1312,278 +2227,65 @@ impl Render for Audit {
                     audit.open_path(path.clone(), cx);
                 }
             }))
+            .child(self.header(count, cx))
+            .child(self.controls(cx))
+            .child(self.summary(cx))
+            .children(self.notices())
             .child(
+                // The table gets a surface of its own, so a folder that does not
+                // fill the window reads as a short list rather than a layout that
+                // ran out half way down.
                 div()
                     .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(white())
-                            .child(self.root.display().to_string()),
-                    )
-                    .child(div().text_size(px(12.)).text_color(rgba(MUTED)).child(
-                        match self.skipped_raw {
-                            0 => format!("{count} images · {}", format_bytes(self.total_bytes())),
-                            skipped => format!(
-                                "{count} images · {} · {skipped} camera raw skipped",
-                                format_bytes(self.total_bytes())
-                            ),
-                        },
-                    ))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .w(px(170.))
-                            .child(Input::new(&self.filter_input).xsmall()),
-                    )
-                    .child(self.choice_button(
-                        "view-grid",
-                        if self.grid { "List" } else { "Grid" }.to_string(),
-                        self.grid,
-                        cx,
-                        |audit, cx| {
-                            audit.grid = !audit.grid;
-                            cx.notify();
-                        },
-                    ))
-                    .child(
-                        self.toolbar_button("open-folder", "Folder…", cx, |audit, cx| {
-                            audit.pick(true, cx)
-                        }),
-                    )
-                    .child(self.toolbar_button("open-file", "Image…", cx, |audit, cx| {
-                        audit.pick(false, cx)
-                    })),
-            )
-            .child(
-                // Controls get their own line. Thirteen of them on the title row ran
-                // the Convert button off the right edge of the window.
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(self.size_button(MaxEdge::FULL, cx))
-                    .child(self.size_button(MaxEdge(Some(2400)), cx))
-                    .child(self.size_button(MaxEdge(Some(1600)), cx))
-                    .child(self.size_button(MaxEdge(Some(1000)), cx))
-                    .child(div().w(px(12.)))
-                    .child(self.format_button(Format::WebP, cx))
-                    .child(self.format_button(Format::Avif, cx))
-                    .child(div().w(px(12.)))
-                    .child(
-                        div()
-                            .w(px(150.))
-                            .child(Slider::new(&self.quality_slider).horizontal()),
-                    )
-                    .child(
-                        div()
-                            .w(px(64.))
-                            .text_size(px(12.))
-                            .text_color(rgba(MUTED))
-                            .child(self.quality.label()),
-                    )
-                    .child(self.quality_button(Quality::LOSSLESS, cx))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .id("convert")
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .text_size(px(12.))
-                            .bg(rgba(0xffffff1f))
-                            .text_color(white())
-                            .hover(|style| style.bg(rgba(0xffffff33)))
-                            .child(if self.converting {
-                                format!(
-                                    "Converting {}/{}",
-                                    self.results.len() + self.failures.len(),
-                                    self.targets().len()
-                                )
-                            } else if self.selected.is_empty() {
-                                format!("Convert all to {}", self.format.label().to_uppercase())
-                            } else {
-                                format!(
-                                    "Convert {} to {}",
-                                    self.selected.len(),
-                                    self.format.label().to_uppercase()
-                                )
-                            })
-                            .on_click(cx.listener(|audit, _, _, cx| audit.start_conversion(cx))),
-                    )
-                    .when(!self.converting && self.results.is_empty(), |row| {
-                        let source: u64 = self
-                            .targets()
-                            .iter()
-                            .filter_map(|index| self.entries.get(*index))
-                            .map(|entry| entry.bytes)
-                            .sum();
-                        row.child(div().text_size(px(12.)).text_color(rgba(MUTED)).child(
-                            match self.estimate {
-                                None => "estimating…".to_string(),
-                                Some((projected, sampled)) => format!(
-                                    "≈ {} · −{:.0}% (from {sampled})",
-                                    format_bytes(projected),
-                                    (source.saturating_sub(projected)) as f32
-                                        / source.max(1) as f32
-                                        * 100.
-                                ),
-                            },
-                        ))
-                    })
-                    .when(!self.selected.is_empty(), |row| {
-                        row.child(
-                            self.toolbar_button("select-none", "Clear", cx, |audit, cx| {
-                                audit.selected.clear();
-                                cx.notify();
+                    .flex_col()
+                    .flex_1()
+                    .overflow_hidden()
+                    .rounded_lg()
+                    .bg(cx.theme().table)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    // Columns take a width, not a share, so the remainder after the
+                    // fixed ones has to be handed to the name column by hand.
+                    .child(if self.grid {
+                        // The gallery has no columns to speak of, so it stays a
+                        // uniform list: one row of tiles per list row.
+                        let rows = count.div_ceil(TILE_COLUMNS);
+                        uniform_list(
+                            "gallery",
+                            rows,
+                            cx.processor(|audit, range: std::ops::Range<usize>, _window, cx| {
+                                range
+                                    .map(|band| {
+                                        // A plain loop: the closure form borrows `audit`
+                                        // mutably for `request_thumb` and immutably for
+                                        // `tile`, which nested closures cannot express.
+                                        let first = band * TILE_COLUMNS;
+                                        let last = (first + TILE_COLUMNS).min(audit.visible.len());
+                                        let mut tiles = Vec::new();
+                                        for row in first..last {
+                                            let Some(entry) = audit.entry_at(row) else {
+                                                continue;
+                                            };
+                                            audit.request_thumb(entry, cx);
+                                            tiles.push(audit.tile(row, entry, cx));
+                                        }
+                                        div().flex().gap_2().children(tiles)
+                                    })
+                                    .collect::<Vec<_>>()
                             }),
                         )
-                    })
-                    .when(!self.results.is_empty() && !self.converting, |row| {
-                        row.child(
-                            self.toolbar_button("reveal", "Show output", cx, |audit, _| {
-                                audit.reveal_output()
-                            }),
-                        )
+                        .flex_1()
+                        .p_2()
+                        .into_any_element()
+                    } else if let Some(table) = self.table.as_ref() {
+                        DataTable::new(table)
+                            .stripe(false)
+                            .bordered(false)
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
                     }),
             )
-            .when(!self.failures.is_empty() || self.unreadable > 0, |shell| {
-                let mut parts = Vec::new();
-                if self.unreadable > 0 {
-                    parts.push(format!("{} would not decode", self.unreadable));
-                }
-                if !self.failures.is_empty() {
-                    // Name a few. A bare count is not a report.
-                    let named: Vec<&str> = self
-                        .failures
-                        .iter()
-                        .take(3)
-                        .map(|name| name.as_str())
-                        .collect();
-                    let rest = self.failures.len().saturating_sub(named.len());
-                    parts.push(match rest {
-                        0 => format!("failed: {}", named.join(", ")),
-                        rest => format!("failed: {} and {rest} more", named.join(", ")),
-                    });
-                }
-                shell.child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgb(0xe0a34a))
-                        .child(parts.join(" · ")),
-                )
-            })
-            .when(!self.results.is_empty(), |shell| {
-                let (before, after) = self.converted_totals();
-                let saved = before.saturating_sub(after);
-                let percent = if before == 0 {
-                    0.
-                } else {
-                    saved as f32 / before as f32 * 100.
-                };
-                shell.child(div().text_size(px(12.)).text_color(rgb(GOOD)).child(
-                    match self.failures.len() {
-                        0 => format!(
-                            "{} converted · {} → {} · saved {} ({percent:.0}%)",
-                            self.results.len(),
-                            format_bytes(before),
-                            format_bytes(after),
-                            format_bytes(saved)
-                        ),
-                        failed => format!(
-                            "{} converted · saved {} ({percent:.0}%) · {failed} failed",
-                            self.results.len(),
-                            format_bytes(saved)
-                        ),
-                    },
-                ))
-            })
-            .when(self.converting, |shell| {
-                let done = (self.results.len() + self.failures.len()) as f32;
-                let total = self.targets().len().max(1) as f32;
-                shell.child(Progress::new("convert-progress").value(done / total * 100.))
-            })
-            .when(!self.grid, |shell| {
-                shell.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .px_3()
-                        .pb_1()
-                        .child(
-                            // Tick-all sits where the per-row ticks are.
-                            Checkbox::new("select-all")
-                                .checked(!self.selected.is_empty())
-                                .on_click(cx.listener(|audit, _: &bool, _, cx| {
-                                    if audit.selected.is_empty() {
-                                        audit.selected = (0..audit.entries.len()).collect();
-                                    } else {
-                                        audit.selected.clear();
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(div().w(px(52.)))
-                        .child(self.column_header(Column::Name, None, cx))
-                        .child(self.column_header(Column::Format, Some(52.), cx))
-                        .child(self.column_header(Column::Pixels, Some(96.), cx))
-                        .child(self.column_header(Column::Density, Some(76.), cx))
-                        .child(self.column_header(Column::Weight, Some(76.), cx))
-                        .child(div().w(px(132.))),
-                )
-            })
-            .child(if self.grid {
-                // Same virtualisation, one row of tiles per list row.
-                let rows = count.div_ceil(TILE_COLUMNS);
-                uniform_list(
-                    "gallery",
-                    rows,
-                    cx.processor(|audit, range: std::ops::Range<usize>, _window, cx| {
-                        range
-                            .map(|band| {
-                                // A plain loop: the closure form borrows `audit`
-                                // mutably for `request_thumb` and immutably for
-                                // `tile`, which nested closures cannot express.
-                                let first = band * TILE_COLUMNS;
-                                let last = (first + TILE_COLUMNS).min(audit.visible.len());
-                                let mut tiles = Vec::new();
-                                for row in first..last {
-                                    let Some(entry) = audit.entry_at(row) else {
-                                        continue;
-                                    };
-                                    audit.request_thumb(entry, cx);
-                                    tiles.push(audit.tile(row, entry, cx));
-                                }
-                                div().flex().gap_2().children(tiles)
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .flex_1()
-                .into_any_element()
-            } else {
-                uniform_list(
-                    "images",
-                    count,
-                    cx.processor(|audit, range: std::ops::Range<usize>, _window, cx| {
-                        // Decode only what the viewport asked for.
-                        range
-                            .filter_map(|row| {
-                                let entry = audit.entry_at(row)?;
-                                audit.request_thumb(entry, cx);
-                                Some(audit.row(row, entry, cx))
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .flex_1()
-                .into_any_element()
-            })
             .into_any_element()
     }
 }
@@ -1776,6 +2478,157 @@ fn main() {
     });
 }
 
+/// Build the audit view for a window. Shared by the app and the screenshot harness
+/// so that what gets captured is the thing that ships.
+fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entity<Audit> {
+    let Launch {
+        root,
+        entries,
+        skipped_raw,
+        unreadable,
+        open_single,
+        format,
+        quality,
+        max_edge,
+        grid,
+    } = launch;
+
+    let audit = cx.new(|cx| {
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+
+        let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name"));
+        cx.subscribe(
+            &filter_input,
+            |audit: &mut Audit, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = input.read(cx).value().to_string();
+                    audit.set_filter(value, cx);
+                }
+            },
+        )
+        .detach();
+
+        let quality_slider = cx.new(|_| {
+            SliderState::new()
+                .min(1.)
+                .max(100.)
+                .step(1.)
+                .default_value(quality.0.unwrap_or(80.))
+        });
+        // Dragging the slider is the only thing that changes quality now,
+        // so results from the old value stop being true the moment it moves.
+        cx.subscribe(
+            &quality_slider,
+            |audit: &mut Audit, _, event: &SliderEvent, cx| {
+                let SliderEvent::Change(value) = event else {
+                    return;
+                };
+                audit.quality = Quality::lossy(value.start());
+                audit.slider_quality = value.start();
+                audit.results.clear();
+                audit.schedule_estimate(cx);
+                cx.notify();
+            },
+        )
+        .detach();
+        let mislabelled = entries
+            .iter()
+            .filter(|entry| entry.extension_lies())
+            .count();
+        let mut audit = Audit {
+            table: None,
+            root,
+            entries,
+            skipped_raw,
+            heaviest: 0,
+            mislabelled,
+            thumbs: HashMap::new(),
+            requested: HashSet::new(),
+            format,
+            quality,
+            max_edge,
+            quality_slider,
+            selected: HashSet::new(),
+            sort: Sort {
+                column: Column::Weight,
+                descending: true,
+            },
+            visible: Vec::new(),
+            filter: String::new(),
+            filter_input,
+            cursor: 0,
+            anchor: 0,
+            slider_quality: quality.0.unwrap_or(80.),
+            grid,
+            estimate: None,
+            estimate_generation: 0,
+            focus,
+            titled: String::new(),
+            settings: settings::Settings::default(),
+            cached: None,
+            results: HashMap::new(),
+            converting: false,
+            failures: Vec::new(),
+            unreadable,
+            drag_over: false,
+            compare: None,
+        };
+        audit.refresh_visible();
+        audit.schedule_estimate(cx);
+        if open_single {
+            audit.open_compare(0, cx);
+        }
+        audit
+    });
+
+    // Only now that the audit is a live entity, because building the
+    // table asks the delegate how many rows there are and answering
+    // that means reading the audit.
+    let table = {
+        let delegate = AuditTable::new(audit.downgrade(), window);
+        cx.new(|cx| TableState::new(delegate, window, cx))
+    };
+    audit.update(cx, |audit, _| audit.table = Some(table));
+
+    audit
+}
+
+/// Set the library up and pick the colours. Shared with the screenshot harness, so
+/// what that captures is what the window draws.
+fn init_theme(cx: &mut App) {
+    // Must run before any gpui-component type is constructed.
+    gpui_component::init(cx);
+    // Dark by default. Judging compression against a bright chrome is a bad idea,
+    // and the comparison view is full-bleed imagery either way.
+    gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+    // The stock dark theme paints `primary` white, which makes the one button that
+    // commits work a white slab and leaves nothing to point at anything else. This
+    // app already has a blue.
+    //
+    // Both halves of the theme have to be told. A button takes its fill from the
+    // token set and its label from the colour set, so setting one and not the other
+    // is how you get black text on a blue button.
+    let theme = gpui_component::Theme::global_mut(cx);
+    let base = gpui::Hsla::from(gpui::rgb(0x2f6feb));
+    let hover = gpui::Hsla::from(gpui::rgb(0x3f7dfa));
+    let active = gpui::Hsla::from(gpui::rgb(0x2760d4));
+
+    theme.primary = base;
+    theme.primary_hover = hover;
+    theme.primary_active = active;
+    theme.primary_foreground = gpui::white();
+    theme.button_primary = base;
+    theme.button_primary_hover = hover;
+    theme.button_primary_active = active;
+    theme.button_primary_foreground = gpui::white();
+
+    theme.tokens.button_primary = base.into();
+    theme.tokens.button_primary_hover = hover.into();
+    theme.tokens.button_primary_active = active.into();
+    theme.tokens.button_primary_foreground = gpui::white().into();
+}
+
 /// Everything the window needs to open. A struct rather than nine positional
 /// arguments, three of which are `usize` and two of which are `bool`.
 struct Launch {
@@ -1791,129 +2644,127 @@ struct Launch {
 }
 
 fn run_window(launch: Launch) {
-    let Launch {
-        root,
-        entries,
-        skipped_raw,
-        unreadable,
-        open_single,
-        format,
-        quality,
-        max_edge,
-        grid,
-    } = launch;
+    application()
+        // Every `IconName` is an SVG loaded through the app's asset source. Without
+        // this the icons resolve to nothing and the toolbar renders as bare words.
+        .with_assets(gpui_component_assets::Assets)
+        .run(move |cx: &mut App| {
+            init_theme(cx);
 
-    application().run(move |cx: &mut App| {
-        // Must run before any gpui-component type is constructed.
-        gpui_component::init(cx);
-        // Dark by default. Judging compression against a bright chrome is a bad idea,
-        // and the comparison view is full-bleed imagery either way.
-        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+            let remembered = settings::load();
+            let bounds = Bounds::centered(
+                None,
+                size(
+                    px(remembered.width.unwrap_or(900.)),
+                    px(remembered.height.unwrap_or(640.)),
+                ),
+                cx,
+            );
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    app_id: Some("imageguide".to_string()),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let audit = build_audit(launch, window, cx);
+                    // Dialogs, notifications and tooltips are drawn by the Root, so
+                    // the window's first level has to be one.
+                    cx.new(|cx| Root::new(audit, window, cx).bg(cx.theme().background))
+                },
+            )
+            .unwrap();
+            cx.activate(true);
+        });
+}
 
-        let remembered = settings::load();
-        let bounds = Bounds::centered(
-            None,
-            size(
-                px(remembered.width.unwrap_or(900.)),
-                px(remembered.height.unwrap_or(640.)),
-            ),
-            cx,
+/// Render the audit window to a PNG, so a change to it can actually be looked at.
+///
+/// gpui draws the frame to a texture and hands back the pixels, which needs no
+/// screen and no screen-recording permission — the alternative was describing the
+/// window to someone else and asking them what they saw.
+///
+///     cargo test --bin imageguide -- --ignored --nocapture screenshot
+///
+/// Set `IMAGEGUIDE_SHOT_DIR` to choose the folder to audit and `IMAGEGUIDE_SHOT_OUT`
+/// to choose where the picture lands.
+#[cfg(test)]
+mod screenshot {
+    use super::*;
+    use gpui::HeadlessAppContext;
+
+    #[test]
+    #[ignore = "renders a window; run it deliberately"]
+    fn screenshot() {
+        let folder = std::env::var("IMAGEGUIDE_SHOT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("imageguide-demo"));
+        let out = std::env::var("IMAGEGUIDE_SHOT_OUT")
+            .unwrap_or_else(|_| "/tmp/imageguide-shot.png".to_string());
+        // Which of the shapes the window can take: list, grid, compare or empty.
+        let mode = std::env::var("IMAGEGUIDE_SHOT_MODE").unwrap_or_else(|_| "list".to_string());
+
+        let mut scanned = scan::scan(&folder);
+        assert!(
+            !scanned.entries.is_empty(),
+            "{} holds no images to draw",
+            folder.display()
         );
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                app_id: Some("imageguide".to_string()),
-                ..Default::default()
-            },
-            |window, cx| {
-                let audit = cx.new(|cx| {
-                    let focus = cx.focus_handle();
-                    focus.focus(window, cx);
+        // The empty state only appears for a root that is not a folder at all.
+        let root = if mode == "empty" {
+            scanned.entries.clear();
+            PathBuf::new()
+        } else {
+            folder.clone()
+        };
 
-                    let filter_input =
-                        cx.new(|cx| InputState::new(window, cx).placeholder("Filter by name"));
-                    cx.subscribe(
-                        &filter_input,
-                        |audit: &mut Audit, input, event: &InputEvent, cx| {
-                            if matches!(event, InputEvent::Change) {
-                                let value = input.read(cx).value().to_string();
-                                audit.set_filter(value, cx);
-                            }
-                        },
-                    )
-                    .detach();
+        // A real platform, only for its text system: glyph metrics decide every
+        // width in the window, so a fake one would measure a different layout.
+        let text_system = gpui_platform::current_platform(true).text_system();
+        let mut cx = HeadlessAppContext::with_platform(
+            text_system,
+            std::sync::Arc::new(gpui_component_assets::Assets),
+            gpui_platform::current_headless_renderer,
+        );
 
-                    let quality_slider = cx.new(|_| {
-                        SliderState::new()
-                            .min(1.)
-                            .max(100.)
-                            .step(1.)
-                            .default_value(quality.0.unwrap_or(80.))
-                    });
-                    // Dragging the slider is the only thing that changes quality now,
-                    // so results from the old value stop being true the moment it moves.
-                    cx.subscribe(
-                        &quality_slider,
-                        |audit: &mut Audit, _, event: &SliderEvent, cx| {
-                            let SliderEvent::Change(value) = event else {
-                                return;
-                            };
-                            audit.quality = Quality::lossy(value.start());
-                            audit.results.clear();
-                            audit.schedule_estimate(cx);
-                            cx.notify();
-                        },
-                    )
-                    .detach();
-                    let mut audit = Audit {
-                        root,
-                        entries,
-                        skipped_raw,
-                        thumbs: HashMap::new(),
-                        requested: HashSet::new(),
-                        format,
-                        quality,
-                        max_edge,
-                        quality_slider,
-                        selected: HashSet::new(),
-                        sort: Sort {
-                            column: Column::Weight,
-                            descending: true,
-                        },
-                        visible: Vec::new(),
-                        filter: String::new(),
-                        filter_input,
-                        cursor: 0,
-                        grid,
-                        estimate: None,
-                        estimate_generation: 0,
-                        focus,
-                        titled: String::new(),
-                        settings: settings::Settings::default(),
-                        cached: None,
-                        results: HashMap::new(),
-                        converting: false,
-                        failures: Vec::new(),
-                        unreadable,
-                        drag_over: false,
-                        compare: None,
-                    };
-                    audit.refresh_visible();
-                    audit.schedule_estimate(cx);
-                    if open_single {
-                        audit.open_compare(0, cx);
-                    }
-                    audit
-                });
+        cx.update(init_theme);
 
-                // Dialogs, notifications and tooltips are drawn by the Root, so the
-                // window's first level has to be one.
+        let window = cx
+            .open_window(size(px(1100.), px(720.)), |window, cx| {
+                let audit = build_audit(
+                    Launch {
+                        root: root.clone(),
+                        entries: scanned.entries,
+                        skipped_raw: scanned.skipped_raw,
+                        unreadable: scanned.unreadable,
+                        open_single: mode == "compare",
+                        format: Format::WebP,
+                        quality: Quality::lossy(80.),
+                        max_edge: MaxEdge::FULL,
+                        grid: mode == "grid",
+                    },
+                    window,
+                    cx,
+                );
                 cx.new(|cx| Root::new(audit, window, cx).bg(cx.theme().background))
-            },
-        )
-        .unwrap();
-        cx.activate(true);
-    });
+            })
+            .expect("window opens");
+
+        // Let the thumbnail decodes and the estimate land before drawing. The
+        // estimate waits out a settling timer first, so the clock has to move.
+        cx.allow_parking();
+        cx.run_until_parked();
+        cx.advance_clock(ESTIMATE_DELAY + Duration::from_millis(200));
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(1200));
+        cx.run_until_parked();
+
+        let image = cx
+            .capture_screenshot(window.into())
+            .expect("frame renders to an image");
+        image.save(&out).expect("png writes");
+        println!("wrote {out} ({}x{})", image.width(), image.height());
+    }
 }
 
 #[cfg(test)]

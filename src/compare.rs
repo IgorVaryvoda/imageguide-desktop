@@ -61,7 +61,7 @@ impl Pair {
 /// compression, and the resize is not the part you need to eyeball. Both sides are
 /// the delivered resolution; only one of them has been through the encoder.
 pub fn build(path: &Path, format: Format, quality: Quality, max_edge: MaxEdge) -> Option<Pair> {
-    let original = max_edge.apply(image::open(path).ok()?);
+    let original = max_edge.apply(crate::scan::decode(path)?);
     let encoded = convert::encode(&original, format, quality)?;
     let decoded = image::load_from_memory(&encoded).ok()?;
 

@@ -46,6 +46,15 @@ pub struct MaxEdge(pub Option<u32>);
 impl MaxEdge {
     pub const FULL: Self = Self(None);
 
+    /// The sizes offered in the window, in order. Listed once so the buttons and the
+    /// value they select cannot disagree.
+    pub const PRESETS: [Self; 4] = [
+        Self::FULL,
+        Self(Some(2400)),
+        Self(Some(1600)),
+        Self(Some(1000)),
+    ];
+
     pub fn label(&self) -> String {
         match self.0 {
             None => "full".to_string(),
@@ -169,7 +178,7 @@ pub fn convert_file(
     quality: Quality,
     max_edge: MaxEdge,
 ) -> Option<Converted> {
-    let decoded = max_edge.apply(image::open(source).ok()?);
+    let decoded = max_edge.apply(crate::scan::decode(source)?);
     let (width, height) = (decoded.width(), decoded.height());
     let encoded = encode(&decoded, format, quality)?;
 

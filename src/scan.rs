@@ -65,6 +65,23 @@ impl Entry {
         }
         self.bytes as f32 / pixels as f32
     }
+
+    /// True when the extension disagrees with the bytes inside the file. The first
+    /// folder this was ever pointed at held 169 files named `.webp`, 59 of which
+    /// were PNG — the sort of thing an audit should say out loud rather than leave
+    /// for someone to notice in a column.
+    pub fn extension_lies(&self) -> bool {
+        let Some(extension) = self.path.extension().and_then(|name| name.to_str()) else {
+            // No extension is not a lie, just an omission.
+            return false;
+        };
+        // `jpg` and `jpeg` are one format under two spellings, as are `tif` and
+        // `tiff`; `extensions_str` lists every name the format answers to.
+        !self
+            .format
+            .extensions_str()
+            .contains(&extension.to_ascii_lowercase().as_str())
+    }
 }
 
 /// Read one file's header. `None` when it is not an image we can read.
@@ -81,6 +98,23 @@ pub fn probe(path: &Path) -> Option<Entry> {
         height,
         bytes,
     })
+}
+
+/// Decode a file, choosing the decoder by what is inside it rather than by what it
+/// is called.
+///
+/// `image::open` picks its decoder from the extension, which is the one thing this
+/// app already knows it cannot trust — `probe` reads the format from the magic bytes
+/// precisely because extensions lie. Using both meant the files the audit flagged as
+/// mislabelled were exactly the files it then failed to convert, thumbnail or open,
+/// with no error beyond a missing row.
+pub fn decode(path: &Path) -> Option<image::DynamicImage> {
+    ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()
 }
 
 /// Walk a folder and probe every image in it, subfolders included.
@@ -188,6 +222,63 @@ mod tests {
         assert_eq!(entry.format, ImageFormat::Png);
         assert_eq!((entry.width, entry.height), (40, 25));
         assert_eq!(entry.bytes, std::fs::metadata(&path).unwrap().len());
+    }
+
+    /// The mislabelled files are the whole point, so they have to survive every path
+    /// and not just the one that counts them. Decoding by extension meant the folder
+    /// this app was built for — 169 files named `.webp`, 59 of them PNG — listed
+    /// those 59 and then silently failed to convert, thumbnail or preview any of them.
+    #[test]
+    fn a_file_decodes_by_its_contents_not_its_name() {
+        let dir = temp_dir("decode-liar");
+        let honest = write_sample(&dir, "honest.png", 24, 16);
+        let liar = dir.join("liar.webp");
+        std::fs::copy(&honest, &liar).unwrap();
+
+        let decoded = decode(&liar).expect("a PNG named .webp still decodes");
+        assert_eq!((decoded.width(), decoded.height()), (24, 16));
+        // And the audit agrees about what it actually is.
+        assert_eq!(probe(&liar).unwrap().format, ImageFormat::Png);
+    }
+
+    /// The audit's best finding is a file whose name disagrees with its bytes, so
+    /// the check has to be right about which disagreements are real. `jpg` and
+    /// `jpeg` naming the same format is not a finding.
+    #[test]
+    fn an_extension_only_lies_when_it_names_another_format() {
+        let png = Entry {
+            path: PathBuf::from("/photos/promo.png"),
+            format: ImageFormat::Png,
+            width: 10,
+            height: 10,
+            bytes: 100,
+        };
+        assert!(!png.extension_lies());
+
+        let liar = Entry {
+            path: PathBuf::from("/photos/promo.webp"),
+            ..png.clone()
+        };
+        assert!(liar.extension_lies(), "a PNG named .webp is the finding");
+
+        let shouty = Entry {
+            path: PathBuf::from("/photos/PROMO.PNG"),
+            ..png.clone()
+        };
+        assert!(!shouty.extension_lies(), "case is not a disagreement");
+
+        let jpeg = Entry {
+            path: PathBuf::from("/photos/shot.jpg"),
+            format: ImageFormat::Jpeg,
+            ..png.clone()
+        };
+        assert!(!jpeg.extension_lies(), "jpg and jpeg are one format");
+
+        let bare = Entry {
+            path: PathBuf::from("/photos/shot"),
+            ..png
+        };
+        assert!(!bare.extension_lies(), "no extension is not a claim");
     }
 
     #[test]
