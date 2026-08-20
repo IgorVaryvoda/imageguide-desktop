@@ -25,6 +25,7 @@ use gpui::{
 use gpui_component::alert::Alert;
 use gpui_component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
+use gpui_component::group_box::{GroupBox, GroupBoxVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::progress::Progress;
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
@@ -59,6 +60,11 @@ const W_RESULT: f32 = 112.;
 /// left-grown bar under a right-aligned number — an underline for the heaviest file
 /// and a stub stranded half a column from its own number for the lightest.
 const W_BAR: f32 = 140.;
+const W_FORMAT_COMPACT: f32 = 70.;
+const W_PIXELS_COMPACT: f32 = 88.;
+const W_DENSITY_COMPACT: f32 = 60.;
+const W_WEIGHT_COMPACT: f32 = 86.;
+const W_NAME_MIN: f32 = 140.;
 
 /// Bytes per output pixel, banded. A photographic JPEG lands near 0.2; a
 /// screenshot saved as PNG can be ten times that. The number was already in the
@@ -74,8 +80,10 @@ const WINDOW_MIN_WIDTH: f32 = 760.;
 const WINDOW_MIN_HEIGHT: f32 = 560.;
 const WINDOW_DEFAULT_WIDTH: f32 = 900.;
 const WINDOW_DEFAULT_HEIGHT: f32 = 640.;
-/// Gallery tiles retain a fixed size so `uniform_list` can virtualise a uniform row.
-const TILE: f32 = 168.;
+/// Gallery rows stay uniform for virtualisation, but the tile itself grows to use the
+/// available surface instead of leaving a dead strip beside three tiny cards.
+const TILE_MIN: f32 = 168.;
+const TILE_MAX: f32 = 224.;
 const TILE_GAP: f32 = 8.;
 const GALLERY_MIN_COLUMNS: usize = 1;
 const GALLERY_MAX_COLUMNS: usize = 5;
@@ -105,11 +113,12 @@ fn restored_window_size(width: Option<f32>, height: Option<f32>) -> (f32, f32) {
 
 /// Geometry for one virtualised gallery row. Band ranges are calculated on demand,
 /// so only the bands requested by `uniform_list` allocate tiles.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct GalleryLayout {
     columns: usize,
     rows: usize,
     entries: usize,
+    tile: f32,
 }
 
 impl GalleryLayout {
@@ -135,12 +144,15 @@ fn gallery_layout(
         + root_right
         + 2. * (ROOT_PADDING + ROOT_BORDER + GALLERY_PADDING + GALLERY_BORDER);
     let available = (viewport_width - chrome).max(0.);
-    let columns = ((available + TILE_GAP) / (TILE + TILE_GAP)) as usize;
+    let columns = ((available + TILE_GAP) / (TILE_MIN + TILE_GAP)) as usize;
     let columns = columns.clamp(GALLERY_MIN_COLUMNS, GALLERY_MAX_COLUMNS);
+    let tile = ((available - (columns.saturating_sub(1) as f32 * TILE_GAP)) / columns as f32)
+        .clamp(TILE_MIN, TILE_MAX);
     GalleryLayout {
         columns,
         rows: entries.div_ceil(columns),
         entries,
+        tile,
     }
 }
 
@@ -193,7 +205,7 @@ fn compare_chip(text: impl Into<gpui::SharedString>, colour: gpui::Hsla, _cx: &A
         .flex_shrink_0()
         .rounded_md()
         .bg(rgba(0x000000b8))
-        .text_size(px(10.))
+        .text_size(px(11.))
         .font_weight(FontWeight::MEDIUM)
         .text_color(colour)
         .child(text.into())
@@ -241,7 +253,8 @@ fn segment(
 /// The faint word that says what a group of controls is for.
 fn group_label(text: &'static str, cx: &App) -> gpui::Div {
     div()
-        .text_size(px(10.))
+        .text_size(px(11.))
+        .font_weight(FontWeight::MEDIUM)
         .text_color(cx.theme().muted_foreground)
         .whitespace_nowrap()
         .flex_shrink_0()
@@ -726,7 +739,13 @@ impl Audit {
     }
 
     /// One gallery tile: the picture, with its name and weight under it.
-    fn tile(&self, row: usize, index: usize, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn tile(
+        &self,
+        row: usize,
+        index: usize,
+        tile_size: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let Some(entry) = self.entries.get(index) else {
             return div().id(("tile", row));
         };
@@ -737,7 +756,7 @@ impl Audit {
 
         div()
             .id(("tile", row))
-            .w(px(TILE))
+            .w(px(tile_size))
             .flex()
             .flex_col()
             .gap_2()
@@ -749,10 +768,12 @@ impl Audit {
             // its contents a pixel down and right.
             .border_1()
             .border_color(gpui::transparent_black())
-            .when(ticked, |tile| tile.bg(cx.theme().list_active))
+            .when(ticked, |tile| {
+                tile.bg(cx.theme().list_active)
+                    .border_color(cx.theme().list_active_border)
+            })
             .when(row == self.cursor, |tile| {
-                tile.border_color(cx.theme().primary)
-                    .bg(cx.theme().list_active)
+                tile.border_color(cx.theme().ring)
             })
             .hover(|style| style.bg(cx.theme().list_hover))
             .on_click(cx.listener(move |audit, event: &gpui::ClickEvent, _, cx| {
@@ -764,7 +785,7 @@ impl Audit {
                 div()
                     .relative()
                     .w_full()
-                    .h(px(TILE - 68.))
+                    .h(px(tile_size - 68.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -772,7 +793,11 @@ impl Audit {
                     .overflow_hidden()
                     .bg(cx.theme().background)
                     .when_some(thumb, |slot, image| {
-                        slot.child(img(image).max_w(px(TILE - 16.)).max_h(px(TILE - 68.)))
+                        slot.child(
+                            img(image)
+                                .max_w(px(tile_size - 16.))
+                                .max_h(px(tile_size - 68.)),
+                        )
                     })
                     // The grid had no way to tick anything; the keyboard was the
                     // only route to a selection you could see in the list.
@@ -801,7 +826,7 @@ impl Audit {
                                 .px_1()
                                 .rounded_sm()
                                 .bg(cx.theme().background.opacity(0.8))
-                                .text_size(px(9.))
+                                .text_size(px(10.))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(format_colour(entry.format, cx))
                                 .child(format_name(entry.format)),
@@ -814,7 +839,7 @@ impl Audit {
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(cx.theme().foreground)
                     .child(entry.name()),
             )
@@ -824,7 +849,7 @@ impl Audit {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .text_size(px(10.))
+                    .text_size(px(11.))
                     .child(div().text_color(cx.theme().muted_foreground).child(
                         match self.results.get(&index) {
                             Some(bytes) => {
@@ -836,7 +861,7 @@ impl Audit {
                     .child(
                         div()
                             .text_color(density_colour(density, cx))
-                            .child(format!("{density:.2}")),
+                            .child(format!("{density:.2} bpp")),
                     ),
             )
     }
@@ -963,12 +988,10 @@ impl Audit {
         group: ButtonGroup,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .flex_shrink_0()
-            .child(group_label(label, cx))
+        GroupBox::new()
+            .outline()
+            .w_auto()
+            .title(group_label(label, cx))
             .child(group.small().compact())
     }
 
@@ -1277,12 +1300,13 @@ impl Audit {
                     .right_0()
                     .bottom_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
                     .px_3()
                     .py_2()
                     .bg(rgba(0x000000bf))
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .child(
                         div()
                             .flex_1()
@@ -1298,11 +1322,62 @@ impl Audit {
                     )
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .flex_shrink_0()
-                            .whitespace_nowrap()
-                            .text_color(rgba(0xffffff8a))
                             .child(
-                                "scroll zoom · drag pan · F fit · 1 actual · ←→ next · esc close",
+                                Button::new("compare-fit")
+                                    .ghost()
+                                    .small()
+                                    .label("Fit")
+                                    .on_click(cx.listener(|audit, _, _, cx| {
+                                        if let Some(comparison) = audit.compare.as_mut() {
+                                            comparison.zoom = None;
+                                            comparison.pan = (0., 0.);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("compare-actual")
+                                    .ghost()
+                                    .small()
+                                    .label("100%")
+                                    .on_click(cx.listener(|audit, _, _, cx| {
+                                        if let Some(comparison) = audit.compare.as_mut() {
+                                            comparison.zoom = Some(1.);
+                                            comparison.pan = (0., 0.);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("compare-prev")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::ArrowLeft)
+                                    .label("Prev")
+                                    .on_click(cx.listener(|audit, _, _, cx| {
+                                        audit.step_compare(-1, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("compare-next")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::ArrowRight)
+                                    .label("Next")
+                                    .on_click(cx.listener(|audit, _, _, cx| {
+                                        audit.step_compare(1, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .ml_1()
+                                    .text_color(rgba(0xffffffcc))
+                                    .whitespace_nowrap()
+                                    .child("Scroll to zoom · drag to pan"),
                             ),
                     ),
             )
@@ -1387,8 +1462,14 @@ impl Audit {
 
         div()
             .flex()
+            .flex_wrap()
             .items_center()
-            .gap_3()
+            .gap_2()
+            .p_2()
+            .rounded_lg()
+            .bg(cx.theme().secondary)
+            .border_1()
+            .border_color(cx.theme().border)
             .child(
                 // The folder name identifies it; the full path only locates it, so
                 // it goes underneath at a size that says so.
@@ -1397,6 +1478,7 @@ impl Audit {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
+                    .min_w(px(220.))
                     .child(
                         div()
                             .flex()
@@ -1415,7 +1497,7 @@ impl Audit {
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(px(12.))
                                     .text_color(cx.theme().muted_foreground)
                                     .whitespace_nowrap()
                                     .flex_shrink_0()
@@ -1424,8 +1506,8 @@ impl Audit {
                     )
                     .child(
                         div()
-                            .text_size(px(10.))
-                            .text_color(cx.theme().muted_foreground.opacity(0.7))
+                            .text_size(px(11.))
+                            .text_color(cx.theme().muted_foreground)
                             .whitespace_nowrap()
                             .overflow_hidden()
                             .text_ellipsis()
@@ -1433,7 +1515,7 @@ impl Audit {
                     ),
             )
             .child(
-                div().w(px(190.)).flex_shrink_0().child(
+                div().w(px(190.)).min_w(px(150.)).flex_shrink_1().child(
                     Input::new(&self.filter_input)
                         .small()
                         .cleanable(true)
@@ -1483,13 +1565,20 @@ impl Audit {
         let lossless = self.quality == Quality::LOSSLESS;
         div()
             .flex()
+            .flex_wrap()
             .items_center()
-            .gap_4()
+            .gap_3()
+            .p_2()
+            .rounded_lg()
+            .bg(cx.theme().secondary)
+            .border_1()
+            .border_color(cx.theme().border)
             .child(self.control_group("Resize", self.resize_group(cx), cx))
             .child(self.control_group("Format", self.format_group(cx), cx))
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .flex_shrink_0()
@@ -1502,7 +1591,7 @@ impl Audit {
                     .child(
                         div()
                             .w(px(26.))
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .font_weight(FontWeight::MEDIUM)
                             .whitespace_nowrap()
                             .text_color(if lossless {
@@ -1611,6 +1700,7 @@ impl Audit {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .child(
@@ -1632,7 +1722,7 @@ impl Audit {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(cx.theme().muted_foreground)
                             .whitespace_nowrap()
                             .overflow_hidden()
@@ -1767,6 +1857,8 @@ struct AuditTable {
     /// do not leave an empty strip on the right. Columns here take a width, not a
     /// share, so somebody has to do the arithmetic.
     name_width: f32,
+    compact: bool,
+    show_result: bool,
 }
 
 /// The columns, in display order. `Column` is what the audit sorts by; this adds the
@@ -1797,7 +1889,7 @@ impl TableColumn {
         }
     }
 
-    fn spec(&self, name_width: f32) -> TableCol {
+    fn spec(&self, name_width: f32, compact: bool) -> TableCol {
         match self {
             TableColumn::Tick => TableCol::new("tick", "").width(px(W_TICK)),
             TableColumn::Thumb => TableCol::new("thumb", "").width(px(THUMB_SLOT + 12.)).p_0(),
@@ -1805,23 +1897,27 @@ impl TableColumn {
             // strip down its right-hand side.
             TableColumn::Name => TableCol::new("name", "Name")
                 .width(px(name_width))
-                .min_width(px(140.))
+                .min_width(px(W_NAME_MIN))
                 .sortable()
                 .resizable(true),
             TableColumn::Format => TableCol::new("format", "Format")
-                .width(px(W_FORMAT))
+                .width(px(if compact { W_FORMAT_COMPACT } else { W_FORMAT }))
                 .sortable(),
             TableColumn::Pixels => TableCol::new("pixels", "Size")
-                .width(px(W_PIXELS))
+                .width(px(if compact { W_PIXELS_COMPACT } else { W_PIXELS }))
                 .text_right()
                 .sortable(),
             TableColumn::Density => TableCol::new("density", "bpp")
-                .width(px(W_DENSITY))
+                .width(px(if compact {
+                    W_DENSITY_COMPACT
+                } else {
+                    W_DENSITY
+                }))
                 .text_right()
                 .sortable(),
             TableColumn::Bar => TableCol::new("bar", "").width(px(W_BAR)),
             TableColumn::Weight => TableCol::new("weight", "Weight")
-                .width(px(W_WEIGHT))
+                .width(px(if compact { W_WEIGHT_COMPACT } else { W_WEIGHT }))
                 .text_right()
                 .sortable(),
             TableColumn::Result => TableCol::new("result", "Result")
@@ -1832,28 +1928,55 @@ impl TableColumn {
 }
 
 impl AuditTable {
-    /// Everything except the name, which gets the remainder.
-    const FIXED_WIDTH: f32 =
-        W_TICK + THUMB_SLOT + 12. + W_FORMAT + W_PIXELS + W_DENSITY + W_BAR + W_WEIGHT;
-
     /// Chrome the table spends on gaps, cell padding and its own border.
     const CHROME: f32 = 30.;
 
-    /// The width left for the name once the fixed columns have taken theirs.
-    ///
-    /// Measured once, when the table is built. It cannot be recomputed during the
-    /// audit's own render: telling the table to re-lay-out makes it ask the delegate
-    /// for its row count, and answering that reads the audit that is mid-render. The
-    /// column is resizable, which covers the rest.
-    fn name_width(window: &Window) -> f32 {
-        (f32::from(window.viewport_size().width) - Self::FIXED_WIDTH - Self::CHROME).max(140.)
+    fn fixed_width(compact: bool, show_result: bool) -> f32 {
+        W_TICK
+            + THUMB_SLOT
+            + 12.
+            + if compact { W_FORMAT_COMPACT } else { W_FORMAT }
+            + if compact { W_PIXELS_COMPACT } else { W_PIXELS }
+            + if compact {
+                W_DENSITY_COMPACT
+            } else {
+                W_DENSITY
+            }
+            + if compact { 0. } else { W_BAR }
+            + if compact { W_WEIGHT_COMPACT } else { W_WEIGHT }
+            + if show_result { W_RESULT } else { 0. }
     }
 
     fn new(audit: gpui::WeakEntity<Audit>, window: &Window) -> Self {
-        Self {
+        let mut table = Self {
             audit,
-            name_width: Self::name_width(window),
-            columns: vec![
+            name_width: W_NAME_MIN,
+            compact: false,
+            show_result: false,
+            columns: Vec::new(),
+        };
+        table.set_viewport_width(f32::from(window.viewport_size().width), false);
+        table
+    }
+
+    fn set_viewport_width(&mut self, width: f32, show_result: bool) {
+        self.compact = width < 900.;
+        self.show_result = show_result;
+        self.name_width =
+            (width - Self::fixed_width(self.compact, show_result) - Self::CHROME).max(W_NAME_MIN);
+        self.columns = if self.compact {
+            vec![
+                TableColumn::Tick,
+                TableColumn::Thumb,
+                TableColumn::Name,
+                TableColumn::Format,
+                TableColumn::Pixels,
+                TableColumn::Density,
+                TableColumn::Weight,
+                TableColumn::Result,
+            ]
+        } else {
+            vec![
                 TableColumn::Tick,
                 TableColumn::Thumb,
                 TableColumn::Name,
@@ -1863,21 +1986,17 @@ impl AuditTable {
                 TableColumn::Bar,
                 TableColumn::Weight,
                 TableColumn::Result,
-            ],
-        }
+            ]
+        };
     }
 }
 
 impl TableDelegate for AuditTable {
-    fn columns_count(&self, cx: &App) -> usize {
+    fn columns_count(&self, _cx: &App) -> usize {
         // The result column only exists once there is something to put in it.
         // Reserving its width up front left a fifth of the window empty in the
         // common case.
-        let shown = self
-            .audit
-            .upgrade()
-            .is_some_and(|audit| !audit.read(cx).results.is_empty());
-        if shown {
+        if self.show_result {
             self.columns.len()
         } else {
             self.columns.len() - 1
@@ -1894,7 +2013,7 @@ impl TableDelegate for AuditTable {
         let Some(column) = self.columns.get(col_ix) else {
             return TableCol::new("none", "");
         };
-        let mut spec = column.spec(self.name_width);
+        let mut spec = column.spec(self.name_width, self.compact);
         // Show the arrow on whichever column the audit is actually ordered by.
         if let Some(sort) = column.sorts_by()
             && let Some(audit) = self.audit.upgrade()
@@ -2154,6 +2273,14 @@ impl Render for Audit {
             self.save_settings(current);
         }
 
+        if let Some(table) = self.table.clone() {
+            let width = f32::from(viewport.width);
+            let show_result = !self.results.is_empty();
+            table.update(cx, |table, _| {
+                table.delegate_mut().set_viewport_width(width, show_result);
+            });
+        }
+
         if self.entries.is_empty() && !self.root.is_dir() {
             return div()
                 .size_full()
@@ -2184,7 +2311,7 @@ impl Render for Audit {
                         })
                         .child(
                             div()
-                                .text_size(px(17.))
+                                .text_size(px(18.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(cx.theme().foreground)
                                 .child("Audit a folder of images"),
@@ -2226,7 +2353,7 @@ impl Render for Audit {
                         .child(
                             div()
                                 .pt_2()
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(cx.theme().muted_foreground.opacity(0.7))
                                 .child("or drop one anywhere in this window"),
                         ),
@@ -2394,7 +2521,7 @@ impl Render for Audit {
                                                 continue;
                                             };
                                             audit.request_thumb(entry, cx);
-                                            tiles.push(audit.tile(row, entry, cx));
+                                            tiles.push(audit.tile(row, entry, layout.tile, cx));
                                         }
                                         div().flex().gap_2().children(tiles)
                                     })
@@ -2743,6 +2870,31 @@ fn init_theme(cx: &mut App) {
     let base = gpui::Hsla::from(gpui::rgb(0x2f6feb));
     let hover = gpui::Hsla::from(gpui::rgb(0x3f7dfa));
     let active = gpui::Hsla::from(gpui::rgb(0x2760d4));
+    let background = gpui::Hsla::from(gpui::rgb(0x0d1117));
+    let surface = gpui::Hsla::from(gpui::rgb(0x151b24));
+    let table = gpui::Hsla::from(gpui::rgb(0x10161e));
+    let border = gpui::Hsla::from(gpui::rgb(0x2a3543));
+    let foreground = gpui::Hsla::from(gpui::rgb(0xe6edf3));
+    let muted = gpui::Hsla::from(gpui::rgb(0x9aa8b8));
+    let focus = gpui::Hsla::from(gpui::rgb(0x9cc7ff));
+
+    theme.background = background;
+    theme.secondary = surface;
+    theme.table = table;
+    theme.input = border;
+    theme.border = border;
+    theme.foreground = foreground;
+    theme.muted_foreground = muted;
+    theme.group_box = surface;
+    theme.group_box_foreground = foreground;
+    theme.list_hover = gpui::Hsla::from(gpui::rgb(0x1c2734));
+    theme.list_active = gpui::Hsla::from(gpui::rgb(0x1d3552));
+    theme.list_active_border = base;
+    theme.table_head = surface;
+    theme.table_head_foreground = muted;
+    theme.table_hover = gpui::Hsla::from(gpui::rgb(0x18222d));
+    theme.table_row_border = gpui::Hsla::from(gpui::rgb(0x202a35));
+    theme.ring = focus;
 
     theme.primary = base;
     theme.primary_hover = hover;
@@ -3108,7 +3260,7 @@ mod tests {
         for columns in 2..=GALLERY_MAX_COLUMNS {
             let threshold = 2. * root
                 + 2. * (ROOT_PADDING + ROOT_BORDER + GALLERY_PADDING + GALLERY_BORDER)
-                + columns as f32 * TILE
+                + columns as f32 * TILE_MIN
                 + (columns - 1) as f32 * TILE_GAP;
             assert_eq!(
                 gallery_layout(threshold - 1., root, root, 100).columns,
@@ -3122,7 +3274,7 @@ mod tests {
     fn gallery_bands_cover_each_entry_once_for_one_three_and_five_columns() {
         for columns in [1, 3, 5] {
             let chrome = 2. * (ROOT_PADDING + ROOT_BORDER + GALLERY_PADDING + GALLERY_BORDER);
-            let width = chrome + columns as f32 * TILE + (columns - 1) as f32 * TILE_GAP;
+            let width = chrome + columns as f32 * TILE_MIN + (columns - 1) as f32 * TILE_GAP;
             let layout = gallery_layout(width, 0., 0., 13);
             assert_eq!(layout.columns, columns);
             assert_eq!(layout.rows, 13_usize.div_ceil(columns));
