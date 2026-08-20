@@ -18,8 +18,9 @@ use std::time::Duration;
 use compare::Pair;
 use convert::{Format, MaxEdge, Quality};
 use gpui::{
-    App, Bounds, Context, FocusHandle, FontWeight, RenderImage, Window, WindowBounds,
-    WindowOptions, div, img, prelude::*, px, rgb, rgba, size, uniform_list,
+    App, Bounds, Context, Decorations, FocusHandle, FontWeight, RenderImage, ScrollStrategy,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, img, prelude::*, px, rgb,
+    rgba, size, uniform_list,
 };
 use gpui_component::alert::Alert;
 use gpui_component::button::{Button, ButtonGroup, ButtonVariants};
@@ -68,15 +69,95 @@ const DENSITY_HEAVY: f32 = 1.5;
 /// How many files encode at once. Each one holds a fully decoded image in memory, so
 /// this is a memory bound as much as a CPU one.
 const WORKERS: usize = 8;
-/// Gallery tile size, and how many fit a row. Fixed rather than responsive because
-/// `uniform_list` needs every row the same height to virtualise at all.
+/// The smallest compositor window that supports every production view.
+const WINDOW_MIN_WIDTH: f32 = 760.;
+const WINDOW_MIN_HEIGHT: f32 = 560.;
+const WINDOW_DEFAULT_WIDTH: f32 = 900.;
+const WINDOW_DEFAULT_HEIGHT: f32 = 640.;
+/// Gallery tiles retain a fixed size so `uniform_list` can virtualise a uniform row.
 const TILE: f32 = 168.;
-const TILE_COLUMNS: usize = 5;
+const TILE_GAP: f32 = 8.;
+const GALLERY_MIN_COLUMNS: usize = 1;
+const GALLERY_MAX_COLUMNS: usize = 5;
+const ROOT_PADDING: f32 = 12.;
+const ROOT_BORDER: f32 = 2.;
+const GALLERY_PADDING: f32 = 8.;
+const GALLERY_BORDER: f32 = 1.;
 /// Files encoded to project a total. More is more accurate and much slower — an AVIF
 /// sample is a second or two each.
 const SAMPLE_SIZE: usize = 4;
 /// Settling time before sampling, so dragging the slider does not start a run per pixel.
 const ESTIMATE_DELAY: Duration = Duration::from_millis(400);
+
+/// A persisted size can be absent or corrupted. Keep restore policy pure so native
+/// startup and tests agree about the supported window.
+fn restored_window_size(width: Option<f32>, height: Option<f32>) -> (f32, f32) {
+    let width = width
+        .filter(|value| value.is_finite())
+        .unwrap_or(WINDOW_DEFAULT_WIDTH)
+        .max(WINDOW_MIN_WIDTH);
+    let height = height
+        .filter(|value| value.is_finite())
+        .unwrap_or(WINDOW_DEFAULT_HEIGHT)
+        .max(WINDOW_MIN_HEIGHT);
+    (width, height)
+}
+
+/// Geometry for one virtualised gallery row. Band ranges are calculated on demand,
+/// so only the bands requested by `uniform_list` allocate tiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GalleryLayout {
+    columns: usize,
+    rows: usize,
+    entries: usize,
+}
+
+impl GalleryLayout {
+    fn band_range(self, band: usize) -> std::ops::Range<usize> {
+        let first = band.saturating_mul(self.columns).min(self.entries);
+        let last = first.saturating_add(self.columns).min(self.entries);
+        first..last
+    }
+
+    #[cfg(test)]
+    fn bands(self) -> impl Iterator<Item = std::ops::Range<usize>> {
+        (0..self.rows).map(move |band| self.band_range(band))
+    }
+}
+
+fn gallery_layout(
+    viewport_width: f32,
+    root_left: f32,
+    root_right: f32,
+    entries: usize,
+) -> GalleryLayout {
+    let chrome = root_left
+        + root_right
+        + 2. * (ROOT_PADDING + ROOT_BORDER + GALLERY_PADDING + GALLERY_BORDER);
+    let available = (viewport_width - chrome).max(0.);
+    let columns = ((available + TILE_GAP) / (TILE + TILE_GAP)) as usize;
+    let columns = columns.clamp(GALLERY_MIN_COLUMNS, GALLERY_MAX_COLUMNS);
+    GalleryLayout {
+        columns,
+        rows: entries.div_ceil(columns),
+        entries,
+    }
+}
+
+/// Root owns a one-pixel border on every non-tiled client-decoration edge.
+fn root_horizontal_chrome(window: &Window) -> (f32, f32) {
+    let paddings = gpui_component::window_paddings(window);
+    let (left_border, right_border) = match window.window_decorations() {
+        Decorations::Client { tiling } => {
+            ((!tiling.left) as u8 as f32, (!tiling.right) as u8 as f32)
+        }
+        Decorations::Server => (0., 0.),
+    };
+    (
+        f32::from(paddings.left) + left_border,
+        f32::from(paddings.right) + right_border,
+    )
+}
 
 /// Which band a file's byte density falls in. Green is carrying its weight, amber
 /// is suspicious, red is a screenshot saved as a PNG.
@@ -216,6 +297,10 @@ struct Audit {
     slider_quality: f32,
     /// List or gallery.
     grid: bool,
+    /// The gallery scroll state survives renders so a width transition can reset it.
+    gallery_scroll: UniformListScrollHandle,
+    /// The column count laid out last frame. `None` deliberately leaves initial layout alone.
+    gallery_columns: Option<usize>,
     /// Projected output size for the current settings, and how many files were
     /// actually encoded to get it.
     estimate: Option<(u64, usize)>,
@@ -305,6 +390,15 @@ struct Comparison {
 }
 
 impl Audit {
+    /// Cache settings in every build, but keep test renders from touching user config.
+    fn save_settings(&mut self, settings: settings::Settings) {
+        #[cfg(not(test))]
+        settings::save(&settings);
+        #[cfg(test)]
+        let _ = settings::save as fn(&settings::Settings);
+        self.settings = settings;
+    }
+
     /// The rows a conversion would touch. An empty selection means the whole folder,
     /// so the common case needs no ticking.
     fn targets(&self) -> Vec<usize> {
@@ -683,17 +777,23 @@ impl Audit {
                     // The grid had no way to tick anything; the keyboard was the
                     // only route to a selection you could see in the list.
                     .child(
-                        div().absolute().top(px(4.)).left(px(4.)).child(
-                            Checkbox::new(("tile-tick", index))
-                                .checked(ticked)
-                                .on_click(cx.listener(move |audit, _: &bool, _, cx| {
-                                    if !audit.selected.remove(&index) {
-                                        audit.selected.insert(index);
-                                    }
-                                    audit.schedule_estimate(cx);
-                                    cx.notify();
-                                })),
-                        ),
+                        div()
+                            .absolute()
+                            .top(px(4.))
+                            .left(px(4.))
+                            .debug_selector(move || format!("grid-checkbox-{index}"))
+                            .child(
+                                Checkbox::new(("tile-tick", index))
+                                    .checked(ticked)
+                                    .on_click(cx.listener(move |audit, _: &bool, _, cx| {
+                                        cx.stop_propagation();
+                                        if !audit.selected.remove(&index) {
+                                            audit.selected.insert(index);
+                                        }
+                                        audit.schedule_estimate(cx);
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                     .child(
                         div().absolute().bottom(px(4.)).right(px(4.)).child(
@@ -771,6 +871,11 @@ impl Audit {
             .filter(|entry| entry.extension_lies())
             .count();
         self.entries = scanned.entries;
+        // The scroll handle belongs to the gallery rather than its data. A new folder
+        // can have the same column count, so a render-time column transition cannot
+        // be relied on to bring its first image into view.
+        self.gallery_scroll
+            .scroll_to_item_strict(0, ScrollStrategy::Top);
         self.skipped_raw = scanned.skipped_raw;
         self.unreadable = scanned.unreadable;
         self.thumbs.clear();
@@ -1879,20 +1984,25 @@ impl TableDelegate for AuditTable {
         match column {
             TableColumn::Tick => {
                 let ticked = audit.selected.contains(&index);
-                Checkbox::new(("tick", index))
-                    .checked(ticked)
-                    .on_click(cx.listener(move |table, _: &bool, _, cx| {
-                        let Some(audit) = table.delegate().audit.upgrade() else {
-                            return;
-                        };
-                        audit.update(cx, |audit, cx| {
-                            if !audit.selected.remove(&index) {
-                                audit.selected.insert(index);
-                            }
-                            audit.schedule_estimate(cx);
-                            cx.notify();
-                        });
-                    }))
+                div()
+                    .debug_selector(move || format!("table-checkbox-{index}"))
+                    .child(
+                        Checkbox::new(("tick", index))
+                            .checked(ticked)
+                            .on_click(cx.listener(move |table, _: &bool, _, cx| {
+                                cx.stop_propagation();
+                                let Some(audit) = table.delegate().audit.upgrade() else {
+                                    return;
+                                };
+                                audit.update(cx, |audit, cx| {
+                                    if !audit.selected.remove(&index) {
+                                        audit.selected.insert(index);
+                                    }
+                                    audit.schedule_estimate(cx);
+                                    cx.notify();
+                                });
+                            })),
+                    )
                     .into_any_element()
             }
             TableColumn::Thumb => div()
@@ -2041,8 +2151,7 @@ impl Render for Audit {
             folder: self.root.is_dir().then(|| self.root.clone()),
         };
         if current != self.settings {
-            settings::save(&current);
-            self.settings = current;
+            self.save_settings(current);
         }
 
         if self.entries.is_empty() && !self.root.is_dir() {
@@ -2247,22 +2356,40 @@ impl Render for Audit {
                     // Columns take a width, not a share, so the remainder after the
                     // fixed ones has to be handed to the name column by hand.
                     .child(if self.grid {
-                        // The gallery has no columns to speak of, so it stays a
-                        // uniform list: one row of tiles per list row.
-                        let rows = count.div_ceil(TILE_COLUMNS);
+                        // One virtualised band is one row of fixed-size tiles.
+                        let (root_left, root_right) = root_horizontal_chrome(window);
+                        let layout = gallery_layout(
+                            f32::from(window.viewport_size().width),
+                            root_left,
+                            root_right,
+                            count,
+                        );
+                        if let Some(previous) = self.gallery_columns
+                            && previous != layout.columns
+                        {
+                            self.gallery_scroll
+                                .scroll_to_item_strict(0, ScrollStrategy::Top);
+                        }
+                        self.gallery_columns = Some(layout.columns);
                         uniform_list(
                             "gallery",
-                            rows,
+                            layout.rows,
                             cx.processor(|audit, range: std::ops::Range<usize>, _window, cx| {
                                 range
                                     .map(|band| {
                                         // A plain loop: the closure form borrows `audit`
                                         // mutably for `request_thumb` and immutably for
                                         // `tile`, which nested closures cannot express.
-                                        let first = band * TILE_COLUMNS;
-                                        let last = (first + TILE_COLUMNS).min(audit.visible.len());
                                         let mut tiles = Vec::new();
-                                        for row in first..last {
+                                        let (root_left, root_right) =
+                                            root_horizontal_chrome(_window);
+                                        let layout = gallery_layout(
+                                            f32::from(_window.viewport_size().width),
+                                            root_left,
+                                            root_right,
+                                            audit.visible.len(),
+                                        );
+                                        for row in layout.band_range(band) {
                                             let Some(entry) = audit.entry_at(row) else {
                                                 continue;
                                             };
@@ -2274,6 +2401,7 @@ impl Render for Audit {
                                     .collect::<Vec<_>>()
                             }),
                         )
+                        .track_scroll(&self.gallery_scroll)
                         .flex_1()
                         .p_2()
                         .into_any_element()
@@ -2561,6 +2689,8 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
             anchor: 0,
             slider_quality: quality.0.unwrap_or(80.),
             grid,
+            gallery_scroll: UniformListScrollHandle::new(),
+            gallery_columns: None,
             estimate: None,
             estimate_generation: 0,
             focus,
@@ -2652,17 +2782,12 @@ fn run_window(launch: Launch) {
             init_theme(cx);
 
             let remembered = settings::load();
-            let bounds = Bounds::centered(
-                None,
-                size(
-                    px(remembered.width.unwrap_or(900.)),
-                    px(remembered.height.unwrap_or(640.)),
-                ),
-                cx,
-            );
+            let (width, height) = restored_window_size(remembered.width, remembered.height);
+            let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(WINDOW_MIN_WIDTH), px(WINDOW_MIN_HEIGHT))),
                     app_id: Some("imageguide".to_string()),
                     ..Default::default()
                 },
@@ -2770,8 +2895,19 @@ mod screenshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
     use image::ImageFormat;
     use std::path::PathBuf;
+
+    struct AuditHarness {
+        audit: gpui::Entity<Audit>,
+    }
+
+    impl gpui::Render for AuditHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.audit.clone()
+        }
+    }
 
     fn entry(name: &str, width: u32, height: u32, bytes: u64, format: ImageFormat) -> Entry {
         Entry {
@@ -2791,6 +2927,81 @@ mod tests {
     /// directly, which is the same comparator either way.
     fn sort_entries(entries: &mut [Entry], sort: Sort) {
         entries.sort_by(|a, b| compare_entries(a, b, sort));
+    }
+
+    fn pointer_checkbox_audit(
+        grid: bool,
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<Audit>, &mut gpui::VisualTestContext) {
+        cx.update(init_theme);
+        let launch = Launch {
+            root: PathBuf::new(),
+            entries: vec![
+                entry("first.png", 10, 10, 100, ImageFormat::Png),
+                entry("second.png", 10, 10, 200, ImageFormat::Png),
+            ],
+            skipped_raw: 0,
+            unreadable: 0,
+            open_single: false,
+            format: Format::WebP,
+            quality: Quality::lossy(80.),
+            max_edge: MaxEdge::FULL,
+            grid,
+        };
+        let (harness, cx) = cx.add_window_view(move |window, cx| {
+            let built = build_audit(launch, window, cx);
+            AuditHarness { audit: built }
+        });
+        let audit = harness.read_with(cx, |harness, _| harness.audit.clone());
+        audit.update(cx, |audit, _| {
+            audit.selected.extend([0, 1]);
+            audit.estimate = Some((123, 2));
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (audit, cx)
+    }
+
+    fn assert_pointer_checkbox_toggle(
+        audit: &gpui::Entity<Audit>,
+        selector: &'static str,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        let checkbox = cx
+            .debug_bounds(selector)
+            .expect("the checkbox must be rendered in its parent event tree");
+        let before = audit.read_with(cx, |audit, _| audit.estimate_generation);
+
+        cx.simulate_click(checkbox.center(), gpui::Modifiers::none());
+        audit.read_with(cx, |audit, _| {
+            assert_eq!(audit.selected, [1].into_iter().collect());
+            assert!(audit.compare.is_none());
+            assert_eq!(audit.estimate_generation, before + 1);
+            assert_eq!(audit.estimate, None);
+        });
+
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let checkbox = cx
+            .debug_bounds(selector)
+            .expect("the checkbox must remain rendered after its controlled state changes");
+        cx.simulate_click(checkbox.center(), gpui::Modifiers::none());
+        audit.read_with(cx, |audit, _| {
+            assert_eq!(audit.selected, [0, 1].into_iter().collect());
+            assert!(audit.compare.is_none());
+            assert_eq!(audit.estimate_generation, before + 2);
+            assert_eq!(audit.estimate, None);
+        });
+    }
+
+    #[gpui::test]
+    fn grid_checkbox_pointer_click_stays_inside_checkbox(cx: &mut TestAppContext) {
+        let (audit, cx) = pointer_checkbox_audit(true, cx);
+        assert_pointer_checkbox_toggle(&audit, "grid-checkbox-0", cx);
+    }
+
+    #[gpui::test]
+    fn table_checkbox_pointer_click_stays_inside_checkbox(cx: &mut TestAppContext) {
+        let (audit, cx) = pointer_checkbox_audit(false, cx);
+        assert_pointer_checkbox_toggle(&audit, "table-checkbox-0", cx);
     }
 
     #[test]
@@ -2857,5 +3068,240 @@ mod tests {
             },
         );
         assert_eq!(names(&entries), ["square.png", "wide.png"]);
+    }
+
+    #[test]
+    fn restored_window_size_defaults_invalid_values_and_clamps_finite_values() {
+        for invalid in [
+            None,
+            Some(f32::NAN),
+            Some(f32::INFINITY),
+            Some(f32::NEG_INFINITY),
+        ] {
+            assert_eq!(
+                restored_window_size(invalid, invalid),
+                (WINDOW_DEFAULT_WIDTH, WINDOW_DEFAULT_HEIGHT)
+            );
+        }
+        assert_eq!(
+            restored_window_size(Some(600.), Some(400.)),
+            (WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        );
+        assert_eq!(restored_window_size(Some(1100.), Some(720.)), (1100., 720.));
+    }
+
+    #[test]
+    fn gallery_geometry_accounts_for_root_chrome_and_supported_widths() {
+        assert_eq!(gallery_layout(760., 0., 0., 100).columns, 4);
+        assert_eq!(gallery_layout(760., 21., 21., 100).columns, 3);
+        assert_eq!(gallery_layout(760., 0., 21., 100).columns, 3);
+
+        assert_eq!(gallery_layout(760., 22., 22., 100).columns, 3);
+        assert_eq!(gallery_layout(873., 22., 22., 100).columns, 4);
+        assert_eq!(gallery_layout(900., 22., 22., 100).columns, 4);
+        assert_eq!(gallery_layout(1100., 22., 22., 100).columns, 5);
+    }
+
+    #[test]
+    fn gallery_changes_column_only_at_each_reachable_threshold() {
+        let root = 22.;
+        for columns in 2..=GALLERY_MAX_COLUMNS {
+            let threshold = 2. * root
+                + 2. * (ROOT_PADDING + ROOT_BORDER + GALLERY_PADDING + GALLERY_BORDER)
+                + columns as f32 * TILE
+                + (columns - 1) as f32 * TILE_GAP;
+            assert_eq!(
+                gallery_layout(threshold - 1., root, root, 100).columns,
+                columns - 1
+            );
+            assert_eq!(gallery_layout(threshold, root, root, 100).columns, columns);
+        }
+    }
+
+    #[test]
+    fn gallery_bands_cover_each_entry_once_for_one_three_and_five_columns() {
+        for columns in [1, 3, 5] {
+            let chrome = 2. * (ROOT_PADDING + ROOT_BORDER + GALLERY_PADDING + GALLERY_BORDER);
+            let width = chrome + columns as f32 * TILE + (columns - 1) as f32 * TILE_GAP;
+            let layout = gallery_layout(width, 0., 0., 13);
+            assert_eq!(layout.columns, columns);
+            assert_eq!(layout.rows, 13_usize.div_ceil(columns));
+            assert_eq!(
+                layout.bands().flatten().collect::<Vec<_>>(),
+                (0..13).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn gallery_scroll_resets_only_when_the_production_column_count_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(init_theme);
+        let entries = (0..120)
+            .map(|index| entry(&format!("image-{index}.png"), 1, 1, 1, ImageFormat::Png))
+            .collect();
+        let mut audit_entity = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let audit = build_audit(
+                Launch {
+                    root: PathBuf::new(),
+                    entries,
+                    skipped_raw: 0,
+                    unreadable: 0,
+                    open_single: false,
+                    format: Format::WebP,
+                    quality: Quality::lossy(80.),
+                    max_edge: MaxEdge::FULL,
+                    grid: true,
+                },
+                window,
+                cx,
+            );
+            audit_entity = Some(audit.clone());
+            Root::new(audit, window, cx).bg(cx.theme().background)
+        });
+        let audit = audit_entity.expect("audit is built for the production Root");
+
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        // Root installs its client inset during its first draw. Settle that frame
+        // before establishing the deliberately deep scroll position.
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        audit.update_in(cx, |audit, window, _| {
+            audit
+                .gallery_scroll
+                .scroll_to_item_strict(12, ScrollStrategy::Top);
+            window.refresh();
+        });
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        assert!(audit.read_with(cx, |audit, _| audit.gallery_scroll.is_scrollable()));
+        assert!(audit.read_with(cx, |audit, _| {
+            audit.gallery_scroll.0.borrow().base_handle.offset().y < px(0.)
+        }));
+
+        cx.simulate_resize(size(px(600.), px(720.)));
+        cx.run_until_parked();
+        assert_eq!(
+            audit.read_with(cx, |audit, _| audit
+                .gallery_scroll
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y),
+            px(0.)
+        );
+
+        audit.update_in(cx, |audit, window, _| {
+            audit
+                .gallery_scroll
+                .scroll_to_item_strict(12, ScrollStrategy::Top);
+            window.refresh();
+        });
+        cx.simulate_resize(size(px(600.), px(720.)));
+        cx.run_until_parked();
+        cx.simulate_resize(size(px(700.), px(720.)));
+        cx.run_until_parked();
+        assert!(audit.read_with(cx, |audit, _| {
+            audit.gallery_scroll.0.borrow().base_handle.offset().y < px(0.)
+        }));
+    }
+
+    #[gpui::test]
+    fn opening_another_large_folder_resets_gallery_scroll_at_the_same_column_count(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0xfc, 0xff, 0x9f, 0x01, 0x00, 0x03, 0x03, 0x02, 0x00, 0xee, 0xfe, 0x3d,
+            0x68, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+
+        let test_root = std::env::temp_dir().join(format!(
+            "imageguide-open-path-scroll-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the system clock is after the Unix epoch")
+                .as_nanos()
+        ));
+        let first_folder = test_root.join("first");
+        let second_folder = test_root.join("second");
+        for folder in [&first_folder, &second_folder] {
+            std::fs::create_dir_all(folder).expect("the test gallery folder is created");
+            for index in 0..120 {
+                std::fs::write(folder.join(format!("image-{index}.png")), PNG)
+                    .expect("the test gallery image is written");
+            }
+        }
+
+        cx.update(init_theme);
+        let mut audit_entity = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let audit = build_audit(
+                Launch {
+                    root: PathBuf::new(),
+                    entries: Vec::new(),
+                    skipped_raw: 0,
+                    unreadable: 0,
+                    open_single: false,
+                    format: Format::WebP,
+                    quality: Quality::lossy(80.),
+                    max_edge: MaxEdge::FULL,
+                    grid: true,
+                },
+                window,
+                cx,
+            );
+            audit_entity = Some(audit.clone());
+            Root::new(audit, window, cx).bg(cx.theme().background)
+        });
+        let audit = audit_entity.expect("audit is built for the production Root");
+
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        audit.update_in(cx, |audit, window, cx| {
+            audit.open_path(first_folder, cx);
+            window.refresh();
+        });
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        audit.update_in(cx, |audit, window, _| {
+            audit
+                .gallery_scroll
+                .scroll_to_item_strict(12, ScrollStrategy::Top);
+            window.refresh();
+        });
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        assert!(audit.read_with(cx, |audit, _| {
+            audit.gallery_scroll.0.borrow().base_handle.offset().y < px(0.)
+        }));
+
+        audit.update_in(cx, |audit, window, cx| {
+            audit.open_path(second_folder, cx);
+            window.refresh();
+        });
+        cx.simulate_resize(size(px(873.), px(720.)));
+        cx.run_until_parked();
+        assert_eq!(
+            audit.read_with(cx, |audit, _| audit
+                .gallery_scroll
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .y),
+            px(0.)
+        );
+
+        std::fs::remove_dir_all(test_root).expect("the test gallery folders are removed");
     }
 }
