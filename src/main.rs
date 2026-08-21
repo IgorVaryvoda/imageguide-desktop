@@ -408,6 +408,8 @@ struct Comparison {
     key: compare::Key,
     /// `None` while the two sides are still decoding.
     pair: Option<Arc<Pair>>,
+    /// A completed build can fail after the initial loading frame.
+    failed: bool,
     /// Where the divider sits, 0 to 1 across the viewport.
     split: f32,
     /// How far the image is dragged from centre, in pixels.
@@ -1123,6 +1125,7 @@ impl Audit {
             dataset_generation,
             key: key.clone(),
             pair: None,
+            failed: false,
             split: 0.5,
             pan: (0., 0.),
             // Open fitted: you cannot judge a crop of an image you have not seen.
@@ -1162,6 +1165,7 @@ impl Audit {
                     && comparison.dataset_generation == dataset_generation
                     && comparison.key == key
                 {
+                    comparison.failed = built.is_none();
                     comparison.pair = built;
                     cx.notify();
                 }
@@ -1345,6 +1349,23 @@ impl Audit {
                     ));
         }
 
+        if comparison.failed {
+            stage = stage.child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Alert::error(
+                            "compare-error",
+                            "Could not build a comparison preview for this image.",
+                        )
+                        .max_w(px(420.)),
+                    ),
+            );
+        }
+
         // Chrome as two full-width bars. These were black boxes pinned at
         // hand-computed offsets, the right-hand one at `view_w - 240` — a number
         // that stopped being the right edge the moment the text or window changed.
@@ -1437,6 +1458,7 @@ impl Audit {
                                 (Some(pair), Some(scale)) => {
                                     format!("{}×{} · {:.0}%", pair.width, pair.height, scale * 100.)
                                 }
+                                (None, _) if comparison.failed => "Preview unavailable".to_string(),
                                 _ => "decoding…".to_string(),
                             }),
                     )
