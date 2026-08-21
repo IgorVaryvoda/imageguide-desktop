@@ -2565,7 +2565,8 @@ impl Render for Audit {
                 .into_any_element();
         }
 
-        if self.entries.is_empty() && !self.root.is_dir() {
+        if self.entries.is_empty() {
+            let empty_folder = self.root.is_dir();
             return div()
                 .size_full()
                 .flex()
@@ -2598,17 +2599,24 @@ impl Render for Audit {
                                 .text_size(px(18.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(cx.theme().foreground)
-                                .child("Audit a folder of images"),
+                                .child(if empty_folder {
+                                    "No supported images found"
+                                } else {
+                                    "Audit a folder of images"
+                                }),
                         )
                         .child(
                             div()
                                 .text_size(px(12.))
                                 .text_color(cx.theme().muted_foreground)
                                 .text_center()
-                                .child(
+                                .child(if empty_folder {
+                                    "This folder has no supported images. Choose another folder \
+                                     or drop an image here."
+                                } else {
                                     "Nothing is uploaded. Every file is read, resized and \
-                                     re-encoded on this machine.",
-                                ),
+                                     re-encoded on this machine."
+                                }),
                         )
                         .child(
                             div()
