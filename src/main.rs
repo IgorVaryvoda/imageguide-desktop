@@ -351,6 +351,8 @@ struct Audit {
     /// audit is a live entity: `TableState::new` asks the delegate for its row and
     /// column counts straight away, and answering that means reading the audit.
     table: Option<gpui::Entity<TableState<AuditTable>>>,
+    /// Width/result signature last handed to the component table.
+    table_signature: Option<(u32, bool)>,
 }
 
 /// List order. Every column is sortable, and clicking the active one reverses it.
@@ -2139,24 +2141,11 @@ impl AuditTable {
             + if show_result { W_RESULT } else { 0. }
     }
 
-    fn new(audit: gpui::WeakEntity<Audit>, window: &Window) -> Self {
-        let mut table = Self {
-            audit,
-            name_width: W_NAME_MIN,
-            compact: false,
-            show_result: false,
-            columns: Vec::new(),
-        };
-        table.set_viewport_width(f32::from(window.viewport_size().width), false);
-        table
-    }
-
-    fn set_viewport_width(&mut self, width: f32, show_result: bool) {
-        self.compact = width < 900.;
-        self.show_result = show_result;
-        self.name_width =
-            (width - Self::fixed_width(self.compact, show_result) - Self::CHROME).max(W_NAME_MIN);
-        self.columns = if self.compact {
+    fn layout(width: f32, show_result: bool) -> (bool, f32, Vec<TableColumn>) {
+        let compact = width < 900.;
+        let name_width =
+            (width - Self::fixed_width(compact, show_result) - Self::CHROME).max(W_NAME_MIN);
+        let columns = if compact {
             vec![
                 TableColumn::Tick,
                 TableColumn::Thumb,
@@ -2180,6 +2169,24 @@ impl AuditTable {
                 TableColumn::Result,
             ]
         };
+        (compact, name_width, columns)
+    }
+
+    fn new(audit: gpui::WeakEntity<Audit>, window: &Window) -> Self {
+        let mut table = Self {
+            audit,
+            name_width: W_NAME_MIN,
+            compact: false,
+            show_result: false,
+            columns: Vec::new(),
+        };
+        table.set_viewport_width(f32::from(window.viewport_size().width), false);
+        table
+    }
+
+    fn set_viewport_width(&mut self, width: f32, show_result: bool) {
+        self.show_result = show_result;
+        (self.compact, self.name_width, self.columns) = Self::layout(width, show_result);
     }
 }
 
@@ -2475,9 +2482,16 @@ impl Render for Audit {
         if let Some(table) = self.table.clone() {
             let width = f32::from(viewport.width);
             let show_result = !self.results.is_empty();
-            table.update(cx, |table, _| {
-                table.delegate_mut().set_viewport_width(width, show_result);
-            });
+            let signature = (width.round().max(0.) as u32, show_result);
+            if self.table_signature != Some(signature) {
+                self.table_signature = Some(signature);
+                cx.defer(move |cx| {
+                    table.update(cx, |table, cx| {
+                        table.delegate_mut().set_viewport_width(width, show_result);
+                        table.refresh(cx);
+                    });
+                });
+            }
         }
 
         if let Some(scanning) = self.scanning.as_ref() {
@@ -3046,6 +3060,7 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
             .count();
         let mut audit = Audit {
             table: None,
+            table_signature: None,
             root,
             entries,
             skipped_raw,
@@ -3342,6 +3357,23 @@ mod tests {
 
         let hidden = HashSet::from([3]);
         assert!(conversion_targets(&visible, &hidden).is_empty());
+    }
+
+    #[test]
+    fn table_layout_keeps_decision_columns_at_compact_width() {
+        let (compact, compact_name, compact_columns) = AuditTable::layout(760., true);
+        assert!(compact);
+        assert!(compact_name >= W_NAME_MIN);
+        assert!(compact_columns.contains(&TableColumn::Weight));
+        assert!(compact_columns.contains(&TableColumn::Result));
+        assert!(!compact_columns.contains(&TableColumn::Bar));
+
+        let (wide, wide_name, wide_columns) = AuditTable::layout(1100., true);
+        assert!(!wide);
+        assert!(wide_name > compact_name);
+        assert!(wide_columns.contains(&TableColumn::Bar));
+        assert!(wide_columns.contains(&TableColumn::Weight));
+        assert!(wide_columns.contains(&TableColumn::Result));
     }
 
     /// The app sorts indices into an unmoved `entries`; these tests sort the data
