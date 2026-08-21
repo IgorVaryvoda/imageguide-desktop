@@ -918,7 +918,7 @@ impl Audit {
                     .child(
                         div()
                             .text_color(density_colour(density, cx))
-                            .child(format!("{density:.2} bpp")),
+                            .child(format!("{density:.2} B/px")),
                     ),
             )
     }
@@ -2120,7 +2120,7 @@ impl TableColumn {
                 .width(px(if compact { W_PIXELS_COMPACT } else { W_PIXELS }))
                 .text_right()
                 .sortable(),
-            TableColumn::Density => TableCol::new("density", "bpp")
+            TableColumn::Density => TableCol::new("density", "B/px")
                 .width(px(if compact {
                     W_DENSITY_COMPACT
                 } else {
