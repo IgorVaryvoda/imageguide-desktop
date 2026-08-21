@@ -9,6 +9,8 @@
 //! the thing that silently drops a credential.
 
 use serde::Deserialize;
+use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -17,6 +19,14 @@ const API: &str = "https://api.sirv.com";
 /// started at minute 19 does not die mid-flight.
 const TOKEN_MARGIN: Duration = Duration::from_secs(60);
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// File transfers get their own, much looser ceiling: a photo shoot folder
+/// holds files that legitimately take minutes.
+const TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
+/// A hard cap on one transfer, so a confused server cannot grow memory forever.
+const MAX_TRANSFER: u64 = 512 * 1024 * 1024;
+/// A walk that finds more files than this is treated as an error rather than
+/// listed forever.
+const WALK_LIMIT: usize = 20_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Credentials {
@@ -122,6 +132,50 @@ pub fn unpair_remote(dir: &str, filename: &str) -> Option<String> {
     filename.strip_prefix(&prefix).map(str::to_string)
 }
 
+/// Relative keys on Sirv that no local file claims: the pull list.
+pub fn pull_plan(remote: &[Node], dir: &str, local_keys: &HashSet<String>) -> Vec<String> {
+    remote
+        .iter()
+        .filter_map(|node| unpair_remote(dir, &node.filename))
+        .filter(|key| !local_keys.contains(key))
+        .collect()
+}
+
+/// The ancestor folders a relative key needs, in creation order:
+/// `sub/deep/a.jpg` gives `["sub", "sub/deep"]`.
+pub fn ancestor_dirs(key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = String::new();
+    let parts: Vec<&str> = key.split('/').collect();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        if !seen.is_empty() {
+            seen.push('/');
+        }
+        seen.push_str(part);
+        out.push(seen.clone());
+    }
+    out
+}
+
+/// The Content-Type an upload declares. Sirv sniffs images anyway; declaring
+/// correctly keeps the API honest about what it stored.
+pub fn content_type(key: &str) -> &'static str {
+    match key
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+}
+
 pub struct Client {
     credentials: Credentials,
     token: Option<(String, Instant)>,
@@ -170,7 +224,6 @@ impl Client {
             status: 0,
             message: format!("token body: {error}"),
         })?;
-
         self.token = Some((
             issued.token.clone(),
             Instant::now() + Duration::from_secs(issued.expires_in),
@@ -178,16 +231,36 @@ impl Client {
         Ok(issued.token)
     }
 
+    /// Run one authenticated call. A token that expired between check and use
+    /// is routine: refresh once and try again rather than surfacing a login
+    /// error.
+    fn authenticated<T>(
+        &mut self,
+        call: impl Fn(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        match call(self) {
+            Err(Error { status: 401, .. }) => {
+                self.token = None;
+                call(self)
+            }
+            other => other,
+        }
+    }
+
+    fn bearer(&mut self) -> Result<String, Error> {
+        Ok(format!("Bearer {}", self.token()?))
+    }
+
     /// One directory listing. Folder names come back absolute
     /// (`/photos/sub`); files carry their byte size.
     pub fn readdir(&mut self, dirname: &str) -> Result<Vec<Node>, Error> {
         let url = format!("{API}/v2/files/readdir?dirname={}", encode_path(dirname));
-        let read = |client: &mut Self| -> Result<Vec<Node>, Error> {
-            let token = client.token()?;
+        self.authenticated(|client| {
+            let authorization = client.bearer()?;
             let response = client
                 .agent
                 .get(&url)
-                .set("Authorization", &format!("Bearer {token}"))
+                .set("Authorization", &authorization)
                 .call()
                 .map_err(|error| match error {
                     ureq::Error::Status(status, _) => Error {
@@ -200,28 +273,134 @@ impl Client {
                 status: 0,
                 message: format!("readdir body: {error}"),
             })
-        };
+        })
+    }
 
-        match read(self) {
-            // A token that expired between check and use is routine; refresh
-            // once and try again rather than surfacing a login error.
-            Err(Error { status: 401, .. }) => {
-                self.token = None;
-                read(self)
+    /// Every file below `dir`, flattened, folders walked depth-first. Bounded:
+    /// a tree that exceeds `WALK_LIMIT` files is an error, not an endless walk.
+    pub fn walk(&mut self, dir: &str) -> Result<Vec<Node>, Error> {
+        let mut all = Vec::new();
+        let mut stack = vec![dir.to_string()];
+        while let Some(current) = stack.pop() {
+            for node in self.readdir(&current)? {
+                if node.is_folder() {
+                    stack.push(node.filename.clone());
+                } else {
+                    all.push(node);
+                }
             }
-            other => other,
+            if all.len() > WALK_LIMIT {
+                return Err(Error {
+                    status: 0,
+                    message: format!("folder holds more than {WALK_LIMIT} files; sync it in parts"),
+                });
+            }
         }
+        Ok(all)
+    }
+
+    /// One file's bytes.
+    pub fn download(&mut self, filename: &str) -> Result<Vec<u8>, Error> {
+        let url = format!("{API}/v2/files/download?filename={}", encode_path(filename));
+        self.authenticated(|client| {
+            let authorization = client.bearer()?;
+            let response = client
+                .agent
+                .get(&url)
+                .set("Authorization", &authorization)
+                .timeout(TRANSFER_TIMEOUT)
+                .call()
+                .map_err(|error| match error {
+                    ureq::Error::Status(status, _) => Error {
+                        status,
+                        message: "download rejected".into(),
+                    },
+                    other => sirv_error("download")(other),
+                })?;
+            let mut bytes = Vec::new();
+            response
+                .into_reader()
+                .take(MAX_TRANSFER)
+                .read_to_end(&mut bytes)
+                .map_err(|error| Error {
+                    status: 0,
+                    message: format!("download body: {error}"),
+                })?;
+            Ok(bytes)
+        })
+    }
+
+    /// Put bytes at `filename`, creating nothing on the way — the caller makes
+    /// folders explicitly so a partial push is visible in the listing.
+    pub fn upload(
+        &mut self,
+        filename: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<(), Error> {
+        let url = format!("{API}/v2/files/upload?filename={}", encode_path(filename));
+        let body = bytes.to_vec();
+        self.authenticated(|client| {
+            let authorization = client.bearer()?;
+            client
+                .agent
+                .post(&url)
+                .set("Authorization", &authorization)
+                .set("Content-Type", content_type)
+                .timeout(TRANSFER_TIMEOUT)
+                .send_bytes(&body)
+                .map_err(|error| match error {
+                    ureq::Error::Status(status, _) => Error {
+                        status,
+                        message: "upload rejected".into(),
+                    },
+                    other => sirv_error("upload")(other),
+                })?;
+            Ok(())
+        })
+    }
+
+    /// Create a folder. The one that already exists is success, not conflict:
+    /// pushes re-check ancestors for every file.
+    pub fn mkdir(&mut self, dirname: &str) -> Result<(), Error> {
+        let url = format!("{API}/v2/files/mkdir?dirname={}", encode_path(dirname));
+        self.authenticated(|client| {
+            let authorization = client.bearer()?;
+            match client
+                .agent
+                .post(&url)
+                .set("Authorization", &authorization)
+                .call()
+            {
+                Ok(_) => Ok(()),
+                Err(ureq::Error::Status(409, _)) => Ok(()),
+                Err(ureq::Error::Status(status, _)) => Err(Error {
+                    status,
+                    message: "mkdir rejected".into(),
+                }),
+                Err(other) => Err(sirv_error("mkdir")(other)),
+            }
+        })
     }
 }
 
 fn sirv_error(stage: &'static str) -> impl Fn(ureq::Error) -> Error {
     move |error| match error {
         ureq::Error::Status(status, response) => {
-            let message = response.into_string().unwrap_or_default();
-            let message = message.lines().next().unwrap_or_default();
+            // Bodies arrive pretty-printed; the first line alone would be a
+            // bare "{". Keep everything, capped.
+            let mut message = response.into_string().unwrap_or_default();
+            message = message.trim().to_string();
+            if message.chars().count() > 200 {
+                message = message.chars().take(200).collect::<String>() + "…";
+            }
             Error {
                 status,
-                message: format!("{stage}: {message}"),
+                message: if message.is_empty() {
+                    stage.to_string()
+                } else {
+                    format!("{stage}: {message}")
+                },
             }
         }
         ureq::Error::Transport(transport) => Error {
@@ -377,5 +556,50 @@ mod tests {
         save_credentials_at(&base, &credentials);
         assert_eq!(load_credentials_from(Some(&path)), Some(credentials));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pull_plan_lists_only_keys_the_local_side_lacks() {
+        let remote = vec![
+            Node {
+                filename: "/d/a.jpg".into(),
+                r#type: "file".into(),
+                size: 1,
+            },
+            Node {
+                filename: "/d/b.jpg".into(),
+                r#type: "file".into(),
+                size: 2,
+            },
+            Node {
+                filename: "/d/sub/c.jpg".into(),
+                r#type: "file".into(),
+                size: 3,
+            },
+        ];
+        let local: HashSet<String> = ["a.jpg".into(), "b.jpg".into()].into();
+        assert_eq!(
+            pull_plan(&remote, "/d", &local),
+            vec!["sub/c.jpg".to_string()]
+        );
+    }
+
+    #[test]
+    fn ancestor_dirs_walk_from_the_top() {
+        assert_eq!(ancestor_dirs("a.jpg"), Vec::<String>::new());
+        assert_eq!(ancestor_dirs("sub/a.jpg"), vec!["sub".to_string()]);
+        assert_eq!(
+            ancestor_dirs("sub/deep/a.jpg"),
+            vec!["sub".to_string(), "sub/deep".to_string()]
+        );
+    }
+
+    #[test]
+    fn content_types_follow_the_extension() {
+        assert_eq!(content_type("a.JPG"), "image/jpeg");
+        assert_eq!(content_type("b.png"), "image/png");
+        assert_eq!(content_type("c.webp"), "image/webp");
+        assert_eq!(content_type("d.avif"), "image/avif");
+        assert_eq!(content_type("e.tif"), "application/octet-stream");
     }
 }

@@ -290,9 +290,12 @@ struct Audit {
     /// The paired Sirv folder, if any: the client, the remote path, and its
     /// listing keyed by the same relative keys the local rows use.
     sirv_pairing: Option<SirvPairing>,
-    /// How many local files are missing on Sirv, and how many differ by size.
-    /// Recomputed when the dataset or the pairing changes, never per frame.
-    sirv_counts: Option<(usize, usize)>,
+    /// How the local dataset stands against it: files to push, files that
+    /// differ, files to pull. Recomputed when the dataset or the listing
+    /// changes, never per frame.
+    sirv_counts: Option<(usize, usize, usize)>,
+    /// A running or finished Sirv transfer, shown in the notices line.
+    sirv_job: Option<SirvJob>,
     /// The open remote-folder browser.
     sirv_browser: Option<SirvBrowser>,
     /// How the list is ordered.
@@ -401,17 +404,34 @@ fn compare_entries(a: &Entry, b: &Entry, sort: Sort) -> std::cmp::Ordering {
 
 /// A paired Sirv folder. `files` maps the relative keys `sirv::relative_key`
 /// produces for local rows onto the remote listing, so the diff column is a
-/// lookup, never a walk.
+/// lookup, never a walk. `None` while the recursive listing is in flight —
+/// a pairing that just happened does not know its diff yet.
 struct SirvPairing {
     dir: String,
-    files: HashMap<String, sirv::Node>,
-    client: Arc<std::sync::Mutex<sirv::Client>>,
+    files: Option<HashMap<String, sirv::Node>>,
+    client: Arc<parking_lot::Mutex<sirv::Client>>,
+}
+
+/// What a background Sirv job is doing, and how far it got. Failures keep
+/// names, because "2 failed" is not a report.
+#[derive(Clone, Copy, PartialEq)]
+enum SirvJobKind {
+    Pull,
+    Push,
+}
+
+struct SirvJob {
+    kind: SirvJobKind,
+    done: usize,
+    total: usize,
+    failures: Vec<String>,
+    finished: bool,
 }
 
 /// The remote-folder browser: one path, its listing, and its own focus so
 /// Escape closes it rather than the thing underneath.
 struct SirvBrowser {
-    client: Arc<std::sync::Mutex<sirv::Client>>,
+    client: Arc<parking_lot::Mutex<sirv::Client>>,
     path: String,
     /// `None` while the listing is in flight.
     nodes: Option<Result<Vec<sirv::Node>, String>>,
@@ -1180,7 +1200,7 @@ impl Audit {
                     );
                     self.sirv_browser = Some(SirvBrowser {
                         // Never used on this path: the listing is already an error.
-                        client: Arc::new(std::sync::Mutex::new(sirv::Client::new(
+                        client: Arc::new(parking_lot::Mutex::new(sirv::Client::new(
                             sirv::Credentials {
                                 client_id: String::new(),
                                 client_secret: String::new(),
@@ -1193,7 +1213,7 @@ impl Audit {
                     cx.notify();
                     return;
                 };
-                Arc::new(std::sync::Mutex::new(sirv::Client::new(credentials)))
+                Arc::new(parking_lot::Mutex::new(sirv::Client::new(credentials)))
             }
         };
         let mut browser = SirvBrowser {
@@ -1222,7 +1242,6 @@ impl Audit {
                 .spawn(async move {
                     client
                         .lock()
-                        .unwrap()
                         .readdir(&path)
                         .map_err(|error| error.to_string())
                 })
@@ -1269,34 +1288,80 @@ impl Audit {
         cx.notify();
     }
 
-    /// Pair the browsed folder: keep its file listing under relative keys and
-    /// count how the local dataset stands against it.
+    /// Pair the browsed folder, then list it recursively in the background.
+    /// The pairing exists immediately (the header names it); its diff arrives
+    /// when the walk lands.
     fn pair_sirv(&mut self, cx: &mut Context<Self>) {
-        let (client, dir, nodes) = {
+        let (client, dir) = {
             let Some(browser) = self.sirv_browser.as_ref() else {
                 return;
             };
-            let Some(Ok(nodes)) = browser.nodes.as_ref() else {
-                return;
-            };
-            let nodes = nodes.clone();
             (
                 browser.client.clone(),
                 browser.path.trim_end_matches('/').to_string(),
-                nodes.clone(),
             )
         };
-        let files: HashMap<String, sirv::Node> = nodes
-            .iter()
-            .filter(|node| !node.is_folder())
-            .filter_map(|node| {
-                sirv::unpair_remote(&dir, &node.filename).map(|key| (key, node.clone()))
-            })
-            .collect();
-        self.sirv_pairing = Some(SirvPairing { dir, files, client });
-        self.refresh_sirv_counts();
+        self.sirv_pairing = Some(SirvPairing {
+            dir: dir.clone(),
+            files: None,
+            client,
+        });
+        self.sirv_counts = None;
         self.sirv_browser = None;
         cx.notify();
+        self.walk_sirv_pairing(cx);
+    }
+
+    /// List the paired folder end to end and rebuild its diff. Also the
+    /// refresh a push finishes with, so pushed files stop reading as new.
+    fn walk_sirv_pairing(&mut self, cx: &mut Context<Self>) {
+        let Some(pairing) = &self.sirv_pairing else {
+            return;
+        };
+        let client = pairing.client.clone();
+        let dir = pairing.dir.clone();
+        let generation = self.dataset_generation;
+        cx.spawn(async move |this, cx| {
+            let walked = cx
+                .background_executor()
+                .spawn(async move { client.lock().walk(&dir).map_err(|error| error.to_string()) })
+                .await;
+            this.update(cx, |audit, cx| {
+                // A folder swap mid-walk retires this listing with the rest of
+                // the detached work the old dataset owned.
+                if audit.dataset_generation != generation {
+                    return;
+                }
+                let Some(pairing) = audit.sirv_pairing.as_mut() else {
+                    return;
+                };
+                match walked {
+                    Ok(nodes) => {
+                        let dir = pairing.dir.clone();
+                        pairing.files = Some(
+                            nodes
+                                .into_iter()
+                                .filter_map(|node| {
+                                    sirv::unpair_remote(&dir, &node.filename).map(|key| (key, node))
+                                })
+                                .collect(),
+                        );
+                        audit.refresh_sirv_counts();
+                    }
+                    Err(message) => {
+                        audit.sirv_job = Some(SirvJob {
+                            kind: SirvJobKind::Pull,
+                            done: 0,
+                            total: 0,
+                            failures: vec![message],
+                            finished: true,
+                        });
+                    }
+                }
+                cx.notify();
+            })
+        })
+        .detach();
     }
 
     fn unpair_sirv(&mut self, cx: &mut Context<Self>) {
@@ -1306,23 +1371,222 @@ impl Audit {
         cx.notify();
     }
 
-    /// Count local-only and changed files across the whole dataset, not just
-    /// the visible rows, so the header number does not move with the filter.
-    fn refresh_sirv_counts(&mut self) {
-        self.sirv_counts = self.sirv_pairing.as_ref().map(|pairing| {
-            let mut only_local = 0;
-            let mut changed = 0;
-            for entry in &self.entries {
-                let key = sirv::relative_key(&self.root, &entry.path);
-                match sirv::classify(entry.bytes, key.and_then(|key| pairing.files.get(&key))) {
-                    sirv::SyncState::OnlyLocal => only_local += 1,
-                    sirv::SyncState::Changed => changed += 1,
-                    sirv::SyncState::Same => {}
-                }
-            }
-            (only_local, changed)
-        });
+    /// A transfer is already running. One at a time: the client serialises on
+    /// its token cache anyway, and two progress lines would lie about order.
+    fn sirv_busy(&self) -> bool {
+        self.sirv_job.as_ref().is_some_and(|job| !job.finished)
     }
+
+    /// Download every remote file the local folder lacks. Existing files are
+    /// never overwritten — pull is additive by design, so it can never destroy
+    /// local work.
+    fn start_pull(&mut self, cx: &mut Context<Self>) {
+        let Some(pairing) = &self.sirv_pairing else {
+            return;
+        };
+        if self.sirv_busy() {
+            return;
+        }
+        let Some(files) = pairing.files.clone() else {
+            return;
+        };
+        let dir = pairing.dir.clone();
+        let client = pairing.client.clone();
+        let remote: Vec<sirv::Node> = files.values().cloned().collect();
+        let local_keys: HashSet<String> = self
+            .entries
+            .iter()
+            .filter_map(|entry| sirv::relative_key(&self.root, &entry.path))
+            .collect();
+        let plan = sirv::pull_plan(&remote, &dir, &local_keys);
+        if plan.is_empty() {
+            return;
+        }
+        let total = plan.len();
+        self.sirv_job = Some(SirvJob {
+            kind: SirvJobKind::Pull,
+            done: 0,
+            total,
+            failures: Vec::new(),
+            finished: false,
+        });
+        cx.notify();
+
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let mut failures = Vec::new();
+            for (ix, key) in plan.iter().enumerate() {
+                let outcome = cx
+                    .background_executor()
+                    .spawn({
+                        let client = client.clone();
+                        let remote_path = format!("{dir}/{key}");
+                        async move { client.lock().download(&remote_path) }
+                    })
+                    .await;
+                let written = match outcome {
+                    Ok(bytes) => {
+                        let target = root.join(key);
+                        let dirs_ok = target
+                            .parent()
+                            .is_none_or(|parent| std::fs::create_dir_all(parent).is_ok());
+                        dirs_ok && std::fs::write(&target, bytes).is_ok()
+                    }
+                    Err(_) => false,
+                };
+                if !written {
+                    failures.push(key.clone());
+                }
+                this.update(cx, |audit, cx| {
+                    if let Some(job) = audit.sirv_job.as_mut() {
+                        job.done = ix + 1;
+                        job.failures = failures.clone();
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+            this.update(cx, |audit, cx| {
+                if let Some(job) = audit.sirv_job.as_mut() {
+                    job.finished = true;
+                }
+                // The pulled files belong in the table: a full rescan, through
+                // the same path a folder change takes.
+                audit.request_path(audit.root.clone(), cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Upload every local file Sirv lacks. Changed files are left alone in
+    /// both directions; overwriting is a decision, not a side effect.
+    fn start_push(&mut self, cx: &mut Context<Self>) {
+        let Some(pairing) = &self.sirv_pairing else {
+            return;
+        };
+        if self.sirv_busy() {
+            return;
+        }
+        let Some(files) = pairing.files.as_ref() else {
+            return;
+        };
+        let dir = pairing.dir.clone();
+        let client = pairing.client.clone();
+        let plan: Vec<(String, PathBuf)> = self
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let key = sirv::relative_key(&self.root, &entry.path)?;
+                (sirv::classify(entry.bytes, files.get(&key)) == sirv::SyncState::OnlyLocal)
+                    .then(|| (key, entry.path.clone()))
+            })
+            .collect();
+        if plan.is_empty() {
+            return;
+        }
+        let total = plan.len();
+        self.sirv_job = Some(SirvJob {
+            kind: SirvJobKind::Push,
+            done: 0,
+            total,
+            failures: Vec::new(),
+            finished: false,
+        });
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let mut failures = Vec::new();
+            for (ix, (key, path)) in plan.iter().enumerate() {
+                let outcome = cx
+                    .background_executor()
+                    .spawn({
+                        let client = client.clone();
+                        let key = key.clone();
+                        let path = path.clone();
+                        let dir = dir.clone();
+                        async move {
+                            let mut client = client.lock();
+                            // mkdir on an existing folder is success upstream,
+                            // so every ancestor is simply ensured.
+                            for ancestor in sirv::ancestor_dirs(&key) {
+                                let full = format!("{dir}/{ancestor}");
+                                if client.mkdir(&full).is_err() {
+                                    return Err(format!("{key}: could not create folder"));
+                                }
+                            }
+                            match std::fs::read(&path) {
+                                Ok(bytes) => client
+                                    .upload(
+                                        &format!("{dir}/{key}"),
+                                        &bytes,
+                                        sirv::content_type(&key),
+                                    )
+                                    .map_err(|error| format!("{key}: {error}")),
+                                Err(error) => Err(format!("{key}: {error}")),
+                            }
+                        }
+                    })
+                    .await;
+                if let Err(message) = outcome {
+                    failures.push(message);
+                }
+                this.update(cx, |audit, cx| {
+                    if let Some(job) = audit.sirv_job.as_mut() {
+                        job.done = ix + 1;
+                        job.failures = failures.clone();
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+            this.update(cx, |audit, cx| {
+                if let Some(job) = audit.sirv_job.as_mut() {
+                    job.finished = true;
+                }
+                // Re-list the pair: pushed files must stop reading as new.
+                audit.walk_sirv_pairing(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Count push / differs / pull across the whole dataset, not just the
+    /// visible rows, so the header numbers do not move with the filter.
+    fn refresh_sirv_counts(&mut self) {
+        self.sirv_counts = match self
+            .sirv_pairing
+            .as_ref()
+            .and_then(|pairing| pairing.files.as_ref())
+        {
+            None => None,
+            Some(files) => {
+                let mut to_push = 0;
+                let mut changed = 0;
+                let mut local_keys = HashSet::new();
+                for entry in &self.entries {
+                    let Some(key) = sirv::relative_key(&self.root, &entry.path) else {
+                        continue;
+                    };
+                    local_keys.insert(key.clone());
+                    match sirv::classify(entry.bytes, files.get(&key)) {
+                        sirv::SyncState::OnlyLocal => to_push += 1,
+                        sirv::SyncState::Changed => changed += 1,
+                        sirv::SyncState::Same => {}
+                    }
+                }
+                let to_pull = files
+                    .keys()
+                    .filter(|key| !local_keys.contains(*key))
+                    .count();
+                Some((to_push, changed, to_pull))
+            }
+        };
+    }
+
     /// Open the side-by-side view for a row and start building both sides.
     fn open_compare(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(path) = self.entries.get(index).map(|entry| entry.path.clone()) else {
@@ -1849,44 +2113,98 @@ impl Audit {
                     ),
             )
             .child(body)
+            .when_some(self.sirv_job.as_ref(), |panel, job| {
+                panel.child(
+                    div()
+                        .text_size(px(11.))
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_color(if job.failures.is_empty() {
+                            cx.theme().muted_foreground
+                        } else {
+                            cx.theme().yellow
+                        })
+                        .child(match (job.finished, job.kind) {
+                            (false, SirvJobKind::Pull) => {
+                                format!("Pulling {} of {}…", job.done, job.total)
+                            }
+                            (false, SirvJobKind::Push) => {
+                                format!("Pushing {} of {}…", job.done, job.total)
+                            }
+                            (true, kind) => {
+                                let verb = if kind == SirvJobKind::Pull {
+                                    "Pulled"
+                                } else {
+                                    "Pushed"
+                                };
+                                let failures = if job.failures.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        ", {} failed: {}",
+                                        job.failures.len(),
+                                        job.failures.join(", ")
+                                    )
+                                };
+                                format!("{verb} {} of {}{failures}", job.done, job.total)
+                            }
+                        }),
+                )
+            })
+            .child(div().flex().items_center().justify_between().child(
+                div().flex().gap_2().when_some(paired, |row, dir| {
+                    let busy = self.sirv_busy();
+                    let (to_push, _, to_pull) = self.sirv_counts.unwrap_or((0, 0, 0));
+                    row.child(
+                        Button::new("sirv-pull")
+                            .outline()
+                            .small()
+                            .icon(IconName::ArrowDown)
+                            .label(format!("Pull {to_pull} missing"))
+                            .disabled(busy || to_pull == 0)
+                            .on_click(cx.listener(|audit, _, _, cx| audit.start_pull(cx))),
+                    )
+                    .child(
+                        Button::new("sirv-push")
+                            .outline()
+                            .small()
+                            .icon(IconName::ArrowUp)
+                            .label(format!("Push {to_push} new"))
+                            .disabled(busy || to_push == 0)
+                            .on_click(cx.listener(|audit, _, _, cx| audit.start_push(cx))),
+                    )
+                    .child(
+                        Button::new("sirv-unpair")
+                            .ghost()
+                            .small()
+                            .label(format!("Unpair {dir}"))
+                            .disabled(busy)
+                            .on_click(cx.listener(|audit, _, _, cx| {
+                                audit.unpair_sirv(cx);
+                            })),
+                    )
+                }),
+            ))
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(div().flex().gap_2().when_some(paired, |row, dir| {
-                        row.child(
-                            Button::new("sirv-unpair")
-                                .ghost()
-                                .small()
-                                .label(format!("Unpair {dir}"))
-                                .on_click(cx.listener(|audit, _, _, cx| {
-                                    audit.unpair_sirv(cx);
-                                })),
-                        )
-                    }))
+                    .gap_2()
                     .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                Button::new("sirv-close")
-                                    .ghost()
-                                    .small()
-                                    .label("Close")
-                                    .on_click(cx.listener(|audit, _, _, cx| {
-                                        audit.sirv_browser = None;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("sirv-pair")
-                                    .primary()
-                                    .small()
-                                    .label("Pair this folder")
-                                    .disabled(!matches!(browser.nodes, Some(Ok(_))))
-                                    .on_click(cx.listener(|audit, _, _, cx| audit.pair_sirv(cx))),
-                            ),
+                        Button::new("sirv-close")
+                            .ghost()
+                            .small()
+                            .label("Close")
+                            .on_click(cx.listener(|audit, _, _, cx| {
+                                audit.sirv_browser = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("sirv-pair")
+                            .primary()
+                            .small()
+                            .label("Pair this folder")
+                            .disabled(!matches!(browser.nodes, Some(Ok(_))))
+                            .on_click(cx.listener(|audit, _, _, cx| audit.pair_sirv(cx))),
                     ),
             )
             .into_any_element()
@@ -1992,8 +2310,10 @@ impl Audit {
         if self.skipped_raw > 0 {
             stats.push_str(&format!(" · {} camera raw skipped", self.skipped_raw));
         }
-        if let Some((only_local, changed)) = self.sirv_counts {
-            stats.push_str(&format!(" · Sirv: {only_local} new · {changed} changed"));
+        if let Some((to_push, changed, to_pull)) = self.sirv_counts {
+            stats.push_str(&format!(
+                " · Sirv: {to_push} to push · {changed} differ · {to_pull} to pull"
+            ));
         }
 
         div()
@@ -2456,6 +2776,27 @@ impl Audit {
                 0 => format!("failed: {}", named.join(", ")),
                 rest => format!("failed: {} and {rest} more", named.join(", ")),
             });
+        }
+        if let Some(job) = &self.sirv_job {
+            let verb = match job.kind {
+                SirvJobKind::Pull => "Sirv pull",
+                SirvJobKind::Push => "Sirv push",
+            };
+            let failures = if job.failures.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} failed: {}",
+                    job.failures.len(),
+                    job.failures
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            parts.push(format!("{verb}: {} of {}{failures}", job.done, job.total));
         }
         if parts.is_empty() {
             return None;
@@ -2926,10 +3267,14 @@ impl TableDelegate for AuditTable {
             TableColumn::Sync => {
                 // The row's file against the paired Sirv folder. No pairing,
                 // no status: the column exists only when it can know.
-                let state = audit.sirv_pairing.as_ref().and_then(|pairing| {
-                    let key = sirv::relative_key(&audit.root, &entry.path)?;
-                    Some(sirv::classify(entry.bytes, pairing.files.get(&key)))
-                });
+                let state = audit
+                    .sirv_pairing
+                    .as_ref()
+                    .and_then(|pairing| pairing.files.as_ref())
+                    .and_then(|files| {
+                        let key = sirv::relative_key(&audit.root, &entry.path)?;
+                        Some(sirv::classify(entry.bytes, files.get(&key)))
+                    });
                 let (label, colour) = match state {
                     None => return div().into_any_element(),
                     Some(sirv::SyncState::Same) => ("synced", cx.theme().muted_foreground),
@@ -3705,6 +4050,7 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
             drag_over: false,
             sirv_pairing: None,
             sirv_counts: None,
+            sirv_job: None,
             sirv_browser: None,
             compare: None,
         };

@@ -3315,6 +3315,7 @@ dependencies = [
  "gpui-component-assets",
  "gpui_platform",
  "image",
+ "parking_lot",
  "ravif",
  "rfd",
  "rgb",
