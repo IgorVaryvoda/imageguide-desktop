@@ -678,6 +678,16 @@ impl Audit {
         }
         let last = self.visible.len() - 1;
         self.cursor = (self.cursor as isize + delta).clamp(0, last as isize) as usize;
+        if self.grid {
+            let columns = self.gallery_columns.unwrap_or(1).max(1);
+            self.gallery_scroll
+                .scroll_to_item_strict(self.cursor / columns, ScrollStrategy::Nearest);
+        } else if let Some(table) = self.table.clone() {
+            let visible = table.read(cx).visible_range().rows().clone();
+            if !visible.contains(&self.cursor) {
+                table.update(cx, |table, cx| table.scroll_to_row(self.cursor, cx));
+            }
+        }
         cx.notify();
     }
 
@@ -732,11 +742,13 @@ impl Audit {
         if self.converting {
             return;
         }
-        if let Some(entry) = self.entry_at(self.cursor)
-            && !self.selected.remove(&entry)
-        {
+        let Some(entry) = self.entry_at(self.cursor) else {
+            return;
+        };
+        if !self.selected.remove(&entry) {
             self.selected.insert(entry);
         }
+        self.schedule_estimate(cx);
         cx.notify();
     }
 
@@ -2236,13 +2248,17 @@ impl TableDelegate for AuditTable {
         let Some(audit) = self.audit.upgrade() else {
             return row;
         };
-        let ticked = audit
-            .read(cx)
+        let audit_state = audit.read(cx);
+        let ticked = audit_state
             .entry_at(row_ix)
-            .is_some_and(|entry| audit.read(cx).selected.contains(&entry));
+            .is_some_and(|entry| audit_state.selected.contains(&entry));
+        let cursor = audit_state.cursor;
 
         row.h(px(ROW_HEIGHT))
+            .border_1()
+            .border_color(gpui::transparent_black())
             .when(ticked, |row| row.bg(cx.theme().list_active))
+            .when(row_ix == cursor, |row| row.border_color(cx.theme().ring))
             .on_click(cx.listener(move |table, event: &gpui::ClickEvent, _, cx| {
                 let Some(audit) = table.delegate().audit.upgrade() else {
                     return;
@@ -2680,7 +2696,9 @@ impl Render for Audit {
                     "end" => audit.move_cursor(isize::MAX / 2, cx),
                     "space" => audit.toggle_cursor_selection(cx),
                     "enter" => {
-                        if let Some(entry) = audit.entry_at(audit.cursor) {
+                        if !audit.converting
+                            && let Some(entry) = audit.entry_at(audit.cursor)
+                        {
                             audit.open_compare(entry, cx);
                         }
                     }
@@ -3405,6 +3423,19 @@ mod tests {
     fn table_checkbox_pointer_click_stays_inside_checkbox(cx: &mut TestAppContext) {
         let (audit, cx) = pointer_checkbox_audit(false, cx);
         assert_pointer_checkbox_toggle(&audit, "table-checkbox-0", cx);
+    }
+
+    #[gpui::test]
+    fn keyboard_selection_refreshes_estimate(cx: &mut TestAppContext) {
+        let (audit, cx) = pointer_checkbox_audit(false, cx);
+        let before = audit.read_with(cx, |audit, _| audit.estimate_generation);
+
+        audit.update(cx, |audit, cx| audit.toggle_cursor_selection(cx));
+        audit.read_with(cx, |audit, _| {
+            assert_eq!(audit.selected, [0].into_iter().collect());
+            assert_eq!(audit.estimate_generation, before + 1);
+            assert_eq!(audit.estimate, None);
+        });
     }
 
     #[test]
