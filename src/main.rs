@@ -25,10 +25,10 @@ use gpui::{
 use gpui_component::alert::Alert;
 use gpui_component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
-use gpui_component::group_box::{GroupBox, GroupBoxVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::progress::Progress;
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
+use gpui_component::switch::Switch;
 use gpui_component::table::{Column as TableCol, ColumnSort, DataTable, TableDelegate, TableState};
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Disableable, IconName, Root, Selectable, Sizable};
@@ -56,10 +56,6 @@ const W_PIXELS: f32 = 96.;
 const W_DENSITY: f32 = 74.;
 const W_WEIGHT: f32 = 100.;
 const W_RESULT: f32 = 112.;
-/// The weight bar gets a column of its own. Sharing a cell with the figure meant a
-/// left-grown bar under a right-aligned number — an underline for the heaviest file
-/// and a stub stranded half a column from its own number for the lightest.
-const W_BAR: f32 = 140.;
 const W_FORMAT_COMPACT: f32 = 70.;
 const W_PIXELS_COMPACT: f32 = 88.;
 const W_DENSITY_COMPACT: f32 = 60.;
@@ -251,19 +247,8 @@ fn segment(
     if selected {
         button.primary()
     } else {
-        button.ghost()
+        button.outline()
     }
-}
-
-/// The faint word that says what a group of controls is for.
-fn group_label(text: &'static str, cx: &App) -> gpui::Div {
-    div()
-        .text_size(px(11.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(cx.theme().muted_foreground)
-        .whitespace_nowrap()
-        .flex_shrink_0()
-        .child(text)
 }
 
 struct Audit {
@@ -700,6 +685,41 @@ impl Audit {
         cx.notify();
     }
 
+    /// One keyboard step. With shift held it is a selection drag: the run from
+    /// the anchor to the new cursor joins the selection, exactly as a
+    /// shift-click does.
+    fn step_cursor(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        self.move_cursor(delta, cx);
+        if extend {
+            self.select_through_cursor(cx);
+        }
+    }
+
+    /// Left and right: one row in the list, one tile across in the gallery.
+    fn step_cursor_lateral(&mut self, direction: isize, extend: bool, cx: &mut Context<Self>) {
+        let columns = if self.grid {
+            self.gallery_columns.unwrap_or(1).max(1) as isize
+        } else {
+            1
+        };
+        self.step_cursor(direction * columns, extend, cx);
+    }
+
+    fn select_through_cursor(&mut self, cx: &mut Context<Self>) {
+        if self.converting {
+            return;
+        }
+        let (from, to) = if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        };
+        let run: Vec<usize> = (from..=to).filter_map(|row| self.entry_at(row)).collect();
+        self.selected.extend(run);
+        self.schedule_estimate(cx);
+        cx.notify();
+    }
+
     /// What a click on a row means, by the rules every file list uses: plain click
     /// selects just that row, the platform modifier adds or removes one, shift takes
     /// the run from the last click, and a second click opens it.
@@ -908,7 +928,8 @@ impl Audit {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .text_size(px(11.))
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(px(10.))
                     .child(div().text_color(cx.theme().muted_foreground).child(
                         match self.results.get(&index) {
                             Some(bytes) => {
@@ -920,7 +941,7 @@ impl Audit {
                     .child(
                         div()
                             .text_color(density_colour(density, cx))
-                            .child(format!("{density:.2} B/px")),
+                            .child(format!("{density:.2}")),
                     ),
             )
     }
@@ -1079,24 +1100,6 @@ impl Audit {
         .detach();
     }
 
-    /// A quiet button, for the things that move you around rather than commit work.
-    fn toolbar_button(
-        &self,
-        id: &'static str,
-        text: &'static str,
-        tooltip: &'static str,
-        icon: IconName,
-        cx: &mut Context<Self>,
-        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-    ) -> Button {
-        Button::new(id)
-            .small()
-            .icon(icon)
-            .label(text)
-            .tooltip(tooltip)
-            .on_click(cx.listener(move |audit, _, _, cx| on_click(audit, cx)))
-    }
-
     /// Several exclusive options as one control, under the word for what they choose.
     /// The old toolbar was thirteen identical ghost buttons in a row with a 12px gap
     /// standing in for grouping, and nothing said which was which.
@@ -1106,10 +1109,20 @@ impl Audit {
         group: ButtonGroup,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        GroupBox::new()
-            .outline()
-            .w_auto()
-            .title(group_label(label, cx))
+        // The word sits left of its control, in the same muted voice as the
+        // rest of the strip's metadata.
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_nowrap()
+                    .child(label),
+            )
             .child(group.small().compact())
     }
 
@@ -1589,6 +1602,23 @@ impl Audit {
             .sum()
     }
 
+    fn toolbar_button(
+        &self,
+        id: &'static str,
+        text: &'static str,
+        tooltip: &'static str,
+        icon: IconName,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Button {
+        Button::new(id)
+            .small()
+            .icon(icon)
+            .label(text)
+            .tooltip(tooltip)
+            .on_click(cx.listener(move |audit, _, _, cx| on_click(audit, cx)))
+    }
+
     /// Which folder this is, and how to get to another one.
     fn header(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let folder = self
@@ -1618,11 +1648,18 @@ impl Audit {
             .p_2()
             .rounded_lg()
             .bg(cx.theme().secondary)
-            .border_1()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
             .border_color(cx.theme().border)
+            // Identity and its two actions share the top-left corner: the name,
+            // then the openers that replace it. The path and the count sit
+            // underneath as metadata.
             .child(
-                // The folder name identifies it; the full path only locates it, so
-                // it goes underneath at a size that says so.
                 div()
                     .flex()
                     .flex_col()
@@ -1632,11 +1669,12 @@ impl Audit {
                     .child(
                         div()
                             .flex()
-                            .items_baseline()
+                            .items_center()
                             .gap_2()
                             .min_w_0()
                             .child(
                                 div()
+                                    .font_family("SF Pro Display")
                                     .text_size(px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(cx.theme().foreground)
@@ -1646,71 +1684,71 @@ impl Audit {
                                     .child(folder),
                             )
                             .child(
+                                Button::new("open-folder")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::Folder)
+                                    .label("Open folder…")
+                                    .disabled(self.converting)
+                                    .on_click(cx.listener(|audit, _, _, cx| audit.pick(true, cx))),
+                            )
+                            .child(
+                                Button::new("open-file")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::File)
+                                    .label("Open image…")
+                                    .disabled(self.converting)
+                                    .on_click(cx.listener(|audit, _, _, cx| audit.pick(false, cx))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(px(11.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(self.root.display().to_string()),
+                            )
+                            .child(
+                                div()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_size(px(11.))
                                     .text_color(cx.theme().muted_foreground)
                                     .whitespace_nowrap()
                                     .flex_shrink_0()
                                     .child(stats),
                             ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(cx.theme().muted_foreground)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(self.root.display().to_string()),
                     ),
             )
-            .child(
-                div().w(px(190.)).min_w(px(150.)).flex_shrink_1().child(
-                    Input::new(&self.filter_input)
-                        .small()
-                        .cleanable(true)
-                        .disabled(self.converting)
-                        .prefix(IconName::Search),
-                ),
-            )
-            .child(self.toolbar_button(
-                "view-grid",
-                if self.grid { "List" } else { "Grid" },
-                if self.grid {
-                    "Show the audit as a list"
-                } else {
-                    "Show the images as a gallery"
-                },
-                if self.grid {
-                    IconName::Menu
-                } else {
-                    IconName::LayoutDashboard
-                },
-                cx,
-                |audit, cx| {
-                    audit.grid = !audit.grid;
-                    cx.notify();
-                },
-            ))
+            // The view toggle sits at the far end of the window: it changes how
+            // the list below is drawn and nothing else.
             .child(
                 self.toolbar_button(
-                    "open-folder",
-                    "Folder",
-                    "Audit a different folder",
-                    IconName::Folder,
+                    "view-grid",
+                    if self.grid { "List" } else { "Grid" },
+                    if self.grid {
+                        "Show the audit as a list"
+                    } else {
+                        "Show the images as a gallery"
+                    },
+                    if self.grid {
+                        IconName::Menu
+                    } else {
+                        IconName::LayoutDashboard
+                    },
                     cx,
-                    |audit, cx| audit.pick(true, cx),
-                )
-                .disabled(self.converting),
-            )
-            .child(
-                self.toolbar_button(
-                    "open-file",
-                    "Image",
-                    "Open a single image in the comparison",
-                    IconName::File,
-                    cx,
-                    |audit, cx| audit.pick(false, cx),
+                    |audit, cx| {
+                        audit.grid = !audit.grid;
+                        cx.notify();
+                    },
                 )
                 .disabled(self.converting),
             )
@@ -1725,24 +1763,46 @@ impl Audit {
             .flex_wrap()
             .items_center()
             .gap_3()
-            .p_2()
-            .rounded_lg()
-            .bg(cx.theme().secondary)
-            .border_1()
+            .px_3()
+            .py_2()
+            .border_b_1()
             .border_color(cx.theme().border)
+            // What the list shows, then what a conversion would do: the reading
+            // order of the strip follows the order you use it.
+            .child(
+                div().w(px(150.)).flex_shrink_0().child(
+                    Input::new(&self.filter_input)
+                        .small()
+                        .cleanable(true)
+                        .disabled(self.converting)
+                        .prefix(IconName::Search),
+                ),
+            )
+            .child(
+                div()
+                    .w(px(1.))
+                    .h(px(24.))
+                    .flex_shrink_0()
+                    .bg(cx.theme().border),
+            )
             .child(self.control_group("Resize", self.resize_group(cx), cx))
             .child(self.control_group("Format", self.format_group(cx), cx))
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .flex_shrink_0()
-                    .child(group_label("Quality", cx))
                     .child(
                         div()
-                            .w(px(130.))
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .whitespace_nowrap()
+                            .child("Quality"),
+                    )
+                    .child(
+                        div()
+                            .w(px(110.))
                             .debug_selector(|| "quality-control".to_string())
                             .when(self.converting, |rail| {
                                 rail.child(
@@ -1759,8 +1819,8 @@ impl Audit {
                     .child(
                         div()
                             .w(px(26.))
+                            .font_family(cx.theme().mono_font_family.clone())
                             .text_size(px(12.))
-                            .font_weight(FontWeight::MEDIUM)
                             .whitespace_nowrap()
                             .text_color(if lossless {
                                 cx.theme().muted_foreground
@@ -1773,8 +1833,9 @@ impl Audit {
                             }),
                     )
                     .child(
-                        segment("lossless", "Lossless", lossless)
-                            .small()
+                        Switch::new("lossless")
+                            .checked(lossless)
+                            .label("Lossless")
                             .disabled(self.converting)
                             .on_click(cx.listener(|audit, _, _, cx| {
                                 if audit.converting {
@@ -1897,16 +1958,24 @@ impl Audit {
             )
         };
 
+        // A status bar: fixed at the bottom, one height in every state, so the
+        // list above it never jumps when the numbers arrive.
+        let (fraction, colour) = bar
+            .map(|(remaining, colour)| (1. - remaining, colour))
+            .unwrap_or((0., gpui::transparent_black()));
+
         div()
             .flex()
             .flex_col()
-            .gap_2()
             .px_3()
-            .py_2()
-            .rounded_lg()
-            .bg(cx.theme().secondary)
-            .border_1()
+            .pt_1()
+            .pb_2()
+            // The one strip allowed colour: washed in the tone of the headline,
+            // so the state of the job reads before any word does.
+            .bg(tone.opacity(0.08))
+            .border_t_1()
             .border_color(cx.theme().border)
+            .child(meter("saving", fraction, colour, 3.))
             .child(
                 div()
                     .flex()
@@ -1915,7 +1984,8 @@ impl Audit {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(17.))
+                            .font_family("SF Pro Display")
+                            .text_size(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(tone)
                             .whitespace_nowrap()
@@ -1939,7 +2009,8 @@ impl Audit {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(12.))
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(11.))
                             .text_color(cx.theme().muted_foreground)
                             .whitespace_nowrap()
                             .overflow_hidden()
@@ -1972,7 +2043,6 @@ impl Audit {
                     .child(
                         Button::new("convert")
                             .primary()
-                            .small()
                             .when(self.converting || targets.is_empty(), |button| {
                                 button.ghost()
                             })
@@ -1993,7 +2063,6 @@ impl Audit {
                             .on_click(cx.listener(|audit, _, _, cx| audit.start_conversion(cx))),
                     ),
             )
-            .children(bar.map(|(remaining, colour)| meter("saving", 1. - remaining, colour, 4.)))
     }
 
     /// Everything the scan could not take at face value, in one line rather than
@@ -2106,7 +2175,6 @@ enum TableColumn {
     Format,
     Pixels,
     Density,
-    Bar,
     Weight,
     Result,
 }
@@ -2150,7 +2218,6 @@ impl TableColumn {
                 }))
                 .text_right()
                 .sortable(),
-            TableColumn::Bar => TableCol::new("bar", "").width(px(W_BAR)),
             TableColumn::Weight => TableCol::new("weight", "Weight")
                 .width(px(if compact { W_WEIGHT_COMPACT } else { W_WEIGHT }))
                 .text_right()
@@ -2177,7 +2244,6 @@ impl AuditTable {
             } else {
                 W_DENSITY
             }
-            + if compact { 0. } else { W_BAR }
             + if compact { W_WEIGHT_COMPACT } else { W_WEIGHT }
             + if show_result { W_RESULT } else { 0. }
     }
@@ -2186,30 +2252,16 @@ impl AuditTable {
         let compact = width < 900.;
         let name_width =
             (width - Self::fixed_width(compact, show_result) - Self::CHROME).max(W_NAME_MIN);
-        let columns = if compact {
-            vec![
-                TableColumn::Tick,
-                TableColumn::Thumb,
-                TableColumn::Name,
-                TableColumn::Format,
-                TableColumn::Pixels,
-                TableColumn::Density,
-                TableColumn::Weight,
-                TableColumn::Result,
-            ]
-        } else {
-            vec![
-                TableColumn::Tick,
-                TableColumn::Thumb,
-                TableColumn::Name,
-                TableColumn::Format,
-                TableColumn::Pixels,
-                TableColumn::Density,
-                TableColumn::Bar,
-                TableColumn::Weight,
-                TableColumn::Result,
-            ]
-        };
+        let columns = vec![
+            TableColumn::Tick,
+            TableColumn::Thumb,
+            TableColumn::Name,
+            TableColumn::Format,
+            TableColumn::Pixels,
+            TableColumn::Density,
+            TableColumn::Weight,
+            TableColumn::Result,
+        ];
         (compact, name_width, columns)
     }
 
@@ -2302,11 +2354,29 @@ impl TableDelegate for AuditTable {
             .is_some_and(|entry| audit_state.selected.contains(&entry));
         let cursor = audit_state.cursor;
 
+        // The audit's finding, carried on the row's left edge: a tick in the
+        // density band colour, so the shape of the folder is visible while
+        // scrolling and not only in the B/px column.
+        let rail = audit_state
+            .entry_at(row_ix)
+            .and_then(|index| audit_state.entries.get(index))
+            .map(|entry| density_colour(entry.bytes_per_pixel(), cx));
         row.h(px(ROW_HEIGHT))
+            .relative()
             .border_1()
             .border_color(gpui::transparent_black())
             .when(ticked, |row| row.bg(cx.theme().list_active))
             .when(row_ix == cursor, |row| row.border_color(cx.theme().ring))
+            .children(rail.map(|colour| {
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(5.))
+                    .bottom(px(5.))
+                    .w(px(2.))
+                    .rounded_full()
+                    .bg(colour.opacity(0.9))
+            }))
             .on_click(cx.listener(move |table, event: &gpui::ClickEvent, _, cx| {
                 let Some(audit) = table.delegate().audit.upgrade() else {
                     return;
@@ -2348,6 +2418,9 @@ impl TableDelegate for AuditTable {
             TableColumn::Tick => {
                 let ticked = audit.selected.contains(&index);
                 div()
+                    .h_full()
+                    .flex()
+                    .items_center()
                     .debug_selector(move || format!("table-checkbox-{index}"))
                     .on_key_down(cx.listener(|_, event, _, cx| {
                         if is_checkbox_activation_key(event) {
@@ -2417,6 +2490,11 @@ impl TableDelegate for AuditTable {
                     .into_any_element()
             }
             TableColumn::Pixels => div()
+                .w_full()
+                .flex()
+                .justify_end()
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_size(px(12.))
                 .text_color(cx.theme().muted_foreground)
                 .whitespace_nowrap()
                 .child(format!("{}×{}", entry.width, entry.height))
@@ -2424,32 +2502,45 @@ impl TableDelegate for AuditTable {
             TableColumn::Density => {
                 let density = entry.bytes_per_pixel();
                 div()
+                    .w_full()
+                    .flex()
+                    .justify_end()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(px(12.))
                     .font_weight(FontWeight::MEDIUM)
                     .whitespace_nowrap()
                     .text_color(density_colour(density, cx))
                     .child(format!("{density:.2}"))
                     .into_any_element()
             }
-            // Against the heaviest file on screen, so the column shows the shape of
-            // the folder and not just its numbers. All the bars share a left edge,
-            // which is the whole point of drawing them.
-            TableColumn::Bar => div()
-                .w_full()
-                .flex()
-                .items_center()
-                .child(meter(
-                    ("weight", index),
-                    entry.bytes as f32 / audit.heaviest.max(1) as f32,
-                    cx.theme().primary,
-                    4.,
-                ))
-                .into_any_element(),
-            TableColumn::Weight => div()
-                .font_weight(FontWeight::MEDIUM)
-                .whitespace_nowrap()
-                .text_color(cx.theme().foreground)
-                .child(format_bytes(entry.bytes))
-                .into_any_element(),
+            // The bar lives under its own number now: one cell, so a bar can
+            // never drift away from the figure it measures.
+            TableColumn::Weight => {
+                let fraction = entry.bytes as f32 / audit.heaviest.max(1) as f32;
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .justify_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .whitespace_nowrap()
+                            .text_color(cx.theme().foreground)
+                            .child(format_bytes(entry.bytes)),
+                    )
+                    .child(div().w_full().child(meter(
+                        ("weight", index),
+                        fraction,
+                        cx.theme().primary,
+                        3.,
+                    )))
+                    .into_any_element()
+            }
             TableColumn::Result => div()
                 .flex()
                 .items_center()
@@ -2468,6 +2559,8 @@ impl TableDelegate for AuditTable {
                     let grew = *converted > entry.bytes;
                     slot.child(
                         div()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(12.))
                             .text_color(cx.theme().muted_foreground)
                             .child(format_bytes(*converted)),
                     )
@@ -2549,7 +2642,6 @@ impl Render for Audit {
                 .justify_center()
                 .p_4()
                 .bg(cx.theme().background)
-                .font_family("sans-serif")
                 .child(
                     div()
                         .flex()
@@ -2565,6 +2657,7 @@ impl Render for Audit {
                         .border_color(cx.theme().border)
                         .child(
                             div()
+                                .font_family("SF Pro Display")
                                 .text_size(px(18.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(cx.theme().foreground)
@@ -2596,7 +2689,6 @@ impl Render for Audit {
                 .justify_center()
                 .p_4()
                 .bg(cx.theme().background)
-                .font_family("sans-serif")
                 .child(
                     // A panel rather than loose text, so the window has something in
                     // it and the drop target has an edge you can see.
@@ -2607,9 +2699,8 @@ impl Render for Audit {
                         .gap_2()
                         .w(px(400.))
                         .px_4()
-                        .py_4()
-                        .rounded_lg()
-                        .bg(cx.theme().secondary)
+                        .py_6()
+                        .border_dashed()
                         .border_1()
                         .border_color(if self.drag_over {
                             cx.theme().drag_border
@@ -2618,7 +2709,8 @@ impl Render for Audit {
                         })
                         .child(
                             div()
-                                .text_size(px(18.))
+                                .font_family("SF Pro Display")
+                                .text_size(px(19.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(cx.theme().foreground)
                                 .child(if empty_folder {
@@ -2694,6 +2786,10 @@ impl Render for Audit {
             // listeners it builds hold a mutable handle to the same entity.
             let view = self.compare_view(&comparison, window, cx);
             self.compare = Some(comparison);
+            // The click or Enter that opened this view left focus inside the list
+            // it replaced, so Escape had nowhere to land. Take focus back next
+            // frame, after the compare tree exists.
+            cx.defer_in(window, |audit, window, cx| window.focus(&audit.focus, cx));
             return div()
                 .size_full()
                 .relative()
@@ -2731,10 +2827,7 @@ impl Render for Audit {
             .size_full()
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
             .bg(cx.theme().background)
-            .font_family("sans-serif")
             .track_focus(&self.focus)
             // Always bordered, so a hovering drag recolours the frame instead of
             // shifting the whole window's contents inward by two pixels.
@@ -2754,14 +2847,39 @@ impl Render for Audit {
             ))
             .on_key_down(cx.listener(|audit, event: &gpui::KeyDownEvent, _, cx| {
                 // The filter box swallows its own keys, so these only fire when the
-                // list itself has focus.
+                // list itself has focus. Shift turns any move into a selection
+                // drag from the anchor.
+                let extend = event.keystroke.modifiers.shift;
                 match event.keystroke.key.as_str() {
-                    "down" => audit.move_cursor(1, cx),
-                    "up" => audit.move_cursor(-1, cx),
-                    "pagedown" => audit.move_cursor(10, cx),
-                    "pageup" => audit.move_cursor(-10, cx),
-                    "home" => audit.move_cursor(isize::MIN / 2, cx),
-                    "end" => audit.move_cursor(isize::MAX / 2, cx),
+                    "down" => audit.step_cursor(1, extend, cx),
+                    "up" => audit.step_cursor(-1, extend, cx),
+                    "left" => audit.step_cursor_lateral(-1, extend, cx),
+                    "right" => audit.step_cursor_lateral(1, extend, cx),
+                    "pagedown" => audit.step_cursor(10, extend, cx),
+                    "pageup" => audit.step_cursor(-10, extend, cx),
+                    "home" => audit.step_cursor(isize::MIN / 2, extend, cx),
+                    "end" => audit.step_cursor(isize::MAX / 2, extend, cx),
+                    "escape" => {
+                        // Nothing is open here, so escape means "put the list down":
+                        // the ticked set clears, the way it does in every file manager.
+                        if !audit.selected.is_empty() && !audit.converting {
+                            audit.selected.clear();
+                            audit.schedule_estimate(cx);
+                            cx.notify();
+                        }
+                    }
+                    "a" if event.keystroke.modifiers.control
+                        || event.keystroke.modifiers.platform =>
+                    {
+                        // Select what the list shows, not what the folder holds:
+                        // a filter that hides files from the list must hide them
+                        // from Convert too.
+                        if !audit.converting {
+                            audit.selected.extend(audit.visible.iter().copied());
+                            audit.schedule_estimate(cx);
+                            cx.notify();
+                        }
+                    }
                     "space" => audit.toggle_cursor_selection(cx),
                     "enter" => {
                         if !audit.converting
@@ -2781,21 +2899,16 @@ impl Render for Audit {
             }))
             .child(self.header(count, cx))
             .child(self.controls(cx))
-            .child(self.summary(cx))
             .children(self.notices())
             .child(
-                // The table gets a surface of its own, so a folder that does not
-                // fill the window reads as a short list rather than a layout that
-                // ran out half way down.
+                // The list runs to the window edge; hairlines above it, not a
+                // card floating in padding.
                 div()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .overflow_hidden()
-                    .rounded_lg()
                     .bg(cx.theme().table)
-                    .border_1()
-                    .border_color(cx.theme().border)
                     // Columns take a width, not a share, so the remainder after the
                     // fixed ones has to be handed to the name column by hand.
                     .child(if self.grid {
@@ -2857,6 +2970,9 @@ impl Render for Audit {
                         div().into_any_element()
                     }),
             )
+            // The status bar sits at the very bottom, so nothing above it ever
+            // changes height and the list never jumps.
+            .child(self.summary(cx))
             .into_any_element()
     }
 }
@@ -3193,16 +3309,18 @@ fn init_theme(cx: &mut App) {
     // token set and its label from the colour set, so setting one and not the other
     // is how you get black text on a blue button.
     let theme = gpui_component::Theme::global_mut(cx);
-    let base = gpui::Hsla::from(gpui::rgb(0x2f6feb));
-    let hover = gpui::Hsla::from(gpui::rgb(0x3f7dfa));
-    let active = gpui::Hsla::from(gpui::rgb(0x2760d4));
-    let background = gpui::Hsla::from(gpui::rgb(0x0d1117));
-    let surface = gpui::Hsla::from(gpui::rgb(0x151b24));
-    let table = gpui::Hsla::from(gpui::rgb(0x10161e));
-    let border = gpui::Hsla::from(gpui::rgb(0x2a3543));
-    let foreground = gpui::Hsla::from(gpui::rgb(0xe6edf3));
-    let muted = gpui::Hsla::from(gpui::rgb(0x9aa8b8));
-    let focus = gpui::Hsla::from(gpui::rgb(0x9cc7ff));
+    // One neutral ramp, barely blue, so the imagery in the table carries the
+    // colour and the chrome reads as an instrument panel rather than a website.
+    let background = gpui::Hsla::from(gpui::rgb(0x0a0d12));
+    let surface = gpui::Hsla::from(gpui::rgb(0x10151d));
+    let table = gpui::Hsla::from(gpui::rgb(0x0d1118));
+    let border = gpui::Hsla::from(gpui::rgb(0x232d3b));
+    let foreground = gpui::Hsla::from(gpui::rgb(0xe8eef6));
+    let muted = gpui::Hsla::from(gpui::rgb(0x8fa0b5));
+    let base = gpui::Hsla::from(gpui::rgb(0x4c8dff));
+    let hover = gpui::Hsla::from(gpui::rgb(0x65a0ff));
+    let active = gpui::Hsla::from(gpui::rgb(0x3b79e6));
+    let focus = gpui::Hsla::from(gpui::rgb(0x8fbcff));
 
     theme.background = background;
     theme.secondary = surface;
@@ -3213,13 +3331,13 @@ fn init_theme(cx: &mut App) {
     theme.muted_foreground = muted;
     theme.group_box = surface;
     theme.group_box_foreground = foreground;
-    theme.list_hover = gpui::Hsla::from(gpui::rgb(0x1c2734));
-    theme.list_active = gpui::Hsla::from(gpui::rgb(0x1d3552));
+    theme.list_hover = gpui::Hsla::from(gpui::rgb(0x161d28));
+    theme.list_active = gpui::Hsla::from(gpui::rgb(0x1a2740));
     theme.list_active_border = base;
-    theme.table_head = surface;
+    theme.table_head = background;
     theme.table_head_foreground = muted;
-    theme.table_hover = gpui::Hsla::from(gpui::rgb(0x18222d));
-    theme.table_row_border = gpui::Hsla::from(gpui::rgb(0x202a35));
+    theme.table_hover = gpui::Hsla::from(gpui::rgb(0x141b26));
+    theme.table_row_border = gpui::Hsla::from(gpui::rgb(0x1a222e));
     theme.ring = focus;
 
     theme.primary = base;
@@ -3235,6 +3353,13 @@ fn init_theme(cx: &mut App) {
     theme.tokens.button_primary_hover = hover.into();
     theme.tokens.button_primary_active = active.into();
     theme.tokens.button_primary_foreground = gpui::white().into();
+
+    // SF Pro Text for words, Fira Code for every measured number. A column of
+    // byte counts in a proportional face will not align down its right edge,
+    // and an audit that will not align is not an audit.
+    theme.font_family = "SF Pro Text".into();
+    theme.mono_font_family = "Fira Code".into();
+    theme.mono_font_size = px(12.);
 }
 
 /// Everything the window needs to open. A struct rather than nine positional
@@ -3420,12 +3545,12 @@ mod tests {
         assert!(compact_name >= W_NAME_MIN);
         assert!(compact_columns.contains(&TableColumn::Weight));
         assert!(compact_columns.contains(&TableColumn::Result));
-        assert!(!compact_columns.contains(&TableColumn::Bar));
+        assert!(compact_columns.contains(&TableColumn::Density));
 
         let (wide, wide_name, wide_columns) = AuditTable::layout(1100., true);
         assert!(!wide);
         assert!(wide_name > compact_name);
-        assert!(wide_columns.contains(&TableColumn::Bar));
+        assert!(wide_columns.contains(&TableColumn::Density));
         assert!(wide_columns.contains(&TableColumn::Weight));
         assert!(wide_columns.contains(&TableColumn::Result));
     }
