@@ -8,6 +8,7 @@ mod compare;
 mod convert;
 mod scan;
 mod settings;
+mod sirv;
 mod thumbs;
 
 use std::collections::{HashMap, HashSet};
@@ -56,6 +57,9 @@ const W_PIXELS: f32 = 96.;
 const W_DENSITY: f32 = 74.;
 const W_WEIGHT: f32 = 100.;
 const W_RESULT: f32 = 112.;
+/// The Sirv diff column. Wide windows only: below 900px the name needs the
+/// room more than the status does.
+const W_SYNC: f32 = 86.;
 const W_FORMAT_COMPACT: f32 = 70.;
 const W_PIXELS_COMPACT: f32 = 88.;
 const W_DENSITY_COMPACT: f32 = 60.;
@@ -283,6 +287,14 @@ struct Audit {
     drag_over: bool,
     /// The open side-by-side view, if any.
     compare: Option<Comparison>,
+    /// The paired Sirv folder, if any: the client, the remote path, and its
+    /// listing keyed by the same relative keys the local rows use.
+    sirv_pairing: Option<SirvPairing>,
+    /// How many local files are missing on Sirv, and how many differ by size.
+    /// Recomputed when the dataset or the pairing changes, never per frame.
+    sirv_counts: Option<(usize, usize)>,
+    /// The open remote-folder browser.
+    sirv_browser: Option<SirvBrowser>,
     /// How the list is ordered.
     sort: Sort,
     /// Indices into `entries`, filtered and sorted. `entries` itself never moves, so
@@ -385,6 +397,25 @@ fn compare_entries(a: &Entry, b: &Entry, sort: Sort) -> std::cmp::Ordering {
             ordering
         }
     }
+}
+
+/// A paired Sirv folder. `files` maps the relative keys `sirv::relative_key`
+/// produces for local rows onto the remote listing, so the diff column is a
+/// lookup, never a walk.
+struct SirvPairing {
+    dir: String,
+    files: HashMap<String, sirv::Node>,
+    client: Arc<std::sync::Mutex<sirv::Client>>,
+}
+
+/// The remote-folder browser: one path, its listing, and its own focus so
+/// Escape closes it rather than the thing underneath.
+struct SirvBrowser {
+    client: Arc<std::sync::Mutex<sirv::Client>>,
+    path: String,
+    /// `None` while the listing is in flight.
+    nodes: Option<Result<Vec<sirv::Node>, String>>,
+    focus: gpui::FocusHandle,
 }
 
 struct Comparison {
@@ -989,6 +1020,8 @@ impl Audit {
         self.cursor = 0;
         self.anchor = 0;
         self.refresh_visible();
+        // A new folder is a new diff: the pairing survives, the numbers do not.
+        self.refresh_sirv_counts();
         self.schedule_estimate(cx);
         cx.notify();
 
@@ -1126,6 +1159,170 @@ impl Audit {
             .child(group.small().compact())
     }
 
+    /// Open the remote-folder browser. Credentials come from the Sirv store; a
+    /// missing store opens the browser on an error that names the file to fix.
+    fn open_sirv_browser(&mut self, cx: &mut Context<Self>) {
+        // A live pairing already holds a warm client; reuse it so the browser
+        // and later pushes share one token cache.
+        let client = self
+            .sirv_pairing
+            .as_ref()
+            .map(|pairing| pairing.client.clone());
+        let client = match client {
+            Some(client) => client,
+            None => {
+                let Some(credentials) = sirv::load_credentials() else {
+                    let message = format!(
+                        "No Sirv credentials. Add client_id and client_secret to {}",
+                        sirv::credentials_path()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "the ImageGuide config file".into())
+                    );
+                    self.sirv_browser = Some(SirvBrowser {
+                        // Never used on this path: the listing is already an error.
+                        client: Arc::new(std::sync::Mutex::new(sirv::Client::new(
+                            sirv::Credentials {
+                                client_id: String::new(),
+                                client_secret: String::new(),
+                            },
+                        ))),
+                        path: "/".into(),
+                        nodes: Some(Err(message)),
+                        focus: cx.focus_handle(),
+                    });
+                    cx.notify();
+                    return;
+                };
+                Arc::new(std::sync::Mutex::new(sirv::Client::new(credentials)))
+            }
+        };
+        let mut browser = SirvBrowser {
+            client,
+            path: "/".into(),
+            nodes: None,
+            focus: cx.focus_handle(),
+        };
+        if let Some(pairing) = &self.sirv_pairing {
+            browser.path = pairing.dir.clone();
+        }
+        self.sirv_browser = Some(browser);
+        let state = self.sirv_browser.as_mut().unwrap();
+        Self::browse_sirv_path(state, cx);
+        cx.notify();
+    }
+
+    /// Fetch the listing for the browser's current path in the background.
+    fn browse_sirv_path(browser: &mut SirvBrowser, cx: &mut Context<Self>) {
+        browser.nodes = None;
+        let client = browser.client.clone();
+        let path = browser.path.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    client
+                        .lock()
+                        .unwrap()
+                        .readdir(&path)
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            this.update(cx, |audit, cx| {
+                if let Some(browser) = audit.sirv_browser.as_mut() {
+                    browser.nodes = Some(result);
+                }
+                cx.notify();
+            })
+        })
+        .detach();
+    }
+
+    /// Enter a folder of the listing.
+    fn descend_sirv(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(browser) = self.sirv_browser.as_mut() else {
+            return;
+        };
+        if !browser.path.ends_with('/') {
+            browser.path.push('/');
+        }
+        browser.path.push_str(&name);
+        Self::browse_sirv_path(browser, cx);
+        cx.notify();
+    }
+
+    /// Go up one folder. The root has no parent, so the button only exists
+    /// below it.
+    fn ascend_sirv(&mut self, cx: &mut Context<Self>) {
+        let Some(browser) = self.sirv_browser.as_mut() else {
+            return;
+        };
+        let trimmed = browser.path.trim_end_matches('/').to_string();
+        let Some((parent, _)) = trimmed.rsplit_once('/') else {
+            return;
+        };
+        browser.path = if parent.is_empty() {
+            "/".into()
+        } else {
+            parent.to_string()
+        };
+        Self::browse_sirv_path(browser, cx);
+        cx.notify();
+    }
+
+    /// Pair the browsed folder: keep its file listing under relative keys and
+    /// count how the local dataset stands against it.
+    fn pair_sirv(&mut self, cx: &mut Context<Self>) {
+        let (client, dir, nodes) = {
+            let Some(browser) = self.sirv_browser.as_ref() else {
+                return;
+            };
+            let Some(Ok(nodes)) = browser.nodes.as_ref() else {
+                return;
+            };
+            let nodes = nodes.clone();
+            (
+                browser.client.clone(),
+                browser.path.trim_end_matches('/').to_string(),
+                nodes.clone(),
+            )
+        };
+        let files: HashMap<String, sirv::Node> = nodes
+            .iter()
+            .filter(|node| !node.is_folder())
+            .filter_map(|node| {
+                sirv::unpair_remote(&dir, &node.filename).map(|key| (key, node.clone()))
+            })
+            .collect();
+        self.sirv_pairing = Some(SirvPairing { dir, files, client });
+        self.refresh_sirv_counts();
+        self.sirv_browser = None;
+        cx.notify();
+    }
+
+    fn unpair_sirv(&mut self, cx: &mut Context<Self>) {
+        self.sirv_pairing = None;
+        self.sirv_counts = None;
+        self.sirv_browser = None;
+        cx.notify();
+    }
+
+    /// Count local-only and changed files across the whole dataset, not just
+    /// the visible rows, so the header number does not move with the filter.
+    fn refresh_sirv_counts(&mut self) {
+        self.sirv_counts = self.sirv_pairing.as_ref().map(|pairing| {
+            let mut only_local = 0;
+            let mut changed = 0;
+            for entry in &self.entries {
+                let key = sirv::relative_key(&self.root, &entry.path);
+                match sirv::classify(entry.bytes, key.and_then(|key| pairing.files.get(&key))) {
+                    sirv::SyncState::OnlyLocal => only_local += 1,
+                    sirv::SyncState::Changed => changed += 1,
+                    sirv::SyncState::Same => {}
+                }
+            }
+            (only_local, changed)
+        });
+    }
     /// Open the side-by-side view for a row and start building both sides.
     fn open_compare(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(path) = self.entries.get(index).map(|entry| entry.path.clone()) else {
@@ -1539,6 +1736,162 @@ impl Audit {
             .into_any_element()
     }
 
+    /// The remote-folder browser: a small panel over the window. Walk folders
+    /// down, pair the folder you land on, or undo a pairing.
+    fn sirv_browser_view(&self, browser: &SirvBrowser, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let paired = self
+            .sirv_pairing
+            .as_ref()
+            .map(|pairing| pairing.dir.clone());
+
+        let body: gpui::AnyElement = match browser.nodes.as_ref() {
+            None => div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.))
+                .text_color(cx.theme().muted_foreground)
+                .child(IconName::LoaderCircle)
+                .child(format!("Listing {}…", browser.path))
+                .into_any_element(),
+            Some(Err(message)) => div()
+                .text_size(px(12.))
+                .text_color(cx.theme().yellow)
+                .child(message.clone())
+                .into_any_element(),
+            Some(Ok(nodes)) => {
+                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                if browser.path != "/" {
+                    rows.push(
+                        Button::new("sirv-up")
+                            .ghost()
+                            .small()
+                            .icon(IconName::ArrowUp)
+                            .label("..")
+                            .on_click(cx.listener(|audit, _, _, cx| audit.ascend_sirv(cx)))
+                            .into_any_element(),
+                    );
+                }
+                for (ix, node) in nodes.iter().filter(|node| node.is_folder()).enumerate() {
+                    let name = node
+                        .filename
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&node.filename)
+                        .to_string();
+                    let descend_to = name.clone();
+                    rows.push(
+                        Button::new(("sirv-dir", ix))
+                            .ghost()
+                            .small()
+                            .icon(IconName::FolderOpen)
+                            .label(name)
+                            .on_click(cx.listener(move |audit, _, _, cx| {
+                                audit.descend_sirv(descend_to.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                if rows.is_empty() {
+                    rows.push(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("No subfolders.")
+                            .into_any_element(),
+                    );
+                }
+                div()
+                    .id("sirv-list")
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap_0p5()
+                    .max_h(px(280.))
+                    .overflow_y_scroll()
+                    .children(rows)
+                    .into_any_element()
+            }
+        };
+
+        div()
+            .w(px(440.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded_lg()
+            .bg(cx.theme().secondary)
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .font_family("SF Pro Display")
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().foreground)
+                            .child("Sync with Sirv"),
+                    )
+                    .child(
+                        div()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(11.))
+                            .text_color(cx.theme().muted_foreground)
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(browser.path.clone()),
+                    ),
+            )
+            .child(body)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().flex().gap_2().when_some(paired, |row, dir| {
+                        row.child(
+                            Button::new("sirv-unpair")
+                                .ghost()
+                                .small()
+                                .label(format!("Unpair {dir}"))
+                                .on_click(cx.listener(|audit, _, _, cx| {
+                                    audit.unpair_sirv(cx);
+                                })),
+                        )
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("sirv-close")
+                                    .ghost()
+                                    .small()
+                                    .label("Close")
+                                    .on_click(cx.listener(|audit, _, _, cx| {
+                                        audit.sirv_browser = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("sirv-pair")
+                                    .primary()
+                                    .small()
+                                    .label("Pair this folder")
+                                    .disabled(!matches!(browser.nodes, Some(Ok(_))))
+                                    .on_click(cx.listener(|audit, _, _, cx| audit.pair_sirv(cx))),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// The resize presets, as one segmented control. `ButtonGroup` reports the index
     /// that was clicked, so the options are listed once and read back by position.
     fn resize_group(&self, cx: &mut Context<Self>) -> ButtonGroup {
@@ -1639,15 +1992,11 @@ impl Audit {
         if self.skipped_raw > 0 {
             stats.push_str(&format!(" · {} camera raw skipped", self.skipped_raw));
         }
+        if let Some((only_local, changed)) = self.sirv_counts {
+            stats.push_str(&format!(" · Sirv: {only_local} new · {changed} changed"));
+        }
 
         div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_2()
-            .p_2()
-            .rounded_lg()
-            .bg(cx.theme().secondary)
             .flex()
             .flex_wrap()
             .items_center()
@@ -1700,6 +2049,22 @@ impl Audit {
                                     .label("Open image…")
                                     .disabled(self.converting)
                                     .on_click(cx.listener(|audit, _, _, cx| audit.pick(false, cx))),
+                            )
+                            .child(
+                                // The sync entry point: opens the remote-folder
+                                // browser, which is also where a pairing is undone.
+                                Button::new("sirv-browser")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::Globe)
+                                    .label(match &self.sirv_pairing {
+                                        Some(pairing) => pairing.dir.clone(),
+                                        None => "Sirv…".into(),
+                                    })
+                                    .disabled(self.converting)
+                                    .on_click(
+                                        cx.listener(|audit, _, _, cx| audit.open_sirv_browser(cx)),
+                                    ),
                             ),
                     )
                     .child(
@@ -2176,6 +2541,7 @@ enum TableColumn {
     Pixels,
     Density,
     Weight,
+    Sync,
     Result,
 }
 
@@ -2222,6 +2588,7 @@ impl TableColumn {
                 .width(px(if compact { W_WEIGHT_COMPACT } else { W_WEIGHT }))
                 .text_right()
                 .sortable(),
+            TableColumn::Sync => TableCol::new("sirv", "Sirv").width(px(W_SYNC)),
             TableColumn::Result => TableCol::new("result", "Result")
                 .width(px(W_RESULT))
                 .text_right(),
@@ -2245,6 +2612,7 @@ impl AuditTable {
                 W_DENSITY
             }
             + if compact { W_WEIGHT_COMPACT } else { W_WEIGHT }
+            + if compact { 0. } else { W_SYNC }
             + if show_result { W_RESULT } else { 0. }
     }
 
@@ -2252,16 +2620,30 @@ impl AuditTable {
         let compact = width < 900.;
         let name_width =
             (width - Self::fixed_width(compact, show_result) - Self::CHROME).max(W_NAME_MIN);
-        let columns = vec![
-            TableColumn::Tick,
-            TableColumn::Thumb,
-            TableColumn::Name,
-            TableColumn::Format,
-            TableColumn::Pixels,
-            TableColumn::Density,
-            TableColumn::Weight,
-            TableColumn::Result,
-        ];
+        let columns = if compact {
+            vec![
+                TableColumn::Tick,
+                TableColumn::Thumb,
+                TableColumn::Name,
+                TableColumn::Format,
+                TableColumn::Pixels,
+                TableColumn::Density,
+                TableColumn::Weight,
+                TableColumn::Result,
+            ]
+        } else {
+            vec![
+                TableColumn::Tick,
+                TableColumn::Thumb,
+                TableColumn::Name,
+                TableColumn::Format,
+                TableColumn::Pixels,
+                TableColumn::Density,
+                TableColumn::Weight,
+                TableColumn::Sync,
+                TableColumn::Result,
+            ]
+        };
         (compact, name_width, columns)
     }
 
@@ -2541,6 +2923,28 @@ impl TableDelegate for AuditTable {
                     )))
                     .into_any_element()
             }
+            TableColumn::Sync => {
+                // The row's file against the paired Sirv folder. No pairing,
+                // no status: the column exists only when it can know.
+                let state = audit.sirv_pairing.as_ref().and_then(|pairing| {
+                    let key = sirv::relative_key(&audit.root, &entry.path)?;
+                    Some(sirv::classify(entry.bytes, pairing.files.get(&key)))
+                });
+                let (label, colour) = match state {
+                    None => return div().into_any_element(),
+                    Some(sirv::SyncState::Same) => ("synced", cx.theme().muted_foreground),
+                    Some(sirv::SyncState::Changed) => ("changed", cx.theme().yellow),
+                    Some(sirv::SyncState::OnlyLocal) => ("new", cx.theme().blue),
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_size(px(11.))
+                    .text_color(colour)
+                    .child(label)
+                    .into_any_element()
+            }
             TableColumn::Result => div()
                 .flex()
                 .items_center()
@@ -2778,6 +3182,34 @@ impl Render for Audit {
                         audit.request_path(path.clone(), cx);
                     }
                 }))
+                .into_any_element();
+        }
+
+        if let Some(browser) = self.sirv_browser.take() {
+            let view = self.sirv_browser_view(&browser, cx);
+            self.sirv_browser = Some(browser);
+            // The click that opened the browser left focus on the header
+            // button it replaced, so Escape had nowhere to land. Same fix as
+            // the comparison: take focus next frame, once this tree exists.
+            cx.defer_in(window, |audit, window, cx| {
+                if let Some(browser) = audit.sirv_browser.as_ref() {
+                    window.focus(&browser.focus, cx);
+                }
+            });
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(cx.theme().background)
+                .track_focus(&self.sirv_browser.as_ref().unwrap().focus)
+                .on_key_down(cx.listener(|audit, event: &gpui::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        audit.sirv_browser = None;
+                        cx.notify();
+                    }
+                }))
+                .child(view)
                 .into_any_element();
         }
 
@@ -3271,6 +3703,9 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
             failures: Vec::new(),
             unreadable,
             drag_over: false,
+            sirv_pairing: None,
+            sirv_counts: None,
+            sirv_browser: None,
             compare: None,
         };
         audit.refresh_visible();
