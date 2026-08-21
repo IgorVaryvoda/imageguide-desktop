@@ -97,6 +97,11 @@ const SAMPLE_SIZE: usize = 4;
 /// Settling time before sampling, so dragging the slider does not start a run per pixel.
 const ESTIMATE_DELAY: Duration = Duration::from_millis(400);
 
+fn is_checkbox_activation_key(event: &gpui::KeyDownEvent) -> bool {
+    matches!(event.keystroke.key.as_str(), "space" | "enter")
+        && !event.keystroke.modifiers.modified()
+}
+
 /// A persisted size can be absent or corrupted. Keep restore policy pure so native
 /// startup and tests agree about the supported window.
 fn restored_window_size(width: Option<f32>, height: Option<f32>) -> (f32, f32) {
@@ -851,6 +856,11 @@ impl Audit {
                             .top(px(4.))
                             .left(px(4.))
                             .debug_selector(move || format!("grid-checkbox-{index}"))
+                            .on_key_down(cx.listener(|_, event, _, cx| {
+                                if is_checkbox_activation_key(event) {
+                                    cx.stop_propagation();
+                                }
+                            }))
                             .child(
                                 Checkbox::new(("tile-tick", index))
                                     .checked(ticked)
@@ -2317,6 +2327,11 @@ impl TableDelegate for AuditTable {
                 let ticked = audit.selected.contains(&index);
                 div()
                     .debug_selector(move || format!("table-checkbox-{index}"))
+                    .on_key_down(cx.listener(|_, event, _, cx| {
+                        if is_checkbox_activation_key(event) {
+                            cx.stop_propagation();
+                        }
+                    }))
                     .child(
                         Checkbox::new(("tick", index))
                             .checked(ticked)
@@ -3477,6 +3492,35 @@ mod tests {
             assert_eq!(audit.estimate_generation, before + 1);
             assert_eq!(audit.estimate, None);
         });
+    }
+
+    #[test]
+    fn checkbox_activation_owns_only_unmodified_space_and_enter() {
+        for key in ["space", "enter"] {
+            let event = gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    key: key.into(),
+                    ..Default::default()
+                },
+                is_held: false,
+                prefer_character_input: false,
+            };
+            assert!(is_checkbox_activation_key(&event));
+
+            let mut modified = event.clone();
+            modified.keystroke.modifiers.control = true;
+            assert!(!is_checkbox_activation_key(&modified));
+        }
+
+        let other = gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                key: "down".into(),
+                ..Default::default()
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        assert!(!is_checkbox_activation_key(&other));
     }
 
     #[test]
