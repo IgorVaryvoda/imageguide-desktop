@@ -19,9 +19,9 @@ use std::time::Duration;
 use compare::Pair;
 use convert::{Format, MaxEdge, Quality};
 use gpui::{
-    App, Bounds, Context, Decorations, FocusHandle, FontWeight, RenderImage, ScrollStrategy,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, img, prelude::*, px, rgb,
-    rgba, size, uniform_list,
+    App, Bounds, Context, Decorations, FocusHandle, Focusable as _, FontWeight, RenderImage,
+    ScrollStrategy, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, img,
+    prelude::*, px, rgb, rgba, size, uniform_list,
 };
 use gpui_component::alert::Alert;
 use gpui_component::button::{Button, ButtonGroup, ButtonVariants};
@@ -236,6 +236,17 @@ fn meter(
         .h(px(height))
 }
 
+/// The small caps word above a control group.
+fn group_label(text: &'static str, cx: &App) -> gpui::Div {
+    div()
+        .text_size(px(10.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(cx.theme().muted_foreground)
+        .whitespace_nowrap()
+        .flex_shrink_0()
+        .child(text.to_uppercase())
+}
+
 /// One option in a segmented control.
 ///
 /// The variant is set per option rather than on the group, because a group applies
@@ -298,6 +309,8 @@ struct Audit {
     sirv_job: Option<SirvJob>,
     /// The open remote-folder browser.
     sirv_browser: Option<SirvBrowser>,
+    /// The open settings overlay.
+    settings_panel: Option<SettingsPanel>,
     /// How the list is ordered.
     sort: Sort,
     /// Indices into `entries`, filtered and sorted. `entries` itself never moves, so
@@ -436,6 +449,19 @@ struct SirvBrowser {
     /// `None` while the listing is in flight.
     nodes: Option<Result<Vec<sirv::Node>, String>>,
     focus: gpui::FocusHandle,
+}
+
+/// The settings overlay: CDN credentials, and the Studio link derived from
+/// them. Inputs are entities so the framework owns their editing state.
+struct SettingsPanel {
+    client_id: gpui::Entity<InputState>,
+    client_secret: gpui::Entity<InputState>,
+    studio_email: gpui::Entity<InputState>,
+    /// (ok?, message) per section.
+    cdn_status: Option<(bool, String)>,
+    studio_status: Option<(bool, String)>,
+    /// Which form field holds focus, as an index into the field list.
+    focus_ix: usize,
 }
 
 struct Comparison {
@@ -1204,6 +1230,7 @@ impl Audit {
                             sirv::Credentials {
                                 client_id: String::new(),
                                 client_secret: String::new(),
+                                studio_key: None,
                             },
                         ))),
                         path: "/".into(),
@@ -1369,6 +1396,139 @@ impl Audit {
         self.sirv_counts = None;
         self.sirv_browser = None;
         cx.notify();
+    }
+
+    /// Open settings, prefilled with whatever is stored.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let stored = sirv::load_credentials();
+        let mut make_input = |value: Option<String>| {
+            cx.new(|cx| {
+                let mut state = InputState::new(window, cx);
+                if let Some(value) = value {
+                    state.set_value(value, window, cx);
+                }
+                state
+            })
+        };
+        self.settings_panel = Some(SettingsPanel {
+            client_id: make_input(stored.as_ref().map(|c| c.client_id.clone())),
+            client_secret: make_input(stored.as_ref().map(|c| c.client_secret.clone())),
+            studio_email: make_input(None),
+            cdn_status: None,
+            studio_status: None,
+            focus_ix: 0,
+        });
+        cx.notify();
+    }
+
+    /// Store the CDN credentials. The Studio key, if one was minted earlier,
+    /// survives the save.
+    fn save_sirv_settings(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.settings_panel.as_mut() else {
+            return;
+        };
+        let client_id = panel.client_id.read(cx).value().trim().to_string();
+        let client_secret = panel.client_secret.read(cx).value().trim().to_string();
+        if client_id.is_empty() || client_secret.is_empty() {
+            panel.cdn_status = Some((false, "Both fields are required.".into()));
+            cx.notify();
+            return;
+        }
+        let studio_key = sirv::load_credentials().and_then(|creds| creds.studio_key);
+        sirv::save_credentials(&sirv::Credentials {
+            client_id,
+            client_secret,
+            studio_key,
+        });
+        panel.cdn_status = Some((true, "Saved.".into()));
+        cx.notify();
+    }
+
+    /// Exchange the stored CDN credentials for a Studio API key.
+    fn connect_studio(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.settings_panel.as_mut() else {
+            return;
+        };
+        let Some(credentials) = sirv::load_credentials() else {
+            panel.studio_status = Some((false, "Save the CDN keys first.".into()));
+            cx.notify();
+            return;
+        };
+        let email = panel.studio_email.read(cx).value().trim().to_string();
+        if email.is_empty() {
+            panel.studio_status = Some((false, "An email is required.".into()));
+            cx.notify();
+            return;
+        }
+        let mut client = sirv::Client::new(sirv::Credentials {
+            client_id: credentials.client_id.clone(),
+            client_secret: credentials.client_secret.clone(),
+            studio_key: None,
+        });
+        panel.studio_status = Some((true, "Connecting…".into()));
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.exchange_studio_key(&email) })
+                .await;
+            this.update(cx, |audit, cx| {
+                let Some(panel) = audit.settings_panel.as_mut() else {
+                    return;
+                };
+                match result {
+                    Ok(identity) => {
+                        let mut stored = sirv::load_credentials().unwrap_or(credentials);
+                        stored.studio_key = Some(identity.api_key);
+                        sirv::save_credentials(&stored);
+                        panel.studio_status = Some((
+                            true,
+                            format!(
+                                "Connected · {} · {} credits",
+                                identity.tier, identity.credits
+                            ),
+                        ));
+                    }
+                    Err(error) => panel.studio_status = Some((false, error.to_string())),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Confirm the stored Studio key still works.
+    fn check_studio(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.settings_panel.as_mut() else {
+            return;
+        };
+        let Some(key) = sirv::load_credentials().and_then(|creds| creds.studio_key) else {
+            panel.studio_status = Some((false, "Not connected yet.".into()));
+            cx.notify();
+            return;
+        };
+        panel.studio_status = Some((true, "Checking…".into()));
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { sirv::Client::studio_me(&key) })
+                .await;
+            this.update(cx, |audit, cx| {
+                let Some(panel) = audit.settings_panel.as_mut() else {
+                    return;
+                };
+                panel.studio_status = Some(match result {
+                    Ok(identity) => (
+                        true,
+                        format!("{} · {} credits", identity.tier, identity.credits),
+                    ),
+                    Err(error) => (false, error.to_string()),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// A transfer is already running. One at a time: the client serialises on
@@ -2000,6 +2160,166 @@ impl Audit {
             .into_any_element()
     }
 
+    /// One labelled row of the settings form.
+    fn settings_row(
+        label: &'static str,
+        input: gpui::Entity<InputState>,
+        secret: bool,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(110.))
+                    .flex_shrink_0()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
+            )
+            .child(
+                Input::new(&input)
+                    .small()
+                    .when(secret, |field| field.mask_toggle()),
+            )
+    }
+
+    /// A section heading plus its status line, if one has anything to say.
+    fn settings_status(status: Option<(bool, String)>, cx: &Context<Self>) -> gpui::Div {
+        match status {
+            None => div(),
+            Some((ok, message)) => div()
+                .text_size(px(11.))
+                .text_color(if ok { cx.theme().green } else { cx.theme().red })
+                .child(message),
+        }
+    }
+
+    /// The settings panel: CDN keys, and the Studio link minted from them.
+    fn settings_panel_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(panel) = self.settings_panel.as_ref() else {
+            return div().into_any_element();
+        };
+        let connected = sirv::load_credentials()
+            .and_then(|creds| creds.studio_key)
+            .is_some();
+
+        div()
+            .w(px(520.))
+            .flex()
+            .flex_col()
+            .gap_4()
+            .p_5()
+            .rounded_lg()
+            .bg(cx.theme().secondary)
+            .border_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .font_family("SF Pro Display")
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().foreground)
+                    .child("Settings"),
+            )
+            // ── CDN ──
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(group_label("Sirv CDN account", cx))
+                    .child(Self::settings_row(
+                        "Client ID",
+                        panel.client_id.clone(),
+                        false,
+                        cx,
+                    ))
+                    .child(Self::settings_row(
+                        "Client secret",
+                        panel.client_secret.clone(),
+                        true,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(Self::settings_status(panel.cdn_status.clone(), cx))
+                            .child(
+                                Button::new("settings-save")
+                                    .primary()
+                                    .small()
+                                    .label("Save")
+                                    .on_click(
+                                        cx.listener(|audit, _, _, cx| audit.save_sirv_settings(cx)),
+                                    ),
+                            ),
+                    ),
+            )
+            // ── Studio ──
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(group_label("Sirv AI Studio", cx))
+                    .child(Self::settings_row(
+                        "Account email",
+                        panel.studio_email.clone(),
+                        false,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(Self::settings_status(panel.studio_status.clone(), cx))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("settings-studio-check")
+                                            .ghost()
+                                            .small()
+                                            .label(if connected { "Check" } else { "Not linked" })
+                                            .disabled(!connected)
+                                            .on_click(cx.listener(|audit, _, _, cx| {
+                                                audit.check_studio(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("settings-studio-connect")
+                                            .primary()
+                                            .small()
+                                            .label(if connected { "Reconnect" } else { "Connect" })
+                                            .on_click(cx.listener(|audit, _, _, cx| {
+                                                audit.connect_studio(cx)
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div().flex().justify_end().child(
+                    Button::new("settings-close")
+                        .ghost()
+                        .small()
+                        .label("Close")
+                        .on_click(cx.listener(|audit, _, _, cx| {
+                            audit.settings_panel = None;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .into_any_element()
+    }
+
     /// The remote-folder browser: a small panel over the window. Walk folders
     /// down, pair the folder you land on, or undo a pairing.
     fn sirv_browser_view(&self, browser: &SirvBrowser, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -2436,6 +2756,15 @@ impl Audit {
                     },
                 )
                 .disabled(self.converting),
+            )
+            .child(
+                // Icon-only: the one global surface, always in the same corner.
+                Button::new("open-settings")
+                    .small()
+                    .ghost()
+                    .icon(IconName::Settings)
+                    .tooltip("Settings")
+                    .on_click(cx.listener(|audit, _, window, cx| audit.open_settings(window, cx))),
             )
     }
 
@@ -3530,6 +3859,56 @@ impl Render for Audit {
                 .into_any_element();
         }
 
+        if self.settings_panel.is_some() {
+            let view = self.settings_panel_view(cx);
+            // The click that opened the panel left focus on the button it
+            // replaced; take focus next frame so typing lands in the first
+            // field. Nothing else in the framework moves Tab between inputs,
+            // so this panel cycles them itself.
+            cx.defer_in(window, |audit, window, cx| {
+                if let Some(panel) = audit.settings_panel.as_ref() {
+                    window.focus(&panel.client_id.read(cx).focus_handle(cx), cx);
+                }
+            });
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(cx.theme().background)
+                .on_key_down(
+                    cx.listener(|audit, event: &gpui::KeyDownEvent, window, cx| {
+                        match event.keystroke.key.as_str() {
+                            "escape" => {
+                                audit.settings_panel = None;
+                                cx.notify();
+                            }
+                            "tab" => {
+                                const FIELDS: usize = 3;
+                                let direction = if event.keystroke.modifiers.shift {
+                                    FIELDS - 1
+                                } else {
+                                    1
+                                };
+                                if let Some(panel) = audit.settings_panel.as_mut() {
+                                    panel.focus_ix = (panel.focus_ix + direction) % FIELDS;
+                                    let handle = [
+                                        panel.client_id.read(cx).focus_handle(cx),
+                                        panel.client_secret.read(cx).focus_handle(cx),
+                                        panel.studio_email.read(cx).focus_handle(cx),
+                                    ][panel.focus_ix]
+                                        .clone();
+                                    window.focus(&handle, cx);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }),
+                )
+                .child(view)
+                .into_any_element();
+        }
+
         if let Some(browser) = self.sirv_browser.take() {
             let view = self.sirv_browser_view(&browser, cx);
             self.sirv_browser = Some(browser);
@@ -3622,52 +4001,59 @@ impl Render for Audit {
                     }
                 },
             ))
-            .on_key_down(cx.listener(|audit, event: &gpui::KeyDownEvent, _, cx| {
-                // The filter box swallows its own keys, so these only fire when the
-                // list itself has focus. Shift turns any move into a selection
-                // drag from the anchor.
-                let extend = event.keystroke.modifiers.shift;
-                match event.keystroke.key.as_str() {
-                    "down" => audit.step_cursor(1, extend, cx),
-                    "up" => audit.step_cursor(-1, extend, cx),
-                    "left" => audit.step_cursor_lateral(-1, extend, cx),
-                    "right" => audit.step_cursor_lateral(1, extend, cx),
-                    "pagedown" => audit.step_cursor(10, extend, cx),
-                    "pageup" => audit.step_cursor(-10, extend, cx),
-                    "home" => audit.step_cursor(isize::MIN / 2, extend, cx),
-                    "end" => audit.step_cursor(isize::MAX / 2, extend, cx),
-                    "escape" => {
-                        // Nothing is open here, so escape means "put the list down":
-                        // the ticked set clears, the way it does in every file manager.
-                        if !audit.selected.is_empty() && !audit.converting {
-                            audit.selected.clear();
-                            audit.schedule_estimate(cx);
-                            cx.notify();
+            .on_key_down(
+                cx.listener(|audit, event: &gpui::KeyDownEvent, window, cx| {
+                    // The filter box swallows its own keys, so these only fire when the
+                    // list itself has focus. Shift turns any move into a selection
+                    // drag from the anchor.
+                    let extend = event.keystroke.modifiers.shift;
+                    match event.keystroke.key.as_str() {
+                        "down" => audit.step_cursor(1, extend, cx),
+                        "up" => audit.step_cursor(-1, extend, cx),
+                        "left" => audit.step_cursor_lateral(-1, extend, cx),
+                        "right" => audit.step_cursor_lateral(1, extend, cx),
+                        "pagedown" => audit.step_cursor(10, extend, cx),
+                        "pageup" => audit.step_cursor(-10, extend, cx),
+                        "home" => audit.step_cursor(isize::MIN / 2, extend, cx),
+                        "end" => audit.step_cursor(isize::MAX / 2, extend, cx),
+                        "escape" => {
+                            // Nothing is open here, so escape means "put the list down":
+                            // the ticked set clears, the way it does in every file manager.
+                            if !audit.selected.is_empty() && !audit.converting {
+                                audit.selected.clear();
+                                audit.schedule_estimate(cx);
+                                cx.notify();
+                            }
                         }
-                    }
-                    "a" if event.keystroke.modifiers.control
-                        || event.keystroke.modifiers.platform =>
-                    {
-                        // Select what the list shows, not what the folder holds:
-                        // a filter that hides files from the list must hide them
-                        // from Convert too.
-                        if !audit.converting {
-                            audit.selected.extend(audit.visible.iter().copied());
-                            audit.schedule_estimate(cx);
-                            cx.notify();
-                        }
-                    }
-                    "space" => audit.toggle_cursor_selection(cx),
-                    "enter" => {
-                        if !audit.converting
-                            && let Some(entry) = audit.entry_at(audit.cursor)
+                        "a" if event.keystroke.modifiers.control
+                            || event.keystroke.modifiers.platform =>
                         {
-                            audit.open_compare(entry, cx);
+                            // Select what the list shows, not what the folder holds:
+                            // a filter that hides files from the list must hide them
+                            // from Convert too.
+                            if !audit.converting {
+                                audit.selected.extend(audit.visible.iter().copied());
+                                audit.schedule_estimate(cx);
+                                cx.notify();
+                            }
                         }
+                        "," if event.keystroke.modifiers.control
+                            || event.keystroke.modifiers.platform =>
+                        {
+                            audit.open_settings(window, cx);
+                        }
+                        "space" => audit.toggle_cursor_selection(cx),
+                        "enter" => {
+                            if !audit.converting
+                                && let Some(entry) = audit.entry_at(audit.cursor)
+                            {
+                                audit.open_compare(entry, cx);
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            }))
+                }),
+            )
             .on_drop(cx.listener(|audit, paths: &gpui::ExternalPaths, _, cx| {
                 audit.drag_over = false;
                 if let Some(path) = paths.paths().first() {
@@ -4052,6 +4438,7 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
             sirv_counts: None,
             sirv_job: None,
             sirv_browser: None,
+            settings_panel: None,
             compare: None,
         };
         audit.refresh_visible();
