@@ -1709,11 +1709,20 @@ impl Audit {
                     .flex_shrink_0()
                     .child(group_label("Quality", cx))
                     .child(
-                        div().w(px(130.)).child(
-                            Slider::new(&self.quality_slider)
-                                .horizontal()
-                                .disabled(self.converting),
-                        ),
+                        div()
+                            .w(px(130.))
+                            .debug_selector(|| "quality-control".to_string())
+                            .when(self.converting, |rail| {
+                                rail.child(
+                                    Progress::new("quality-locked")
+                                        .value(self.quality.0.unwrap_or(100.))
+                                        .color(cx.theme().primary)
+                                        .h(px(6.)),
+                                )
+                            })
+                            .when(!self.converting, |slider| {
+                                slider.child(Slider::new(&self.quality_slider).horizontal())
+                            }),
                     )
                     .child(
                         div()
