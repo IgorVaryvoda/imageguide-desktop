@@ -11,6 +11,8 @@ mod scan;
 mod settings;
 mod sirv;
 mod thumbs;
+#[cfg(feature = "updater")]
+mod update;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -4891,6 +4893,9 @@ struct Launch {
 }
 
 fn run_window(launch: Launch) {
+    #[cfg(feature = "updater")]
+    update::install_if_available();
+
     application()
         // Every `IconName` is an SVG loaded through the app's asset source. Without
         // this the icons resolve to nothing and the toolbar renders as bare words.

@@ -1,0 +1,191 @@
+name: Release installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  NO_STRIP: 1
+  CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+  CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+
+jobs:
+  package:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-22.04
+            formats: appimage
+            platform: linux-x86_64
+            update_glob: "*.AppImage"
+            update_format: appimage
+            artifact: linux-x86_64
+          - name: macOS Apple Silicon
+            os: macos-15
+            formats: app,dmg
+            platform: macos-aarch64
+            update_glob: "*.app.tar.gz"
+            update_format: app
+            artifact: macos-aarch64
+          - name: macOS Intel
+            os: macos-15-intel
+            formats: app,dmg
+            platform: macos-x86_64
+            update_glob: "*.app.tar.gz"
+            update_format: app
+            artifact: macos-x86_64
+          - name: Windows x86_64
+            os: windows-2022
+            formats: nsis
+            platform: windows-x86_64
+            update_glob: "*.exe"
+            update_format: nsis
+            artifact: windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libdav1d-dev libavif-dev libaom-dev libyuv-dev \
+            cmake clang pkg-config \
+            libasound2-dev libfontconfig-dev libglib2.0-dev libssl-dev \
+            libvulkan1 libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
+            libxcb1-dev
+
+      - name: System dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libavif
+          echo "LIBAVIF_STATIC=1" >> "$GITHUB_ENV"
+          echo "DAV1D_STATIC=1" >> "$GITHUB_ENV"
+
+      - name: System dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis pkgconfiglite -y --no-progress
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "libavif[aom,dav1d]:x64-windows-static"
+          "VCPKGRS_TRIPLET=x64-windows-static" >> $env:GITHUB_ENV
+          "DAV1D_STATIC=1" >> $env:GITHUB_ENV
+          "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\lib\pkgconfig" >> $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install packager
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      - name: Build signed installer
+        run: cargo packager --release --formats "${{ matrix.formats }}" --out-dir dist
+
+      - name: Reject Homebrew-linked macOS binaries
+        if: runner.os == 'macOS'
+        run: |
+          if otool -L target/release/imageguide | grep -E '/(opt/homebrew|usr/local)/'; then
+            echo "The app still depends on Homebrew libraries" >&2
+            exit 1
+          fi
+
+      - name: Record update package
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          UPDATE_GLOB: ${{ matrix.update_glob }}
+          UPDATE_FORMAT: ${{ matrix.update_format }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          package=$(find dist -maxdepth 1 -type f -name "$UPDATE_GLOB" -print -quit)
+          test -n "$package"
+          test -f "$package.sig"
+          PACKAGE="$package" node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const packagePath = process.env.PACKAGE;
+          fs.writeFileSync(`dist/fragment-${process.env.ARTIFACT}.json`, JSON.stringify({
+            platform: process.env.PLATFORM,
+            format: process.env.UPDATE_FORMAT,
+            file: path.basename(packagePath),
+            signature: fs.readFileSync(`${packagePath}.sig`, "utf8").trim(),
+          }));
+          NODE
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: |
+            dist/*.AppImage
+            dist/*.AppImage.sig
+            dist/*.dmg
+            dist/*.dmg.sig
+            dist/*.app.tar.gz
+            dist/*.app.tar.gz.sig
+            dist/*.exe
+            dist/*.exe.sig
+            dist/fragment-*.json
+
+  publish:
+    name: Publish GitHub release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Build update manifest
+        env:
+          TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const directory = "release-assets";
+          const fragments = fs.readdirSync(directory).filter(name => name.startsWith("fragment-"));
+          const platforms = {};
+          for (const name of fragments) {
+            const item = JSON.parse(fs.readFileSync(path.join(directory, name)));
+            platforms[item.platform] = {
+              signature: item.signature,
+              url: `https://github.com/${process.env.REPOSITORY}/releases/download/${process.env.TAG}/${item.file}`,
+              format: item.format,
+            };
+          }
+          if (Object.keys(platforms).length !== 4) throw new Error("expected four update packages");
+          fs.writeFileSync(path.join(directory, "latest.json"), JSON.stringify({
+            version: process.env.TAG,
+            pub_date: new Date().toISOString(),
+            platforms,
+          }, null, 2));
+          NODE
+
+      - name: Verify tag matches Cargo version
+        run: test "v$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            release-assets/*.AppImage release-assets/*.AppImage.sig \
+            release-assets/*.dmg release-assets/*.dmg.sig \
+            release-assets/*.app.tar.gz release-assets/*.app.tar.gz.sig \
+            release-assets/*.exe release-assets/*.exe.sig \
+            release-assets/latest.json

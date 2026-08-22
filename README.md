@@ -14,6 +14,18 @@ It is the desktop companion to the site and the
 The extension audits the images on a page and stops there, because a browser cannot
 rewrite your files. This one can.
 
+## Install
+
+Download the current installer from [GitHub Releases](https://github.com/IgorVaryvoda/imageguide-desktop/releases/latest):
+
+- Linux: `.AppImage`
+- macOS: `.dmg` for Apple Silicon or Intel
+- Windows: `.exe` installer
+
+Packaged builds check that release feed in the background at launch. An available
+update is downloaded, signature-checked, and installed for the next launch. Source
+builds do not update themselves.
+
 ## Status
 
 Audit, thumbnails, and WebP conversion all work.
@@ -197,8 +209,6 @@ rather than tells you.
 
 - Zoom in the comparison. It is 1:1 and pannable, but there is no way to back out to
   a whole-image view.
-- Windows. dav1d decodes AVIF and libavif/libaom encode it; getting those onto a
-  Windows runner means vcpkg. Ubuntu and macOS are both green in CI.
 - Spec profiles — "1400×1400, white background, under 250 KB" — for marketplace
   pre-flight.
 
@@ -223,8 +233,8 @@ them by target: gpui's window backends (`wayland` and `x11` are Linux-only featu
 and macOS and Windows pick their own), and `rfd`, whose xdg-portal backend keeps GTK
 out of the Linux build while the other platforms use their native dialogs by default.
 
-Only Linux is tested so far. The macOS and Windows builds are believed-correct, not
-verified.
+Release tags build the Linux, macOS, and Windows installers on their native GitHub
+Actions runners and sign each auto-update artifact.
 
 The UI is [GPUI](https://www.gpui.rs) with
 [gpui-component](https://github.com/longbridge/gpui-component) for the widgets.
