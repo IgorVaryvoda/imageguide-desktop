@@ -110,9 +110,13 @@ const COMPARE_DELAY: Duration = Duration::from_millis(120);
 const SETTINGS_SAVE_DELAY: Duration = Duration::from_millis(500);
 
 /// Decoded thumbnails kept in memory at once. A viewport holds a few dozen, so this is
-/// far more than scrolling needs; without it a 5,000-image folder scrolled end to end
-/// retains 5,000 decoded thumbnails and a GPU texture for each.
-const THUMB_CACHE: usize = 512;
+/// still far more than scrolling needs; without it a 5,000-image folder scrolled end to
+/// end retains 5,000 decoded thumbnails and a GPU texture for each.
+///
+/// Lower than it was, because `THUMB_EDGE` grew to fill a gallery tile. A 3:2 thumbnail
+/// is about 150KB of texture at that size against 25KB before, so 512 of them would be
+/// 75MB of video memory for rows nobody is looking at.
+const THUMB_CACHE: usize = 192;
 
 fn is_checkbox_activation_key(event: &gpui::KeyDownEvent) -> bool {
     matches!(event.keystroke.key.as_str(), "space" | "enter")
@@ -5068,6 +5072,22 @@ mod tests {
     /// directly, which is the same comparator either way.
     fn sort_entries(entries: &mut [Entry], sort: Sort) {
         entries.sort_by(|a, b| compare_entries(a, b, sort));
+    }
+
+    /// `img` will not scale an image past its own size, so a thumbnail smaller than the
+    /// slot it is drawn in does not fill it — it sits in the middle of the empty space.
+    /// The gallery looked like that at 96px in a 224px tile. The two constants live in
+    /// different modules, so this is what stops them drifting apart again.
+    #[test]
+    fn the_gallery_never_asks_for_more_than_a_thumbnail_holds() {
+        // `tile` draws the image inside the tile's own padding.
+        let widest = TILE_MAX - 16.;
+        assert!(
+            widest <= thumbs::THUMB_EDGE as f32,
+            "a {TILE_MAX}px tile draws an image {widest}px wide, \
+             and thumbnails are only {}px",
+            thumbs::THUMB_EDGE
+        );
     }
 
     /// Names before counts, wherever the window reports a set of files it could not

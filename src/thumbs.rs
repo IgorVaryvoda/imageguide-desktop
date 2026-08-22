@@ -20,11 +20,24 @@ use gpui::RenderImage;
 use image::{DynamicImage, Frame, RgbaImage};
 
 /// Longest edge of a generated thumbnail, in pixels.
-pub const THUMB_EDGE: u32 = 96;
+///
+/// This has to cover the largest a tile ever draws one, `TILE_MAX - 16`. At 96 it did
+/// not: `img` will not scale past an image's own size, so the gallery drew small
+/// pictures floating in the middle of 200px tiles. `gallery_never_asks_for_more_than_a_
+/// thumbnail_holds` keeps the two in step.
+///
+/// One size for both views rather than one each. The list shrinks this to a 34px slot,
+/// which costs nothing, while a second size would mean a second decode and a second
+/// cache entry per file the first time anyone switched between list and grid.
+///
+// ponytail: a logical pixel, not a device one. On a 2x display the gallery scales this
+// up again — far less than it did at 96, but visibly. Ask the window for its scale
+// factor if that ever matters.
+pub const THUMB_EDGE: u32 = 224;
 
-/// Thumbnails kept on disk. Measured at 8 to 11KB of lossless WebP each on real
-/// photographs, so this bounds the cache near 100MB.
-const CACHE_FILES: usize = 10_000;
+/// Thumbnails kept on disk. Measured at 38KB of lossless WebP each at `THUMB_EDGE` on
+/// real photographs, so this bounds the cache near 110MB.
+const CACHE_FILES: usize = 3_000;
 
 /// Decode `path`, scale it to fit `edge`, and hand back something `img()` can draw.
 /// Returns `None` for anything that fails to decode, which the caller shows as a gap
