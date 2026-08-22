@@ -455,7 +455,11 @@ struct SirvPairing {
 #[derive(Clone, Copy, PartialEq)]
 enum SirvJobKind {
     Pull,
+    /// Deliberately overwrite the differing local copy.
+    PullChanged,
     Push,
+    /// Deliberately overwrite the differing remote copy.
+    PushChanged,
 }
 
 struct SirvJob {
@@ -1639,6 +1643,15 @@ impl Audit {
     /// never overwritten — pull is additive by design, so it can never destroy
     /// local work.
     fn start_pull(&mut self, cx: &mut Context<Self>) {
+        self.run_pull(false, cx);
+    }
+
+    /// Deliberately replace every differing local copy with the remote one.
+    fn start_pull_changed(&mut self, cx: &mut Context<Self>) {
+        self.run_pull(true, cx);
+    }
+
+    fn run_pull(&mut self, differing: bool, cx: &mut Context<Self>) {
         let Some(pairing) = &self.sirv_pairing else {
             return;
         };
@@ -1652,12 +1665,14 @@ impl Audit {
         let dir = pairing.dir.clone();
         let client = pairing.client.clone();
         let remote: Vec<sirv::Node> = files.values().cloned().collect();
-        let local_keys: HashSet<String> = self
+        let local_sizes: HashMap<String, u64> = self
             .entries
             .iter()
-            .filter_map(|entry| sirv::relative_key(&self.root, &entry.path))
+            .filter_map(|entry| {
+                sirv::relative_key(&self.root, &entry.path).map(|key| (key, entry.bytes))
+            })
             .collect();
-        let plan = sirv::pull_plan(&remote, &dir, &local_keys);
+        let plan = sirv::pull_plan(&remote, &dir, &local_sizes, differing);
         if plan.is_empty() {
             return;
         }
@@ -1665,7 +1680,11 @@ impl Audit {
         self.sirv_generation = self.sirv_generation.wrapping_add(1);
         let generation = self.sirv_generation;
         self.sirv_job = Some(SirvJob {
-            kind: SirvJobKind::Pull,
+            kind: if differing {
+                SirvJobKind::PullChanged
+            } else {
+                SirvJobKind::Pull
+            },
             done: 0,
             total,
             failures: Vec::new(),
@@ -1731,9 +1750,17 @@ impl Audit {
         .detach();
     }
 
-    /// Upload every local file Sirv lacks. Changed files are left alone in
-    /// both directions; overwriting is a decision, not a side effect.
+    /// Upload every local file Sirv lacks.
     fn start_push(&mut self, cx: &mut Context<Self>) {
+        self.run_push(sirv::SyncState::OnlyLocal, cx);
+    }
+
+    /// Deliberately replace every differing remote copy with the local one.
+    fn start_push_changed(&mut self, cx: &mut Context<Self>) {
+        self.run_push(sirv::SyncState::Changed, cx);
+    }
+
+    fn run_push(&mut self, accept: sirv::SyncState, cx: &mut Context<Self>) {
         let Some(pairing) = &self.sirv_pairing else {
             return;
         };
@@ -1745,15 +1772,7 @@ impl Audit {
         };
         let dir = pairing.dir.clone();
         let client = pairing.client.clone();
-        let plan: Vec<(String, PathBuf)> = self
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                let key = sirv::relative_key(&self.root, &entry.path)?;
-                (sirv::classify(entry.bytes, files.get(&key)) == sirv::SyncState::OnlyLocal)
-                    .then(|| (key, entry.path.clone()))
-            })
-            .collect();
+        let plan = sirv_push_plan(&self.root, &self.entries, files, accept);
         if plan.is_empty() {
             return;
         }
@@ -1761,7 +1780,11 @@ impl Audit {
         self.sirv_generation = self.sirv_generation.wrapping_add(1);
         let generation = self.sirv_generation;
         self.sirv_job = Some(SirvJob {
-            kind: SirvJobKind::Push,
+            kind: if accept == sirv::SyncState::Changed {
+                SirvJobKind::PushChanged
+            } else {
+                SirvJobKind::Push
+            },
             done: 0,
             total,
             failures: Vec::new(),
@@ -2558,14 +2581,21 @@ impl Audit {
                             (false, SirvJobKind::Pull) => {
                                 format!("Pulling {} of {}…", job.done, job.total)
                             }
+                            (false, SirvJobKind::PullChanged) => {
+                                format!("Taking from Sirv {} of {}…", job.done, job.total)
+                            }
                             (false, SirvJobKind::Push) => {
                                 format!("Pushing {} of {}…", job.done, job.total)
                             }
+                            (false, SirvJobKind::PushChanged) => {
+                                format!("Overwriting on Sirv {} of {}…", job.done, job.total)
+                            }
                             (true, kind) => {
-                                let verb = if kind == SirvJobKind::Pull {
-                                    "Pulled"
-                                } else {
-                                    "Pushed"
+                                let verb = match kind {
+                                    SirvJobKind::Pull => "Pulled",
+                                    SirvJobKind::PullChanged => "Took from Sirv",
+                                    SirvJobKind::Push => "Pushed",
+                                    SirvJobKind::PushChanged => "Overwrote on Sirv",
                                 };
                                 let failures = if job.failures.is_empty() {
                                     String::new()
@@ -2581,40 +2611,68 @@ impl Audit {
                         }),
                 )
             })
-            .child(div().flex().items_center().justify_between().child(
-                div().flex().gap_2().when_some(paired, |row, dir| {
-                    let busy = self.sirv_busy();
-                    let (to_push, _, to_pull) = self.sirv_counts.unwrap_or((0, 0, 0));
-                    row.child(
-                        Button::new("sirv-pull")
-                            .outline()
-                            .small()
-                            .icon(IconName::ArrowDown)
-                            .label(format!("Pull {to_pull} missing"))
-                            .disabled(busy || to_pull == 0)
-                            .on_click(cx.listener(|audit, _, _, cx| audit.start_pull(cx))),
-                    )
-                    .child(
-                        Button::new("sirv-push")
-                            .outline()
-                            .small()
-                            .icon(IconName::ArrowUp)
-                            .label(format!("Push {to_push} new"))
-                            .disabled(busy || to_push == 0)
-                            .on_click(cx.listener(|audit, _, _, cx| audit.start_push(cx))),
-                    )
-                    .child(
-                        Button::new("sirv-unpair")
-                            .ghost()
-                            .small()
-                            .label(format!("Unpair {dir}"))
-                            .disabled(busy)
-                            .on_click(cx.listener(|audit, _, _, cx| {
-                                audit.unpair_sirv(cx);
-                            })),
-                    )
-                }),
-            ))
+            .child(
+                div().flex().items_center().justify_between().child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .when_some(paired, |row, dir| {
+                            let busy = self.sirv_busy();
+                            let (to_push, changed, to_pull) = self.sirv_counts.unwrap_or((0, 0, 0));
+                            row.child(
+                                Button::new("sirv-pull")
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::ArrowDown)
+                                    .label(format!("Pull {to_pull} missing"))
+                                    .disabled(busy || to_pull == 0)
+                                    .on_click(cx.listener(|audit, _, _, cx| audit.start_pull(cx))),
+                            )
+                            .child(
+                                Button::new("sirv-push")
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::ArrowUp)
+                                    .label(format!("Push {to_push} new"))
+                                    .disabled(busy || to_push == 0)
+                                    .on_click(cx.listener(|audit, _, _, cx| audit.start_push(cx))),
+                            )
+                            .when(changed > 0, |row| {
+                                row.child(
+                                    Button::new("sirv-push-changed")
+                                        .ghost()
+                                        .small()
+                                        .label(format!("Overwrite {changed} on Sirv"))
+                                        .disabled(busy)
+                                        .on_click(cx.listener(|audit, _, _, cx| {
+                                            audit.start_push_changed(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("sirv-pull-changed")
+                                        .ghost()
+                                        .small()
+                                        .label(format!("Take {changed} from Sirv"))
+                                        .disabled(busy)
+                                        .on_click(cx.listener(|audit, _, _, cx| {
+                                            audit.start_pull_changed(cx);
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("sirv-unpair")
+                                    .ghost()
+                                    .small()
+                                    .label(format!("Unpair {dir}"))
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|audit, _, _, cx| {
+                                        audit.unpair_sirv(cx);
+                                    })),
+                            )
+                        }),
+                ),
+            )
             .child(
                 div()
                     .flex()
@@ -3258,7 +3316,9 @@ impl Audit {
         if let Some(job) = &self.sirv_job {
             let verb = match job.kind {
                 SirvJobKind::Pull => "Sirv pull",
+                SirvJobKind::PullChanged => "Sirv pull (overwrite)",
                 SirvJobKind::Push => "Sirv push",
+                SirvJobKind::PushChanged => "Sirv push (overwrite)",
             };
             let failures = if job.failures.is_empty() {
                 String::new()
@@ -3424,6 +3484,22 @@ fn named(names: impl Iterator<Item = String>) -> String {
         0 => shown,
         rest => format!("{shown} and {rest} more"),
     }
+}
+
+fn sirv_push_plan(
+    root: &Path,
+    entries: &[scan::Entry],
+    files: &HashMap<String, sirv::Node>,
+    accept: sirv::SyncState,
+) -> Vec<(String, PathBuf)> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let key = sirv::relative_key(root, &entry.path)?;
+            (sirv::classify(entry.bytes, files.get(&key)) == accept)
+                .then(|| (key, entry.path.clone()))
+        })
+        .collect()
 }
 
 /// One sampled file and the slice of the list it speaks for.
@@ -5096,6 +5172,79 @@ mod tests {
 
         let hidden = HashSet::from([3]);
         assert!(conversion_targets(&visible, &hidden).is_empty());
+    }
+
+    #[test]
+    fn push_plan_lists_only_files_sirv_lacks() {
+        let entries = vec![
+            entry("photos/local.jpg", 1, 1, 10, ImageFormat::Jpeg),
+            entry("photos/same.jpg", 1, 1, 20, ImageFormat::Jpeg),
+            entry("photos/changed.jpg", 1, 1, 30, ImageFormat::Jpeg),
+        ];
+        let files = HashMap::from([
+            (
+                "same.jpg".into(),
+                sirv::Node {
+                    filename: "/d/same.jpg".into(),
+                    r#type: "file".into(),
+                    size: 20,
+                },
+            ),
+            (
+                "changed.jpg".into(),
+                sirv::Node {
+                    filename: "/d/changed.jpg".into(),
+                    r#type: "file".into(),
+                    size: 31,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            sirv_push_plan(
+                Path::new("photos"),
+                &entries,
+                &files,
+                sirv::SyncState::OnlyLocal,
+            ),
+            [("local.jpg".into(), PathBuf::from("photos/local.jpg"))]
+        );
+    }
+
+    #[test]
+    fn the_forced_push_plan_takes_changed_files_and_leaves_synced_ones() {
+        let entries = vec![
+            entry("photos/same.jpg", 1, 1, 20, ImageFormat::Jpeg),
+            entry("photos/changed.jpg", 1, 1, 30, ImageFormat::Jpeg),
+        ];
+        let files = HashMap::from([
+            (
+                "same.jpg".into(),
+                sirv::Node {
+                    filename: "/d/same.jpg".into(),
+                    r#type: "file".into(),
+                    size: 20,
+                },
+            ),
+            (
+                "changed.jpg".into(),
+                sirv::Node {
+                    filename: "/d/changed.jpg".into(),
+                    r#type: "file".into(),
+                    size: 31,
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            sirv_push_plan(
+                Path::new("photos"),
+                &entries,
+                &files,
+                sirv::SyncState::Changed,
+            ),
+            [("changed.jpg".into(), PathBuf::from("photos/changed.jpg"))]
+        );
     }
 
     #[test]
