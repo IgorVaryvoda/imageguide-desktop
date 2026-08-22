@@ -23,7 +23,7 @@ jobs:
       matrix:
         include:
           - name: Linux x86_64
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             formats: appimage
             platform: linux-x86_64
             update_glob: "*.AppImage"
@@ -78,6 +78,7 @@ jobs:
         run: |
           choco install nsis pkgconfiglite -y --no-progress
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "libavif[aom,dav1d]:x64-windows-static"
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
           "VCPKGRS_TRIPLET=x64-windows-static" >> $env:GITHUB_ENV
           "DAV1D_STATIC=1" >> $env:GITHUB_ENV
           "PKG_CONFIG_PATH=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static\lib\pkgconfig" >> $env:GITHUB_ENV
