@@ -56,3 +56,6 @@
 - Benchmark folders: hardlink-mirror `~/Pictures` into `~/.cache/` (`/tmp` is tmpfs, so `ln` fails across filesystems). 5,732 images / 3.0 GB convert to 422.9 MB at WebP q80 full size.
 - Measured on this 16-core host at `52520d2`: WebP conversion 54.3s serial vs 9.3s parallel for 255 MB; AVIF 128s serial, 88s at two files at once, 83s at four. rav1e already spends about 6 cores on a single image, so only WebP wants a worker per core.
 - `ravif`'s `asm` and `threading` features are on by default and `nasm` is installed, so the rav1e assembly is already built. The old `convert.rs` module comment claiming otherwise was wrong.
+- `/tmp` is on a different filesystem from `/home/igor/Pictures` here; put hard-link benchmark fixtures under `/home/igor/.cache`, or `ln` emits one cross-device error per file.
+- Gamescope PipeWire is damage-driven: `videorate` plus `num-buffers` does not produce a fixed-rate frame run when the app is idle. Bound continuous captures with `timeout`; do not wait for a frame count.
+- A 6,000-image GPUI conversion stress run took 2.557s before progress batching and 2.481s after it (3% wall-time gain); do not market that as a 70% conversion speedup. The honest UI metric is progress invalidations: 6,000 to 750 for WebP (87.5% fewer), plus cached visible bytes remove the remaining O(folder size) header scan from each redraw.

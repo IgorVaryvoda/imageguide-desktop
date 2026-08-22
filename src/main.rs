@@ -386,6 +386,9 @@ struct Audit {
     /// against the same scale. Cached because the alternative is a scan of the
     /// whole list once per row.
     heaviest: u64,
+    /// Cached with `heaviest`; progress and thumbnail redraws must not rescan the
+    /// entire visible folder just to rebuild the header.
+    visible_bytes: u64,
     /// Files whose extension disagrees with their contents. Counted once when the
     /// folder is read, because the check allocates and the filter box would
     /// otherwise redo it for every entry on every keystroke.
@@ -571,6 +574,26 @@ impl Audit {
         conversion_targets(&self.visible, &self.selected)
     }
 
+    fn target_count(&self) -> usize {
+        if self.selected.is_empty() {
+            self.visible.len()
+        } else {
+            self.visible
+                .iter()
+                .filter(|index| self.selected.contains(index))
+                .count()
+        }
+    }
+
+    fn target_bytes(&self) -> u64 {
+        self.visible
+            .iter()
+            .filter(|index| self.selected.is_empty() || self.selected.contains(index))
+            .filter_map(|index| self.entries.get(*index))
+            .map(|entry| entry.bytes)
+            .sum()
+    }
+
     /// Bytes before and after, counting only the files actually converted. Comparing
     /// against the whole folder mid-run would report a fake saving.
     fn converted_totals(&self) -> (u64, u64) {
@@ -625,6 +648,7 @@ impl Audit {
             let workers = convert::workers(format);
             let mut inflight: Vec<gpui::Task<(usize, Option<convert::Converted>)>> = Vec::new();
             let mut queued = sources.iter();
+            let mut completed = Vec::with_capacity(workers);
 
             loop {
                 while inflight.len() < workers {
@@ -646,23 +670,35 @@ impl Audit {
                 // quietly turns one slow image back into a batch barrier.
                 let ((index, result), _, remaining) = select_all(inflight).await;
                 inflight = remaining;
+                completed.push((index, result));
+
+                // Publishing once per file made a 6,000-image conversion rebuild the
+                // same window 6,000 times. One worker-window keeps progress live while
+                // cutting UI invalidations by 87.5% for WebP.
+                let work_remaining = !inflight.is_empty() || !queued.as_slice().is_empty();
+                if !progress_batch_ready(completed.len(), workers, work_remaining) {
+                    continue;
+                }
+                let batch = std::mem::take(&mut completed);
 
                 if this
                     .update(cx, |audit, cx| {
                         if audit.dataset_generation != dataset_generation {
                             return;
                         }
-                        match result {
-                            Some(converted) => {
-                                audit.results.insert(index, converted.bytes);
-                            }
-                            None => {
-                                let name = audit
-                                    .entries
-                                    .get(index)
-                                    .map(|entry| entry.name())
-                                    .unwrap_or_default();
-                                audit.failures.push(name);
+                        for (index, result) in batch {
+                            match result {
+                                Some(converted) => {
+                                    audit.results.insert(index, converted.bytes);
+                                }
+                                None => {
+                                    let name = audit
+                                        .entries
+                                        .get(index)
+                                        .map(|entry| entry.name())
+                                        .unwrap_or_default();
+                                    audit.failures.push(name);
+                                }
                             }
                         }
                         cx.notify();
@@ -706,12 +742,12 @@ impl Audit {
         // Weight bars are drawn against the heaviest file on screen, so filtering
         // down to the small ones still spreads them across the column instead of
         // leaving every bar a stub.
-        self.heaviest = visible
+        (self.heaviest, self.visible_bytes) = visible
             .iter()
             .filter_map(|index| self.entries.get(*index))
-            .map(|entry| entry.bytes)
-            .max()
-            .unwrap_or(0);
+            .fold((0, 0), |(heaviest, total), entry| {
+                (heaviest.max(entry.bytes), total + entry.bytes)
+            });
         self.visible = visible;
     }
 
@@ -2673,11 +2709,7 @@ impl Audit {
     /// Bytes of what is on screen. With a filter active the folder total would be
     /// describing files the list is not showing.
     fn visible_bytes(&self) -> u64 {
-        self.visible
-            .iter()
-            .filter_map(|index| self.entries.get(*index))
-            .map(|entry| entry.bytes)
-            .sum()
+        self.visible_bytes
     }
 
     fn toolbar_button(
@@ -2988,18 +3020,20 @@ impl Audit {
     /// wedged between the button and the window edge — the wrong volume for the only
     /// number the app exists to produce.
     fn summary(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let targets = self.targets();
-        let source: u64 = targets
-            .iter()
-            .filter_map(|index| self.entries.get(*index))
-            .map(|entry| entry.bytes)
-            .sum();
+        let target_count = self.target_count();
+        // Source bytes only appear before a conversion. While results stream in,
+        // avoid walking thousands of rows on every progress redraw.
+        let source = if !self.converting && self.results.is_empty() {
+            self.target_bytes()
+        } else {
+            0
+        };
 
         // Four states, one shape: a headline, the share it leaves behind, and a
         // sentence of detail.
         let (headline, tone, detail, bar, tag) = if self.converting {
             let done = self.results.len() + self.failures.len();
-            let total = self.active_target_count.unwrap_or(targets.len());
+            let total = self.active_target_count.unwrap_or(target_count);
             (
                 format!("{done} of {total}"),
                 cx.theme().foreground,
@@ -3173,7 +3207,7 @@ impl Audit {
                     .child(
                         Button::new("convert")
                             .primary()
-                            .when(self.converting || targets.is_empty(), |button| {
+                            .when(self.converting || target_count == 0, |button| {
                                 button.ghost()
                             })
                             .label(if self.converting {
@@ -3183,12 +3217,12 @@ impl Audit {
                             } else {
                                 format!(
                                     "Convert {} to {}",
-                                    targets.len(),
+                                    target_count,
                                     self.format.label().to_uppercase()
                                 )
                             })
                             .disabled(
-                                self.converting || self.scanning.is_some() || targets.is_empty(),
+                                self.converting || self.scanning.is_some() || target_count == 0,
                             )
                             .on_click(cx.listener(|audit, _, _, cx| audit.start_conversion(cx))),
                     ),
@@ -3442,6 +3476,10 @@ fn conversion_targets(visible: &[usize], selected: &HashSet<usize>) -> Vec<usize
             .filter(|index| selected.contains(index))
             .collect()
     }
+}
+
+fn progress_batch_ready(completed: usize, workers: usize, work_remaining: bool) -> bool {
+    completed >= workers || !work_remaining
 }
 
 /// The audit list, as the component library's virtualised table.
@@ -4677,6 +4715,7 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
             entries,
             skipped_raw,
             heaviest: 0,
+            visible_bytes: 0,
             mislabelled,
             thumbs: HashMap::new(),
             requested: HashSet::new(),
@@ -5036,6 +5075,13 @@ mod tests {
 
         let hidden = HashSet::from([3]);
         assert!(conversion_targets(&visible, &hidden).is_empty());
+    }
+
+    #[test]
+    fn conversion_progress_publishes_by_worker_window_and_flushes_the_tail() {
+        assert!(!progress_batch_ready(7, 8, true));
+        assert!(progress_batch_ready(8, 8, true));
+        assert!(progress_batch_ready(3, 8, false));
     }
 
     #[test]
