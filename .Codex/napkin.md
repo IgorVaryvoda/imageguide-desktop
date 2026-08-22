@@ -3,6 +3,8 @@
 ## Corrections
 | Date | Source | What Went Wrong | What To Do Instead |
 |------|--------|----------------|-------------------|
+| 2026-08-22 | self | Treated `webp::WebPConfig::new()` as `Option` in an `Option`-returning encoder | It returns `Result`; use `.ok()?` at this deliberately lossy error boundary |
+| 2026-08-22 | self | Timed a long conversion through an `exec` wrapper that hid the yielded `exec_command` session id, then accidentally started a second conversion beside it | Print the full `exec_command` result as JSON and resume its `session_id` with `write_stdin`; never trust timing while another benchmark process exists |
 | 2026-08-20 | user | Treated the broken GPUI headless renderer as a reason to defer screenshot-backed UI proof | Launch the real pre-alpha app, control it through Hyprland/ydotool, capture with `grim`, and visually inspect every changed state and size |
 
 ## User Preferences
@@ -10,6 +12,9 @@
 - For pre-alpha UI work, reshape the design freely and make real app screenshots yourself; do not wait for an in-repo headless capture test.
 
 ## Patterns That Work
+- For lossy WebP, libwebp method 1 with eight file workers cut the current 5,739-image / 3.0GB q80 full-size run from 69.505s to 29.608s (57.4%); output grew from 423.2MB to 480.3MB but still saved 84%. Keep method 4 for lossless/transparent images. Threaded libwebp was worse: 71.2s at eight file workers and 125.3s at four.
+- A `VecDeque<Task<_>>` awaited from the front is not a sliding conversion window: one slow first file leaves completed worker slots idle. `select_all` cut a 64-file uneven WebP workload from a 2.121s median to 1.812s (14.6%) by refilling on any completion.
+- When the settings overlay has only one section, name that task in the title and keep status plus secondary/primary actions in one footer; the old section label and separate Close row made the small form look oversized.
 - `git pull --ff-only` followed by `cargo run --release` updates and launches the GPUI app; Cargo may fetch newly locked crates first.
 - For real UI proof on Hyprland: launch `target/release/imageguide <folder>`, use `hyprctl` to focus/float/resize/move the `imageguide` window, interact with `hyprctl dispatch movecursor` plus `ydotool`/`wtype`, capture exact window geometry with `grim -g`, then inspect the PNG.
 - If the desktop is locked, keep the lock intact: run the release app in headless Gamescope, capture its PipeWire node with GStreamer, and drive its Xwayland seat with `DISPLAY=:2 xdotool`. Use an isolated `XDG_CONFIG_HOME` for requested window sizes.
@@ -31,6 +36,8 @@
 - Comparison `pair == None` can mean either loading or a completed decode/encode failure; keep an explicit failed bit so the error panel and footer do not say `decoding…` forever.
 
 ## Patterns That Don't Work
+- This Arch host has no `/usr/bin/time`; use Bash `TIMEFORMAT` and the shell `time` keyword for wall-clock benchmarks.
+- Removing a settings input must also update the overlay's `FIELDS` count and focus-handle array; the Studio removal left `studio_email` there and broke the build.
 - The documented ignored screenshot harness currently fails on this Linux host with `render_to_image not available: no HeadlessRenderer configured`; do not claim UI screenshot proof from `cargo test --bin imageguide -- --ignored screenshot` until the renderer setup is fixed.
 - Do not persist `uniform_list` processor range as viewport state: GPUI also invokes the processor with a one-item measurement range. Read the tracked handle's public `base_handle.logical_scroll_top()` instead.
 - A normal live app run writes its viewport and folder to `~/.config/imageguide/settings`; save or isolate that config before scripted resize tests, then restore it exactly.
