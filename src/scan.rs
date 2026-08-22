@@ -119,9 +119,8 @@ pub fn decode(path: &Path) -> Option<image::DynamicImage> {
 
 /// Walk a folder and probe every image in it, subfolders included.
 pub fn scan(root: &Path) -> Scan {
-    let mut entries = Vec::new();
+    let mut candidates = Vec::new();
     let mut skipped_raw = 0;
-    let mut unreadable = 0;
 
     for file in WalkDir::new(root)
         .follow_links(false)
@@ -140,13 +139,45 @@ pub fn scan(root: &Path) -> Scan {
             skipped_raw += 1;
             continue;
         }
-        match probe(file.path()) {
-            Some(entry) => entries.push(entry),
-            // Only count things that claimed to be images. A README is not a failure.
-            None if looks_like_an_image(file.path()) => unreadable += 1,
-            None => {}
-        }
+        candidates.push(file.into_path());
     }
+
+    // A probe is an open and a header read, so a few thousand of them are waiting on
+    // the disk rather than arithmetic. Split the list across the cores and read them
+    // at the same time: the folder a photographer points this at holds thousands, and
+    // one at a time is the whole "Scanning…" wait.
+    let threads = std::thread::available_parallelism().map_or(4, |count| count.get());
+    let chunk = candidates.len().div_ceil(threads).max(1);
+    let mut entries = Vec::with_capacity(candidates.len());
+    let mut unreadable = 0;
+    std::thread::scope(|scope| {
+        // Chunks are contiguous and joined in order, so the walk order survives into
+        // the stable sort below and ties still break the way they always did.
+        let workers: Vec<_> = candidates
+            .chunks(chunk)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut found = Vec::new();
+                    let mut missed = 0usize;
+                    for path in chunk {
+                        match probe(path) {
+                            Some(entry) => found.push(entry),
+                            // Only count things that claimed to be images. A README is
+                            // not a failure.
+                            None if looks_like_an_image(path) => missed += 1,
+                            None => {}
+                        }
+                    }
+                    (found, missed)
+                })
+            })
+            .collect();
+        for worker in workers {
+            let (found, missed) = worker.join().unwrap_or_default();
+            entries.extend(found);
+            unreadable += missed;
+        }
+    });
 
     // Heaviest first: the top of the list is the work worth doing.
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.bytes));
@@ -337,6 +368,28 @@ mod tests {
         assert_eq!(
             scanned.skipped_raw, 2,
             "raw is counted, not silently dropped"
+        );
+    }
+
+    /// The walk hands its files to one thread per core, so every count and the sort
+    /// order have to survive being assembled from several chunks instead of one loop.
+    #[test]
+    fn a_folder_larger_than_one_chunk_reports_every_file_once() {
+        let dir = temp_dir("parallel");
+        for index in 0..40u32 {
+            write_sample(&dir, &format!("s{index:02}.png"), 8 + index, 8);
+        }
+        std::fs::write(dir.join("broken.png"), b"not a png").unwrap();
+
+        let scanned = scan(&dir);
+        assert_eq!(scanned.entries.len(), 40, "no file is probed twice or lost");
+        assert_eq!(scanned.unreadable, 1, "failures survive the join");
+        assert!(
+            scanned
+                .entries
+                .windows(2)
+                .all(|pair| pair[0].bytes >= pair[1].bytes),
+            "heaviest first still holds across chunks"
         );
     }
 

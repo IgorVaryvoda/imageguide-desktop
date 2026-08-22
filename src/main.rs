@@ -11,7 +11,7 @@ mod settings;
 mod sirv;
 mod thumbs;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -96,6 +96,16 @@ const GALLERY_BORDER: f32 = 1.;
 const SAMPLE_SIZE: usize = 4;
 /// Settling time before sampling, so dragging the slider does not start a run per pixel.
 const ESTIMATE_DELAY: Duration = Duration::from_millis(400);
+/// Settling time before building a comparison, so a held arrow key does not queue one
+/// full decode and encode per repeat.
+const COMPARE_DELAY: Duration = Duration::from_millis(120);
+/// Settling time before the window state reaches disk, so a resize drag is one write.
+const SETTINGS_SAVE_DELAY: Duration = Duration::from_millis(500);
+
+/// Decoded thumbnails kept in memory at once. A viewport holds a few dozen, so this is
+/// far more than scrolling needs; without it a 5,000-image folder scrolled end to end
+/// retains 5,000 decoded thumbnails and a GPU texture for each.
+const THUMB_CACHE: usize = 512;
 
 fn is_checkbox_activation_key(event: &gpui::KeyDownEvent) -> bool {
     matches!(event.keystroke.key.as_str(), "space" | "enter")
@@ -276,6 +286,9 @@ struct Audit {
     /// Rows already handed to a background thread, so scrolling past one twice does
     /// not decode it twice.
     requested: HashSet<usize>,
+    /// The order `thumbs` filled up in, so the oldest decode is the one that leaves
+    /// when the cache reaches `THUMB_CACHE`.
+    thumb_order: VecDeque<usize>,
     format: Format,
     quality: Quality,
     max_edge: MaxEdge,
@@ -350,8 +363,12 @@ struct Audit {
     focus: FocusHandle,
     /// Last title pushed to the compositor, so render does not set it every frame.
     titled: String,
-    /// Last state written to disk, so render only writes when it changes.
+    /// Last state render asked to store, so render only schedules a write when it
+    /// changes.
     settings: settings::Settings,
+    /// A delayed save is already waiting; it reads `settings` when it fires, so a
+    /// whole resize drag needs one task and one write.
+    settings_save_pending: bool,
     /// The last pair built, kept so closing and reopening the same image is instant.
     // ponytail: one entry. A pair holds two full-size RGBA buffers — 165 MB for a
     // 5568x3712 photo — so a bigger cache would need a byte budget, not a count.
@@ -462,6 +479,10 @@ struct SettingsPanel {
     studio_status: Option<(bool, String)>,
     /// Which form field holds focus, as an index into the field list.
     focus_ix: usize,
+    /// The panel has taken focus already. Without this the next render put focus back
+    /// in the first field, so Tab and a click into another field both came undone the
+    /// moment a save or a status message redrew the audit.
+    focused: bool,
 }
 
 struct Comparison {
@@ -483,14 +504,39 @@ struct Comparison {
     drag: Option<((f32, f32), (f32, f32))>,
 }
 
+/// Write the remembered state, except in tests, where a render must not touch the
+/// user's real config file.
+fn write_settings(settings: &settings::Settings) {
+    #[cfg(not(test))]
+    settings::save(settings);
+    #[cfg(test)]
+    let _ = (settings, settings::save as fn(&settings::Settings));
+}
+
 impl Audit {
-    /// Cache settings in every build, but keep test renders from touching user config.
-    fn save_settings(&mut self, settings: settings::Settings) {
-        #[cfg(not(test))]
-        settings::save(&settings);
-        #[cfg(test)]
-        let _ = settings::save as fn(&settings::Settings);
+    /// Remember the window state without putting a disk write inside a frame.
+    /// Dragging a window edge changes the size on every frame, and the old code
+    /// answered each one with `create_dir_all` plus `write` on the UI thread. One
+    /// delayed save collects the whole drag and stores the size it ended at.
+    fn remember_settings(&mut self, settings: settings::Settings, cx: &mut Context<Self>) {
         self.settings = settings;
+        if self.settings_save_pending {
+            return;
+        }
+        self.settings_save_pending = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SETTINGS_SAVE_DELAY).await;
+            let Ok(settings) = this.update(cx, |audit, _| {
+                audit.settings_save_pending = false;
+                audit.settings.clone()
+            }) else {
+                return;
+            };
+            cx.background_executor()
+                .spawn(async move { write_settings(&settings) })
+                .detach();
+        })
+        .detach();
     }
 
     /// The rows a conversion would touch. An empty selection means the whole folder,
@@ -1053,6 +1099,7 @@ impl Audit {
         self.skipped_raw = scanned.skipped_raw;
         self.unreadable = scanned.unreadable;
         self.thumbs.clear();
+        self.thumb_order.clear();
         self.requested.clear();
         self.selected.clear();
         self.results.clear();
@@ -1417,6 +1464,7 @@ impl Audit {
             cdn_status: None,
             studio_status: None,
             focus_ix: 0,
+            focused: false,
         });
         cx.notify();
     }
@@ -1783,6 +1831,22 @@ impl Audit {
         }
 
         cx.spawn(async move |this, cx| {
+            // Building a pair is a full decode, encode and second decode. Arrowing
+            // through a folder used to start one per keypress and leave every one of
+            // them running; wait for the arrow key to stop first.
+            cx.background_executor().timer(COMPARE_DELAY).await;
+            let still_open = this
+                .read_with(cx, |audit, _| {
+                    audit
+                        .compare
+                        .as_ref()
+                        .is_some_and(|open| open.index == index && open.key == key)
+                })
+                .unwrap_or(false);
+            if !still_open {
+                return;
+            }
+
             let built = cx
                 .background_executor()
                 .spawn(async move { compare::build(&path, format, quality, max_edge) })
@@ -3161,12 +3225,26 @@ impl Audit {
                 let _ = this.update(cx, |audit, cx| {
                     if audit.dataset_generation == dataset_generation {
                         audit.thumbs.insert(index, image);
+                        audit.thumb_order.push_back(index);
+                        audit.trim_thumbs();
                         cx.notify();
                     }
                 });
             }
         })
         .detach();
+    }
+
+    /// Drop the oldest thumbnails once the cache is over its bound. `requested` has to
+    /// forget them too, or scrolling back to a dropped row would show a permanent gap.
+    fn trim_thumbs(&mut self) {
+        while self.thumb_order.len() > THUMB_CACHE {
+            let Some(oldest) = self.thumb_order.pop_front() else {
+                return;
+            };
+            self.thumbs.remove(&oldest);
+            self.requested.remove(&oldest);
+        }
     }
 }
 
@@ -3684,8 +3762,8 @@ impl Render for Audit {
             self.titled = title;
         }
 
-        // Cheap enough to check every frame, and it means a crash still leaves the
-        // last good size and folder on disk.
+        // Cheap enough to compare every frame, and it means a crash still leaves the
+        // last good size and folder on disk. The write itself is delayed.
         let viewport = window.viewport_size();
         let current = settings::Settings {
             width: Some(f32::from(viewport.width)),
@@ -3693,7 +3771,7 @@ impl Render for Audit {
             folder: self.root.is_dir().then(|| self.root.clone()),
         };
         if current != self.settings {
-            self.save_settings(current);
+            self.remember_settings(current, cx);
         }
 
         if let Some(table) = self.table.clone() {
@@ -3863,11 +3941,16 @@ impl Render for Audit {
             let view = self.settings_panel_view(cx);
             // The click that opened the panel left focus on the button it
             // replaced; take focus next frame so typing lands in the first
-            // field. Nothing else in the framework moves Tab between inputs,
-            // so this panel cycles them itself.
+            // field. Once only: after that the field with focus is whichever
+            // one Tab or a click chose. Nothing else in the framework moves Tab
+            // between inputs, so this panel cycles them itself.
             cx.defer_in(window, |audit, window, cx| {
-                if let Some(panel) = audit.settings_panel.as_ref() {
-                    window.focus(&panel.client_id.read(cx).focus_handle(cx), cx);
+                if let Some(panel) = audit.settings_panel.as_mut()
+                    && !panel.focused
+                {
+                    panel.focused = true;
+                    let handle = panel.client_id.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
                 }
             });
             return div()
@@ -4401,6 +4484,7 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
             mislabelled,
             thumbs: HashMap::new(),
             requested: HashSet::new(),
+            thumb_order: VecDeque::new(),
             format,
             quality,
             max_edge,
@@ -4427,6 +4511,7 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
             focus,
             titled: String::new(),
             settings: settings::Settings::default(),
+            settings_save_pending: false,
             cached: None,
             results: HashMap::new(),
             converting: false,
