@@ -12,6 +12,8 @@
 - For pre-alpha UI work, reshape the design freely and make real app screenshots yourself; do not wait for an in-repo headless capture test.
 
 ## Patterns That Work
+- On the 5,739-image corpus, bundled libwebp 1.6.0 with zero-copy RGB/RGBA input took 28.512s versus 29.569s for the 1.3.1 wrapper (3.6% faster) and encoded five formats the wrapper rejected; converting every image to a fresh RGB buffer first regressed to 33.119s.
+- Rav1e speed 8 took 20.628s versus 23.373s at speed 6 on a 64-file size-stratified real sample (11.7% faster), while output grew only 0.6%.
 - For lossy WebP, libwebp method 1 with eight file workers cut the current 5,739-image / 3.0GB q80 full-size run from 69.505s to 29.608s (57.4%); output grew from 423.2MB to 480.3MB but still saved 84%. Keep method 4 for lossless/transparent images. Threaded libwebp was worse: 71.2s at eight file workers and 125.3s at four.
 - A `VecDeque<Task<_>>` awaited from the front is not a sliding conversion window: one slow first file leaves completed worker slots idle. `select_all` cut a 64-file uneven WebP workload from a 2.121s median to 1.812s (14.6%) by refilling on any completion.
 - When the settings overlay has only one section, name that task in the title and keep status plus secondary/primary actions in one footer; the old section label and separate Close row made the small form look oversized.
@@ -36,6 +38,7 @@
 - Comparison `pair == None` can mean either loading or a completed decode/encode failure; keep an explicit failed bit so the error panel and footer do not say `decoding…` forever.
 
 ## Patterns That Don't Work
+- The vendored `libaom-sys 0.17.2` build fails this repo's current NASM with `multipass optimization not supported`. A system-linked libaom benchmark was promising, but do not add host-specific linkage; retry when the crate's vendored build supports the pinned toolchain.
 - This Arch host has no `/usr/bin/time`; use Bash `TIMEFORMAT` and the shell `time` keyword for wall-clock benchmarks.
 - Removing a settings input must also update the overlay's `FIELDS` count and focus-handle array; the Studio removal left `studio_email` there and broke the build.
 - The documented ignored screenshot harness currently fails on this Linux host with `render_to_image not available: no HeadlessRenderer configured`; do not claim UI screenshot proof from `cargo test --bin imageguide -- --ignored screenshot` until the renderer setup is fixed.

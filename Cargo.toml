@@ -24,7 +24,7 @@ image = { version = "0.25", features = ["avif-native"] }
 ravif = "0.13.0"
 rgb = "0.8.53"
 walkdir = "2"
-webp = "0.3.1"
+libwebp-sys = "0.14.4"
 # Sirv REST sync. ureq keeps the dependency tree pure Rust (rustls), so no new
 # system packages join the CI images; calls run on gpui's background executor.
 ureq = { version = "2.10", features = ["json"] }

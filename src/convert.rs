@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use image::DynamicImage;
+use libwebp_sys::{
+    WEBP_ENCODER_ABI_VERSION, WebPConfig, WebPConfigInitInternal, WebPEncode, WebPMemoryWrite,
+    WebPMemoryWriter, WebPMemoryWriterClear, WebPMemoryWriterInit, WebPPicture, WebPPictureFree,
+    WebPPictureImportRGB, WebPPictureImportRGBA, WebPPictureInitInternal, WebPPreset,
+    WebPValidateConfig,
+};
 use ravif::{Encoder as AvifEncoder, Img};
 use rgb::FromSlice;
 
@@ -125,8 +131,22 @@ pub fn encode(image: &DynamicImage, format: Format, quality: Quality) -> Option<
 /// requested quality.
 fn encode_webp(image: &DynamicImage, quality: Quality) -> Option<Vec<u8>> {
     let lossless = quality.0.is_none() || has_transparency(image);
-    let encoder = webp::Encoder::from_image(image).ok()?;
-    let mut config = webp::WebPConfig::new().ok()?;
+    let mut config = std::mem::MaybeUninit::<WebPConfig>::uninit();
+    // SAFETY: `config` points to writable storage for exactly one WebPConfig and the
+    // ABI constant comes from the same statically linked libwebp crate.
+    if unsafe {
+        WebPConfigInitInternal(
+            config.as_mut_ptr(),
+            WebPPreset::WEBP_PRESET_DEFAULT,
+            quality.0.unwrap_or(75.),
+            WEBP_ENCODER_ABI_VERSION as i32,
+        )
+    } == 0
+    {
+        return None;
+    }
+    // SAFETY: the initializer above succeeded.
+    let mut config = unsafe { config.assume_init() };
     config.lossless = i32::from(lossless);
     config.alpha_compression = i32::from(!lossless);
     config.quality = quality.0.unwrap_or(75.);
@@ -134,8 +154,100 @@ fn encode_webp(image: &DynamicImage, quality: Quality) -> Option<Vec<u8>> {
     // folder from 69.5s to 29.6s. Lossless keeps the prior method 4 behavior because
     // its explicit promise is unchanged pixels, not the lossy path's speed tradeoff.
     config.method = if lossless { 4 } else { 1 };
-    let memory = encoder.encode_advanced(&config).ok()?;
-    Some(memory.to_vec())
+    if unsafe { WebPValidateConfig(&config) } == 0 {
+        return None;
+    }
+
+    if let Some(pixels) = image.as_rgba8() {
+        encode_webp_pixels(
+            pixels.as_raw(),
+            pixels.width(),
+            pixels.height(),
+            true,
+            &config,
+        )
+    } else if let Some(pixels) = image.as_rgb8() {
+        encode_webp_pixels(
+            pixels.as_raw(),
+            pixels.width(),
+            pixels.height(),
+            false,
+            &config,
+        )
+    } else if image.color().has_alpha() {
+        let pixels = image.to_rgba8();
+        encode_webp_pixels(
+            pixels.as_raw(),
+            pixels.width(),
+            pixels.height(),
+            true,
+            &config,
+        )
+    } else {
+        let pixels = image.to_rgb8();
+        encode_webp_pixels(
+            pixels.as_raw(),
+            pixels.width(),
+            pixels.height(),
+            false,
+            &config,
+        )
+    }
+}
+
+fn encode_webp_pixels(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    alpha: bool,
+    config: &WebPConfig,
+) -> Option<Vec<u8>> {
+    let channels = if alpha { 4 } else { 3 };
+    let stride = i32::try_from(width.checked_mul(channels)?).ok()?;
+    let width = i32::try_from(width).ok()?;
+    let height = i32::try_from(height).ok()?;
+    let expected = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?
+        .checked_mul(channels as usize)?;
+    if pixels.len() != expected {
+        return None;
+    }
+    let mut picture = std::mem::MaybeUninit::<WebPPicture>::uninit();
+    // SAFETY: all pointers remain valid through the synchronous encode. Both libwebp
+    // allocations are released before returning, including every failure path.
+    unsafe {
+        if WebPPictureInitInternal(picture.as_mut_ptr(), WEBP_ENCODER_ABI_VERSION as i32) == 0 {
+            return None;
+        }
+        let mut picture = picture.assume_init();
+        picture.use_argb = 1;
+        picture.width = width;
+        picture.height = height;
+        let imported = if alpha {
+            WebPPictureImportRGBA(&mut picture, pixels.as_ptr(), stride)
+        } else {
+            WebPPictureImportRGB(&mut picture, pixels.as_ptr(), stride)
+        };
+        if imported == 0 {
+            WebPPictureFree(&mut picture);
+            return None;
+        }
+
+        let mut writer = std::mem::MaybeUninit::<WebPMemoryWriter>::uninit();
+        WebPMemoryWriterInit(writer.as_mut_ptr());
+        let mut writer = writer.assume_init();
+        picture.writer = Some(WebPMemoryWrite);
+        picture.custom_ptr = (&mut writer as *mut WebPMemoryWriter).cast();
+        let encoded = if WebPEncode(config, &mut picture) != 0 && !writer.mem.is_null() {
+            Some(std::slice::from_raw_parts(writer.mem, writer.size).to_vec())
+        } else {
+            None
+        };
+        WebPMemoryWriterClear(&mut writer);
+        WebPPictureFree(&mut picture);
+        encoded
+    }
 }
 
 /// AVIF keeps alpha in a separate plane, so transparency needs no special case here.
@@ -149,7 +261,7 @@ fn encode_webp(image: &DynamicImage, quality: Quality) -> Option<Vec<u8>> {
 fn encode_avif(image: &DynamicImage, quality: Quality) -> Option<Vec<u8>> {
     let encoder = AvifEncoder::new()
         .with_quality(quality.0.unwrap_or(90.))
-        .with_speed(6);
+        .with_speed(8);
 
     let encoded = if has_transparency(image) {
         let rgba = image.to_rgba8();
@@ -371,6 +483,13 @@ mod tests {
         let encoded = encode(&photo(32, 32), Format::WebP, Quality::lossy(80.)).unwrap();
         assert_eq!(&encoded[0..4], b"RIFF");
         assert_eq!(&encoded[8..12], b"WEBP");
+    }
+
+    #[test]
+    fn bundled_libwebp_has_the_current_encoder() {
+        // 0xMMmmpp: major, minor, patch.
+        let version = unsafe { libwebp_sys::WebPGetEncoderVersion() };
+        assert!(version >= 0x010600, "bundled libwebp is {version:#08x}");
     }
 
     #[test]
