@@ -30,6 +30,7 @@ use gpui_component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::progress::Progress;
+use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_component::switch::Switch;
 use gpui_component::table::{Column as TableCol, ColumnSort, DataTable, TableDelegate, TableState};
@@ -4384,7 +4385,7 @@ impl Render for Audit {
                                 .scroll_to_item_strict(0, ScrollStrategy::Top);
                         }
                         self.gallery_columns = Some(layout.columns);
-                        uniform_list(
+                        let gallery = uniform_list(
                             "gallery",
                             layout.rows,
                             cx.processor(|audit, range: std::ops::Range<usize>, _window, cx| {
@@ -4415,9 +4416,29 @@ impl Render for Audit {
                             }),
                         )
                         .track_scroll(&self.gallery_scroll)
-                        .flex_1()
-                        .p_2()
-                        .into_any_element()
+                        .size_full()
+                        .p_2();
+                        div()
+                            .relative()
+                            .flex_1()
+                            .overflow_hidden()
+                            .child(gallery)
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .w(Scrollbar::width())
+                                    .debug_selector(|| "gallery-scrollbar".into())
+                                    .child(
+                                        Scrollbar::vertical(&self.gallery_scroll)
+                                            .id("gallery-scrollbar")
+                                            .mode(ScrollbarMode::Always)
+                                            .viewport_from_layout(),
+                                    ),
+                            )
+                            .into_any_element()
                     } else if let Some(table) = self.table.as_ref() {
                         DataTable::new(table)
                             .stripe(false)
@@ -5546,6 +5567,10 @@ mod tests {
 
         cx.simulate_resize(size(px(873.), px(720.)));
         cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("gallery-scrollbar").is_some(),
+            "the production gallery exposes a draggable scrollbar"
+        );
         // Root installs its client inset during its first draw. Settle that frame
         // before establishing the deliberately deep scroll position.
         cx.simulate_resize(size(px(873.), px(720.)));
