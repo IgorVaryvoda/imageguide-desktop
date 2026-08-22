@@ -18,7 +18,7 @@ thumbs::load (per visible row)  compare::build (per view)  convert::convert_file
 ```
 
 - `src/scan.rs` — header-only folder walk. Never decodes to learn dimensions. `Entry` carries `path/format/width/height/bytes`; `extension_lies()` flags files whose magic bytes disagree with the extension; output goes to `OUTPUT_DIR = "optimized"`, which the walk skips.
-- `src/convert.rs` — re-encode. WebP via libwebp (real transparency forces lossless), AVIF via system libavif/libaom speed 6 with libyuv conversion (no lossless AVIF). `MaxEdge` downscales with Lanczos3, never up. `output_path` mirrors the source tree.
+- `src/convert.rs` — re-encode. WebP via libwebp (real transparency forces lossless), AVIF via system libavif/libaom speed 6 with libyuv conversion where packaged (no lossless AVIF). `MaxEdge` downscales with Lanczos3, never up. `output_path` mirrors the source tree.
 - `src/compare.rs` — original-vs-converted pair built in memory, decode-encode-decode so both sides are real pixels. Cached by `Key` (path+format+quality+max_edge).
 - `src/thumbs.rs` — decode + 96px thumbnail + BGRA swap (`to_bgra`, shared with compare). `None` means draw a gap, not an error.
 - `src/settings.rs` — hand-rolled `key=value` file at `<config>/imageguide/settings`; tolerant parse.
@@ -47,7 +47,7 @@ Key patterns an editor must respect:
 ## Development Commands
 
 ```bash
-cargo build --release        # needs dav1d, libavif, libaom, libyuv (pacman/apt/brew)
+cargo build --release        # needs dav1d and libavif/libaom; Linux also packages libyuv
 cargo test --locked          # 48 tests; screenshot test stays ignored
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
@@ -83,7 +83,7 @@ CI runs the same gates with `--locked` (see `.github/workflows/ci.yml`).
 
 - Rust toolchain is pinned; use the pinned toolchain, not a system default.
 - gpui/gpui_platform (zed) and gpui-component(+assets) are unpinned git deps on purpose: pinning a revision in Cargo.toml would give cargo two git sources for gpui and two incompatible copies of every type. `Cargo.lock` pins commits; CI builds `--locked`. Do not "fix" this by adding revs.
-- Linux build uses rfd `xdg-portal` (no GTK) and gpui_platform `wayland,x11,font-kit`; other targets use defaults. AVIF encoding links system libavif >= 1.0 with its libaom and libyuv backends.
+- Linux build uses rfd `xdg-portal` (no GTK) and gpui_platform `wayland,x11,font-kit`; other targets use defaults. AVIF encoding links system libavif >= 1.0 with its libaom backend and libyuv where packaged.
 - `gpui-component-assets` must be registered as the asset source or every `IconName` renders blank.
 - Only Linux is tested; macOS/Windows builds are believed-correct, not verified. Windows is blocked on dav1d via vcpkg.
 

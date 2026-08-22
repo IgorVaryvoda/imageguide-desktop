@@ -5,8 +5,9 @@
 //! libwebp directly for both, and picks between them by whether the source has
 //! meaningful transparency.
 //!
-//! AVIF goes through libavif's libaom backend and libyuv colour conversion. The system
-//! libraries are the same path as `avifenc`, without starting a process per image.
+//! AVIF goes through libavif's libaom backend, with libyuv colour conversion where
+//! packaged. The system libraries are the same path as `avifenc`, without starting a
+//! process per image.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

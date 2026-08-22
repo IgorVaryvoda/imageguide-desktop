@@ -163,8 +163,8 @@ twenty, which are already at the top.
 | AVIF, current libaom encoder | 134.1 MB → **3.6 MB** (97%) | **9.07 s** |
 
 The current path is 58% faster and 9% smaller than the former rav1e path at matched
-visual quality. It uses the system libavif, libaom and libyuv libraries directly, so
-there is no subprocess per image.
+visual quality. It uses the system libavif and libaom libraries directly, with libyuv
+acceleration where packaged, so there is no subprocess per image.
 
 AVIF has no lossless option here. Lossless AVIF is routinely larger than lossless
 WebP and much slower to produce, so `--lossless` means WebP.
@@ -209,13 +209,13 @@ cargo build --release   # fetches the pinned Rust toolchain on first run
 cargo test
 ```
 
-Needs `dav1d` to decode AVIF, and libavif with its libaom and libyuv backends to
-encode it:
+Needs `dav1d` to decode AVIF and libavif with libaom to encode it. Linux packages
+also provide libyuv for faster pixel conversion:
 
 ```bash
 sudo pacman -S dav1d libavif aom libyuv                  # Arch and derivatives
 sudo apt install libdav1d-dev libavif-dev libaom-dev libyuv-dev
-brew install dav1d libavif aom libyuv                     # macOS
+brew install libavif                                      # macOS
 ```
 
 Nothing in `src/` is platform-specific. Two dependencies are, and `Cargo.toml` splits
