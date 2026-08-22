@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use compare::Pair;
 use convert::{Format, MaxEdge, Quality};
+use futures::future::select_all;
 use gpui::{
     App, Bounds, Context, Decorations, FocusHandle, Focusable as _, FontWeight, RenderImage,
     ScrollStrategy, UniformListScrollHandle, Window, WindowBounds, WindowOptions, div, img,
@@ -622,8 +623,7 @@ impl Audit {
             // idle; here a finished file is replaced immediately. The window is what
             // bounds memory: every file in flight holds a fully decoded image.
             let workers = convert::workers(format);
-            let mut inflight: VecDeque<gpui::Task<(usize, Option<convert::Converted>)>> =
-                VecDeque::new();
+            let mut inflight: Vec<gpui::Task<(usize, Option<convert::Converted>)>> = Vec::new();
             let mut queued = sources.iter();
 
             loop {
@@ -632,20 +632,20 @@ impl Audit {
                         break;
                     };
                     let (index, source, written) = (*index, source.clone(), written.clone());
-                    inflight.push_back(cx.background_executor().spawn(async move {
+                    inflight.push(cx.background_executor().spawn(async move {
                         (
                             index,
                             convert::convert_to(&source, &written, format, quality, max_edge),
                         )
                     }));
                 }
-                // Awaiting the oldest keeps the results in list order for the table.
-                // The rest are already running: an executor task does not need to be
-                // awaited to make progress.
-                let Some(task) = inflight.pop_front() else {
+                if inflight.is_empty() {
                     break;
-                };
-                let (index, result) = task.await;
+                }
+                // Take whichever file finishes first. Waiting for source order here
+                // quietly turns one slow image back into a batch barrier.
+                let ((index, result), _, remaining) = select_all(inflight).await;
+                inflight = remaining;
 
                 if this
                     .update(cx, |audit, cx| {
@@ -807,7 +807,7 @@ impl Audit {
             // 32 WebP samples of a 3.0GB folder take 0.9s, inside the wait the status
             // bar already shows as "Sizing it up…".
             let concurrency = convert::workers(format);
-            let mut inflight: VecDeque<(u64, u64, gpui::Task<Option<u64>>)> = VecDeque::new();
+            let mut inflight: Vec<gpui::Task<(u64, u64, Option<u64>)>> = Vec::new();
             let mut queued = strata.iter();
             let mut sampled = Vec::with_capacity(strata.len());
 
@@ -817,19 +817,21 @@ impl Audit {
                         break;
                     };
                     let path = stratum.path.clone();
-                    inflight.push_back((
-                        stratum.slice_bytes,
-                        stratum.bytes,
-                        cx.background_executor().spawn(async move {
-                            let image = scan::decode(&path).map(|image| max_edge.apply(image))?;
-                            Some(convert::encode(&image, format, quality)?.len() as u64)
-                        }),
-                    ));
+                    let (slice_bytes, bytes) = (stratum.slice_bytes, stratum.bytes);
+                    inflight.push(cx.background_executor().spawn(async move {
+                        let encoded = scan::decode(&path)
+                            .map(|image| max_edge.apply(image))
+                            .and_then(|image| convert::encode(&image, format, quality))
+                            .map(|encoded| encoded.len() as u64);
+                        (slice_bytes, bytes, encoded)
+                    }));
                 }
-                let Some((slice_bytes, bytes, task)) = inflight.pop_front() else {
+                if inflight.is_empty() {
                     break;
-                };
-                sampled.push((slice_bytes, task.await.map(|encoded| (bytes, encoded))));
+                }
+                let ((slice_bytes, bytes, encoded), _, remaining) = select_all(inflight).await;
+                inflight = remaining;
+                sampled.push((slice_bytes, encoded.map(|encoded| (bytes, encoded))));
             }
 
             let Some((projected, counted)) = project_total(&sampled) else {
