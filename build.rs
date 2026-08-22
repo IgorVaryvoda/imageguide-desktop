@@ -1,11 +1,11 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/avif_bridge.c");
 
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+    if std::env::var_os("VCPKGRS_TRIPLET").is_some() {
         let avif = vcpkg::Config::new()
             .cargo_metadata(false)
             .find_package("libavif")
-            .expect("libavif is required; install libavif[aom] with vcpkg");
+            .expect("libavif is required; install libavif[aom,dav1d] with vcpkg");
         compile_bridge(&avif.include_paths);
         for line in avif.cargo_metadata {
             println!("{line}");
@@ -15,7 +15,6 @@ fn main() {
 
     let avif = pkg_config::Config::new()
         .atleast_version("1.0")
-        .statik(std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos"))
         .cargo_metadata(false)
         .probe("libavif")
         .expect("libavif >= 1.0 is required; install libavif-dev or libavif");
@@ -24,7 +23,6 @@ fn main() {
     // Emit libavif after the static bridge so linkers using --as-needed retain it.
     pkg_config::Config::new()
         .atleast_version("1.0")
-        .statik(std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos"))
         .probe("libavif")
         .expect("libavif disappeared between configure and link");
 }
