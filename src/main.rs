@@ -39,7 +39,6 @@ use gpui_component::table::{Column as TableCol, ColumnSort, DataTable, TableDele
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Disableable, IconName, Root, Selectable, Sizable};
 use gpui_platform::application;
-use image::ImageFormat;
 use scan::{Entry, format_bytes, format_name};
 
 // Colours come from `cx.theme()` rather than a private palette. The window is
@@ -214,17 +213,6 @@ fn density_colour(density: f32, cx: &App) -> gpui::Hsla {
     }
 }
 
-/// Modern formats are the destination, JPEG is a reasonable place to be, and the
-/// rest are the reason this app exists. Colouring the column turns it from a label
-/// into the finding the audit is actually making.
-fn format_colour(format: ImageFormat, cx: &App) -> gpui::Hsla {
-    match format {
-        ImageFormat::WebP | ImageFormat::Avif => cx.theme().green,
-        ImageFormat::Jpeg => cx.theme().blue,
-        _ => cx.theme().yellow,
-    }
-}
-
 /// A label for the comparison view, which floats over the picture rather than over
 /// a theme surface, so it carries its own dark backing.
 fn compare_chip(text: impl Into<gpui::SharedString>, colour: gpui::Hsla, _cx: &App) -> gpui::Div {
@@ -264,21 +252,13 @@ fn meter(
 
 /// One option in a segmented control.
 ///
-/// The variant is set per option rather than on the group, because a group applies
-/// its own variant to every child — and an outlined group draws the selected child
-/// in the *active* style, which on a near-black theme is the same colour as the
-/// unselected ones. Which option was chosen has to be legible.
 fn segment(
     id: impl Into<gpui::ElementId>,
     label: impl Into<gpui::SharedString>,
     selected: bool,
 ) -> Button {
-    let button = Button::new(id).label(label).selected(selected);
-    if selected {
-        button.primary()
-    } else {
-        button.outline()
-    }
+    // The group's neutral selected state keeps `primary` for the conversion commit.
+    Button::new(id).label(label).selected(selected)
 }
 
 struct Audit {
@@ -1058,7 +1038,6 @@ impl Audit {
             .gap_2()
             .p_2()
             .rounded_lg()
-            .cursor_pointer()
             .bg(cx.theme().secondary)
             // Always bordered, in nothing, so arrowing onto a tile does not shunt
             // its contents a pixel down and right.
@@ -1132,8 +1111,13 @@ impl Audit {
                                 .bg(cx.theme().background.opacity(0.8))
                                 .text_size(px(10.))
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(format_colour(entry.format, cx))
-                                .child(format_name(entry.format)),
+                                .text_color(if entry.extension_lies() {
+                                    cx.theme().yellow
+                                } else {
+                                    cx.theme().muted_foreground
+                                })
+                                .child(format_name(entry.format))
+                                .when(entry.extension_lies(), |label| label.child(" ≠")),
                         ),
                     )
                     // The same word the table's Sirv column uses. The gallery used to
@@ -2901,13 +2885,24 @@ impl Audit {
 
     /// The three knobs that decide what a conversion produces, each under its own
     /// name and drawn as one control rather than a run of loose buttons.
-    fn controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn controls(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let lossless = self.quality == Quality::LOSSLESS;
+        let heavy = self
+            .entries
+            .iter()
+            .filter(|entry| Finding::Heavy.holds(entry))
+            .count();
+        // Below this width the audit controls and conversion settings are two
+        // intentional bands. Letting one long flex row break wherever it ran out of
+        // room left Quality orphaned on a line of its own at the default window size.
+        let stacked = f32::from(window.viewport_size().width) < 1060.;
+
         div()
             .flex()
             .flex_wrap()
-            .items_center()
-            .gap_3()
+            .when(stacked, |strip| strip.flex_col().items_start())
+            .when(!stacked, |strip| strip.items_center())
+            .gap_2()
             .px_3()
             .py_2()
             .border_b_1()
@@ -2915,106 +2910,105 @@ impl Audit {
             // What the list shows, then what a conversion would do: the reading
             // order of the strip follows the order you use it.
             .child(
-                div().w(px(150.)).flex_shrink_0().child(
-                    Input::new(&self.filter_input)
-                        .small()
-                        .cleanable(true)
-                        .disabled(self.converting)
-                        .prefix(IconName::Search),
-                ),
-            )
-            // The audit colours every row by weight per pixel and then asks you to find
-            // the heavy ones yourself. Counted here rather than cached: it is a
-            // multiply and a compare per row, unlike the allocating `extension_lies`.
-            .children({
-                let heavy = self
-                    .entries
-                    .iter()
-                    .filter(|entry| Finding::Heavy.holds(entry))
-                    .count();
-                (heavy > 0).then(|| {
-                    self.finding_button(
-                        Finding::Heavy,
-                        IconName::TriangleAlert,
-                        format!("{heavy} heavy"),
-                        cx,
-                    )
-                })
-            })
-            .child(
-                div()
-                    .w(px(1.))
-                    .h(px(24.))
-                    .flex_shrink_0()
-                    .bg(cx.theme().border),
-            )
-            .child(self.control_group("Resize", self.resize_group(cx), cx))
-            .child(self.control_group("Format", self.format_group(cx), cx))
-            .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
                     .flex_shrink_0()
                     .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(cx.theme().muted_foreground)
-                            .whitespace_nowrap()
-                            .child("Quality"),
+                        div().w(px(150.)).flex_shrink_0().child(
+                            Input::new(&self.filter_input)
+                                .small()
+                                .cleanable(true)
+                                .disabled(self.converting)
+                                .prefix(IconName::Search),
+                        ),
                     )
+                    // The audit colours every row by weight per pixel and then asks
+                    // you to find the heavy ones yourself.
+                    .children((heavy > 0).then(|| {
+                        self.finding_button(
+                            Finding::Heavy,
+                            IconName::TriangleAlert,
+                            format!("{heavy} heavy"),
+                            cx,
+                        )
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_3()
+                    .child(self.control_group("Resize", self.resize_group(cx), cx))
+                    .child(self.control_group("Format", self.format_group(cx), cx))
                     .child(
                         div()
-                            .w(px(110.))
-                            .debug_selector(|| "quality-control".to_string())
-                            .when(self.converting, |rail| {
-                                rail.child(
-                                    Progress::new("quality-locked")
-                                        .value(self.quality.0.unwrap_or(100.))
-                                        .color(cx.theme().primary)
-                                        .h(px(6.)),
-                                )
-                            })
-                            .when(!self.converting, |slider| {
-                                slider.child(Slider::new(&self.quality_slider).horizontal())
-                            }),
-                    )
-                    .child(
-                        div()
-                            .w(px(26.))
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_size(px(12.))
-                            .whitespace_nowrap()
-                            .text_color(if lossless {
-                                cx.theme().muted_foreground
-                            } else {
-                                cx.theme().foreground
-                            })
-                            .child(match self.quality.0 {
-                                Some(value) => format!("{}", value.round() as u32),
-                                None => "—".to_string(),
-                            }),
-                    )
-                    .child(
-                        Switch::new("lossless")
-                            .checked(lossless)
-                            .label("Lossless")
-                            .disabled(self.converting)
-                            .on_click(cx.listener(|audit, _, _, cx| {
-                                if audit.converting {
-                                    return;
-                                }
-                                // A second click on a lit toggle has to turn it off,
-                                // or lossless is a one-way door.
-                                audit.quality = if audit.quality == Quality::LOSSLESS {
-                                    Quality::lossy(audit.slider_quality)
-                                } else {
-                                    Quality::LOSSLESS
-                                };
-                                audit.results.clear();
-                                audit.schedule_estimate(cx);
-                                cx.notify();
-                            })),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_shrink_0()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .whitespace_nowrap()
+                                    .child("Quality"),
+                            )
+                            .child(
+                                div()
+                                    .w(px(110.))
+                                    .debug_selector(|| "quality-control".to_string())
+                                    .when(self.converting, |rail| {
+                                        rail.child(
+                                            Progress::new("quality-locked")
+                                                .value(self.quality.0.unwrap_or(100.))
+                                                .color(cx.theme().primary)
+                                                .h(px(6.)),
+                                        )
+                                    })
+                                    .when(!self.converting, |slider| {
+                                        slider.child(Slider::new(&self.quality_slider).horizontal())
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(26.))
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_size(px(12.))
+                                    .whitespace_nowrap()
+                                    .text_color(if lossless {
+                                        cx.theme().muted_foreground
+                                    } else {
+                                        cx.theme().foreground
+                                    })
+                                    .child(match self.quality.0 {
+                                        Some(value) => format!("{}", value.round() as u32),
+                                        None => "—".to_string(),
+                                    }),
+                            )
+                            .child(
+                                Switch::new("lossless")
+                                    .checked(lossless)
+                                    .label("Lossless")
+                                    .disabled(self.converting)
+                                    .on_click(cx.listener(|audit, _, _, cx| {
+                                        if audit.converting {
+                                            return;
+                                        }
+                                        // A second click on a lit toggle has to turn it off,
+                                        // or lossless is a one-way door.
+                                        audit.quality = if audit.quality == Quality::LOSSLESS {
+                                            Quality::lossy(audit.slider_quality)
+                                        } else {
+                                            Quality::LOSSLESS
+                                        };
+                                        audit.results.clear();
+                                        audit.schedule_estimate(cx);
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
     }
@@ -3837,7 +3831,7 @@ impl TableDelegate for AuditTable {
                     .text_color(if lies {
                         cx.theme().yellow
                     } else {
-                        format_colour(entry.format, cx)
+                        cx.theme().muted_foreground
                     })
                     .child(format_name(entry.format))
                     // The extension disagrees with the bytes. The mark is small
@@ -4358,7 +4352,7 @@ impl Render for Audit {
                 }
             }))
             .child(self.header(count, cx))
-            .child(self.controls(cx))
+            .child(self.controls(window, cx))
             .children(self.notices(cx))
             .child(
                 // The list runs to the window edge; hairlines above it, not a
