@@ -98,6 +98,15 @@ jobs:
       - name: Build signed installer
         run: cargo packager --release --formats "${{ matrix.formats }}" --out-dir dist
 
+      - name: Give macOS updates unique names
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          update="$(find dist -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          update="${update%.dmg}.app.tar.gz"
+          mv dist/ImageGuide.app.tar.gz "$update"
+          mv dist/ImageGuide.app.tar.gz.sig "$update.sig"
+
       - name: Reject Homebrew-linked macOS binaries
         if: runner.os == 'macOS'
         run: |
