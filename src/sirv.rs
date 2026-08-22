@@ -15,8 +15,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const API: &str = "https://api.sirv.com";
-/// The AI Studio platform, a separate service with its own key material.
-const STUDIO_API: &str = "https://www.sirv.studio";
 /// Tokens live 20 minutes on the server. Refresh a minute early so an upload
 /// started at minute 19 does not die mid-flight.
 const TOKEN_MARGIN: Duration = Duration::from_secs(60);
@@ -28,9 +26,6 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
 pub struct Credentials {
     pub client_id: String,
     pub client_secret: String,
-    /// The AI Studio API key, minted by exchanging the CDN credentials. Absent
-    /// until the user connects Studio.
-    pub studio_key: Option<String>,
 }
 
 /// A hard cap on one transfer, so a confused server cannot grow memory forever.
@@ -38,17 +33,6 @@ const MAX_TRANSFER: u64 = 512 * 1024 * 1024;
 /// A walk that finds more files than this is treated as an error rather than
 /// listed forever.
 const WALK_LIMIT: usize = 20_000;
-/// What Studio reports about the account behind an API key.
-#[derive(Clone, Debug, Deserialize)]
-pub struct StudioIdentity {
-    #[serde(default)]
-    pub api_key: String,
-    #[serde(default)]
-    pub credits: u64,
-    #[serde(default)]
-    pub tier: String,
-}
-
 /// One entry as Sirv reports it from readdir. Unknown fields are ignored, so a
 /// server-side addition never breaks the parse.
 #[derive(Clone, Debug, Deserialize)]
@@ -437,78 +421,6 @@ impl Client {
             }
         })
     }
-
-    /// The account alias this credential pair belongs to (`myaccount` for
-    /// `myaccount.sirv.com`). Studio's exchange wants it; making a human type
-    /// it was wrong, because the API hands it back for free.
-    pub fn account_alias(&mut self) -> Result<String, Error> {
-        #[derive(Deserialize)]
-        struct Account {
-            #[serde(default)]
-            alias: String,
-        }
-        let account: Account = self.authenticated(|client| {
-            let authorization = client.bearer()?;
-            let response = client
-                .agent
-                .get(&format!("{API}/v2/account"))
-                .set("Authorization", &authorization)
-                .call()
-                .map_err(|error| match error {
-                    ureq::Error::Status(status, _) => Error {
-                        status,
-                        message: "account rejected".into(),
-                    },
-                    other => sirv_error("account")(other),
-                })?;
-            response.into_json().map_err(|error| Error {
-                status: 0,
-                message: format!("account body: {error}"),
-            })
-        })?;
-        Ok(account.alias)
-    }
-
-    /// Trade the CDN credentials for an AI Studio API key. The account alias
-    /// comes from the CDN API, not the user. Studio creates or links the
-    /// account behind `email`, which is why the email is required.
-    pub fn exchange_studio_key(&mut self, email: &str) -> Result<StudioIdentity, Error> {
-        let account_alias = self.account_alias()?;
-        let agent = ureq::AgentBuilder::new().timeout(TIMEOUT).build();
-        let response = agent
-            .post(&format!("{STUDIO_API}/api/auth/wordpress"))
-            .send_json(serde_json::json!({
-                "email": email,
-                "clientId": self.credentials.client_id,
-                "clientSecret": self.credentials.client_secret,
-                "accountAlias": account_alias,
-            }))
-            .map_err(sirv_error("studio connect"))?;
-        response.into_json().map_err(|error| Error {
-            status: 0,
-            message: format!("studio body: {error}"),
-        })
-    }
-
-    /// Confirm a stored key still works, and what it carries.
-    pub fn studio_me(api_key: &str) -> Result<StudioIdentity, Error> {
-        let agent = ureq::AgentBuilder::new().timeout(TIMEOUT).build();
-        let response = agent
-            .get(&format!("{STUDIO_API}/api/zapier/me"))
-            .set("Authorization", &format!("Bearer {api_key}"))
-            .call()
-            .map_err(|error| match error {
-                ureq::Error::Status(status, _) => Error {
-                    status,
-                    message: "studio check rejected".into(),
-                },
-                other => sirv_error("studio check")(other),
-            })?;
-        response.into_json().map_err(|error| Error {
-            status: 0,
-            message: format!("studio body: {error}"),
-        })
-    }
 }
 
 fn sirv_error(stage: &'static str) -> impl Fn(ureq::Error) -> Error {
@@ -578,7 +490,6 @@ pub fn load_credentials_from(path: Option<&Path>) -> Option<Credentials> {
 fn parse_credentials(text: &str) -> Option<Credentials> {
     let mut client_id = None;
     let mut client_secret = None;
-    let mut studio_key = None;
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -586,14 +497,14 @@ fn parse_credentials(text: &str) -> Option<Credentials> {
         match key.trim() {
             "client_id" => client_id = Some(value.trim().to_string()),
             "client_secret" => client_secret = Some(value.trim().to_string()),
-            "studio_key" => studio_key = Some(value.trim().to_string()),
+            // `studio_key` may still sit in an older file. Ignored, and dropped on
+            // the next save: nothing ever read it but the panel that displayed it.
             _ => {}
         }
     }
     Some(Credentials {
         client_id: client_id?,
         client_secret: client_secret?,
-        studio_key,
     })
 }
 
@@ -624,14 +535,9 @@ fn write_credentials(path: &Path, credentials: &Credentials) -> Result<(), Strin
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let studio_line = credentials
-        .studio_key
-        .as_ref()
-        .map(|key| format!("studio_key={key}\n"))
-        .unwrap_or_default();
     let body = format!(
-        "client_id={}\nclient_secret={}\n{}",
-        credentials.client_id, credentials.client_secret, studio_line
+        "client_id={}\nclient_secret={}\n",
+        credentials.client_id, credentials.client_secret
     );
     std::fs::write(path, body).map_err(|error| error.to_string())?;
     owner_only(path);
@@ -725,21 +631,12 @@ mod tests {
         let credentials = Credentials {
             client_id: "an id with spaces".into(),
             client_secret: "s3cret/with:colons".into(),
-            studio_key: None,
         };
         write_credentials(&path, &credentials).expect("the store is writable");
         assert_eq!(
             load_credentials_from(Some(&path)),
             Some(credentials.clone())
         );
-
-        // A minted Studio key survives its credential file.
-        let linked = Credentials {
-            studio_key: Some("sk_live_abc".into()),
-            ..credentials.clone()
-        };
-        write_credentials(&path, &linked).expect("the store is writable");
-        assert_eq!(load_credentials_from(Some(&path)), Some(linked));
 
         // The file holds an API secret, so it must not be readable by anyone else on
         // the machine. The usual umask would have written it 0644.
@@ -771,7 +668,6 @@ mod tests {
         let credentials = Credentials {
             client_id: "id".into(),
             client_secret: "secret".into(),
-            studio_key: None,
         };
         save_credentials(&credentials).expect("a fresh temp directory is writable");
 

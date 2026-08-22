@@ -257,17 +257,6 @@ fn meter(
         .h(px(height))
 }
 
-/// The small caps word above a control group.
-fn group_label(text: &'static str, cx: &App) -> gpui::Div {
-    div()
-        .text_size(px(10.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(cx.theme().muted_foreground)
-        .whitespace_nowrap()
-        .flex_shrink_0()
-        .child(text.to_uppercase())
-}
-
 /// One option in a segmented control.
 ///
 /// The variant is set per option rather than on the group, because a group applies
@@ -506,19 +495,13 @@ struct SirvBrowser {
     focus: gpui::FocusHandle,
 }
 
-/// The settings overlay: CDN credentials, and the Studio link derived from
-/// them. Inputs are entities so the framework owns their editing state.
+/// The settings overlay: the CDN credentials, and nothing else. Inputs are entities
+/// so the framework owns their editing state.
 struct SettingsPanel {
     client_id: gpui::Entity<InputState>,
     client_secret: gpui::Entity<InputState>,
-    studio_email: gpui::Entity<InputState>,
     /// (ok?, message) per section.
     cdn_status: Option<(bool, String)>,
-    studio_status: Option<(bool, String)>,
-    /// Whether a Studio key is stored. Read when the panel opens and updated when
-    /// this panel changes it, rather than read from disk on every render: the panel
-    /// redraws on every keystroke, and the answer only changes here.
-    studio_connected: bool,
     /// Which form field holds focus, as an index into the field list.
     focus_ix: usize,
     /// The panel has taken focus already. Without this the next render put focus back
@@ -1375,7 +1358,6 @@ impl Audit {
                             sirv::Credentials {
                                 client_id: String::new(),
                                 client_secret: String::new(),
-                                studio_key: None,
                             },
                         ))),
                         path: "/".into(),
@@ -1588,18 +1570,14 @@ impl Audit {
         self.settings_panel = Some(SettingsPanel {
             client_id: make_input(stored.as_ref().map(|c| c.client_id.clone())),
             client_secret: make_input(stored.as_ref().map(|c| c.client_secret.clone())),
-            studio_email: make_input(None),
             cdn_status: None,
-            studio_status: None,
-            studio_connected: stored.as_ref().is_some_and(|c| c.studio_key.is_some()),
             focus_ix: 0,
             focused: false,
         });
         cx.notify();
     }
 
-    /// Store the CDN credentials. The Studio key, if one was minted earlier,
-    /// survives the save.
+    /// Store the CDN credentials.
     fn save_sirv_settings(&mut self, cx: &mut Context<Self>) {
         let Some(panel) = self.settings_panel.as_mut() else {
             return;
@@ -1611,114 +1589,18 @@ impl Audit {
             cx.notify();
             return;
         }
-        let studio_key = sirv::load_credentials().and_then(|creds| creds.studio_key);
         // Report what happened, not what was attempted. A read-only config directory
         // used to look exactly like success.
         panel.cdn_status = Some(
             match sirv::save_credentials(&sirv::Credentials {
                 client_id,
                 client_secret,
-                studio_key,
             }) {
                 Ok(()) => (true, "Saved.".into()),
                 Err(error) => (false, format!("Could not save: {error}")),
             },
         );
         cx.notify();
-    }
-
-    /// Exchange the stored CDN credentials for a Studio API key.
-    fn connect_studio(&mut self, cx: &mut Context<Self>) {
-        let Some(panel) = self.settings_panel.as_mut() else {
-            return;
-        };
-        let Some(credentials) = sirv::load_credentials() else {
-            panel.studio_status = Some((false, "Save the CDN keys first.".into()));
-            cx.notify();
-            return;
-        };
-        let email = panel.studio_email.read(cx).value().trim().to_string();
-        if email.is_empty() {
-            panel.studio_status = Some((false, "An email is required.".into()));
-            cx.notify();
-            return;
-        }
-        let mut client = sirv::Client::new(sirv::Credentials {
-            client_id: credentials.client_id.clone(),
-            client_secret: credentials.client_secret.clone(),
-            studio_key: None,
-        });
-        panel.studio_status = Some((true, "Connecting…".into()));
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { client.exchange_studio_key(&email) })
-                .await;
-            this.update(cx, |audit, cx| {
-                let Some(panel) = audit.settings_panel.as_mut() else {
-                    return;
-                };
-                match result {
-                    Ok(identity) => {
-                        let mut stored = sirv::load_credentials().unwrap_or(credentials);
-                        stored.studio_key = Some(identity.api_key);
-                        panel.studio_status = Some(match sirv::save_credentials(&stored) {
-                            // The key is minted either way, but a key that did not
-                            // reach disk is gone at the next launch, so say so.
-                            Ok(()) => {
-                                panel.studio_connected = true;
-                                (
-                                    true,
-                                    format!(
-                                        "Connected · {} · {} credits",
-                                        identity.tier, identity.credits
-                                    ),
-                                )
-                            }
-                            Err(error) => (false, format!("Connected, but not saved: {error}")),
-                        });
-                    }
-                    Err(error) => panel.studio_status = Some((false, error.to_string())),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Confirm the stored Studio key still works.
-    fn check_studio(&mut self, cx: &mut Context<Self>) {
-        let Some(panel) = self.settings_panel.as_mut() else {
-            return;
-        };
-        let Some(key) = sirv::load_credentials().and_then(|creds| creds.studio_key) else {
-            panel.studio_status = Some((false, "Not connected yet.".into()));
-            cx.notify();
-            return;
-        };
-        panel.studio_status = Some((true, "Checking…".into()));
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { sirv::Client::studio_me(&key) })
-                .await;
-            this.update(cx, |audit, cx| {
-                let Some(panel) = audit.settings_panel.as_mut() else {
-                    return;
-                };
-                panel.studio_status = Some(match result {
-                    Ok(identity) => (
-                        true,
-                        format!("{} · {} credits", identity.tier, identity.credits),
-                    ),
-                    Err(error) => (false, error.to_string()),
-                });
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// A transfer is already running. One at a time: the client serialises on
@@ -2441,18 +2323,17 @@ impl Audit {
         }
     }
 
-    /// The settings panel: CDN keys, and the Studio link minted from them.
+    /// The settings panel: the CDN keys.
     fn settings_panel_view(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(panel) = self.settings_panel.as_ref() else {
             return div().into_any_element();
         };
-        let connected = panel.studio_connected;
 
         div()
-            .w(px(520.))
+            .w(px(480.))
             .flex()
             .flex_col()
-            .gap_4()
+            .gap_3()
             .p_5()
             .rounded_lg()
             .bg(cx.theme().secondary)
@@ -2460,104 +2341,66 @@ impl Audit {
             .border_color(cx.theme().border)
             .child(
                 div()
-                    .font_family("SF Pro Display")
-                    .text_size(px(15.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().foreground)
-                    .child("Settings"),
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .font_family("SF Pro Display")
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().foreground)
+                            .child("Sirv account"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Credentials stay on this computer."),
+                    ),
             )
-            // ── CDN ──
+            .child(Self::settings_row(
+                "Client ID",
+                panel.client_id.clone(),
+                false,
+                cx,
+            ))
+            .child(Self::settings_row(
+                "Client secret",
+                panel.client_secret.clone(),
+                true,
+                cx,
+            ))
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(group_label("Sirv CDN account", cx))
-                    .child(Self::settings_row(
-                        "Client ID",
-                        panel.client_id.clone(),
-                        false,
-                        cx,
-                    ))
-                    .child(Self::settings_row(
-                        "Client secret",
-                        panel.client_secret.clone(),
-                        true,
-                        cx,
-                    ))
+                    .items_center()
+                    .justify_between()
+                    .child(Self::settings_status(panel.cdn_status.clone(), cx))
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(Self::settings_status(panel.cdn_status.clone(), cx))
+                            .gap_2()
+                            .child(
+                                Button::new("settings-close")
+                                    .ghost()
+                                    .small()
+                                    .label("Close")
+                                    .on_click(cx.listener(|audit, _, _, cx| {
+                                        audit.settings_panel = None;
+                                        cx.notify();
+                                    })),
+                            )
                             .child(
                                 Button::new("settings-save")
                                     .primary()
                                     .small()
-                                    .label("Save")
+                                    .label("Save credentials")
                                     .on_click(
                                         cx.listener(|audit, _, _, cx| audit.save_sirv_settings(cx)),
                                     ),
                             ),
                     ),
-            )
-            // ── Studio ──
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(group_label("Sirv AI Studio", cx))
-                    .child(Self::settings_row(
-                        "Account email",
-                        panel.studio_email.clone(),
-                        false,
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(Self::settings_status(panel.studio_status.clone(), cx))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new("settings-studio-check")
-                                            .ghost()
-                                            .small()
-                                            .label(if connected { "Check" } else { "Not linked" })
-                                            .disabled(!connected)
-                                            .on_click(cx.listener(|audit, _, _, cx| {
-                                                audit.check_studio(cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("settings-studio-connect")
-                                            .primary()
-                                            .small()
-                                            .label(if connected { "Reconnect" } else { "Connect" })
-                                            .on_click(cx.listener(|audit, _, _, cx| {
-                                                audit.connect_studio(cx)
-                                            })),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(
-                div().flex().justify_end().child(
-                    Button::new("settings-close")
-                        .ghost()
-                        .small()
-                        .label("Close")
-                        .on_click(cx.listener(|audit, _, _, cx| {
-                            audit.settings_panel = None;
-                            cx.notify();
-                        })),
-                ),
             )
             .into_any_element()
     }
@@ -4295,7 +4138,7 @@ impl Render for Audit {
                                 cx.notify();
                             }
                             "tab" => {
-                                const FIELDS: usize = 3;
+                                const FIELDS: usize = 2;
                                 let direction = if event.keystroke.modifiers.shift {
                                     FIELDS - 1
                                 } else {
@@ -4306,7 +4149,6 @@ impl Render for Audit {
                                     let handle = [
                                         panel.client_id.read(cx).focus_handle(cx),
                                         panel.client_secret.read(cx).focus_handle(cx),
-                                        panel.studio_email.read(cx).focus_handle(cx),
                                     ][panel.focus_ix]
                                         .clone();
                                     window.focus(&handle, cx);
