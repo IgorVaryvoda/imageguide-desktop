@@ -575,14 +575,27 @@ pub fn save_credentials_at(base: impl AsRef<Path>, credentials: &Credentials) {
         .as_ref()
         .map(|key| format!("studio_key={key}\n"))
         .unwrap_or_default();
-    let _ = std::fs::write(
-        path,
-        format!(
-            "client_id={}\nclient_secret={}\n{}",
-            credentials.client_id, credentials.client_secret, studio_line
-        ),
+    let body = format!(
+        "client_id={}\nclient_secret={}\n{}",
+        credentials.client_id, credentials.client_secret, studio_line
     );
+    if std::fs::write(&path, body).is_ok() {
+        owner_only(&path);
+    }
 }
+
+/// Take the group and world bits off a file. An API secret written under the usual
+/// umask is 0644, which every other account on the machine can read.
+#[cfg(unix)]
+fn owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+/// Windows and macOS keep their own defaults. Windows has no mode bits, and a macOS
+/// home directory is already private to its owner.
+#[cfg(not(unix))]
+fn owner_only(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -673,6 +686,15 @@ mod tests {
         };
         save_credentials_at(&base, &linked);
         assert_eq!(load_credentials_from(Some(&path)), Some(linked));
+
+        // The file holds an API secret, so it must not be readable by anyone else on
+        // the machine. The usual umask would have written it 0644.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "group or world can read {path:?}");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

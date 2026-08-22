@@ -312,8 +312,11 @@ struct Audit {
     /// Names of files a conversion could not read or write. Kept rather than counted,
     /// because "3 failed" without saying which is not a report.
     failures: Vec<String>,
-    /// Files in the folder that claim to be images and will not decode.
-    unreadable: usize,
+    /// Files in the folder that claim to be images and will not decode, by name. A
+    /// count alone says a folder has a problem and gives you nowhere to look.
+    unreadable: Vec<PathBuf>,
+    /// Files already sitting in the output folder when this one was scanned.
+    existing_output: usize,
     /// A drag is hovering over the window.
     drag_over: bool,
     /// The open side-by-side view, if any.
@@ -338,6 +341,9 @@ struct Audit {
     visible: Vec<usize>,
     /// Substring the name must contain, lowercased. Empty shows everything.
     filter: String,
+    /// The finding the list is narrowed to, if any. Sits alongside the name filter
+    /// rather than replacing it, so you can search within one.
+    finding: Option<Finding>,
     /// Backs the filter box.
     filter_input: gpui::Entity<InputState>,
     /// Row the keyboard is on, as a position in `visible`.
@@ -588,6 +594,15 @@ impl Audit {
             .into_iter()
             .filter_map(|index| Some((index, self.entries.get(index)?.path.clone())))
             .collect();
+        // Two sources can want one output name, so the whole run picks its names
+        // together before any of it writes.
+        let paths: Vec<PathBuf> = sources.iter().map(|(_, path)| path.clone()).collect();
+        let planned = convert::plan_outputs(&root, &paths, &out_dir, format);
+        let sources: Vec<(usize, PathBuf, PathBuf)> = sources
+            .into_iter()
+            .zip(planned)
+            .map(|((index, source), written)| (index, source, written))
+            .collect();
 
         cx.spawn(async move |this, cx| {
             // A sliding window rather than batches. Batching waited for all eight of a
@@ -601,17 +616,14 @@ impl Audit {
 
             loop {
                 while inflight.len() < workers {
-                    let Some((index, path)) = queued.next() else {
+                    let Some((index, source, written)) = queued.next() else {
                         break;
                     };
-                    let (index, path) = (*index, path.clone());
-                    let (root, out_dir) = (root.clone(), out_dir.clone());
+                    let (index, source, written) = (*index, source.clone(), written.clone());
                     inflight.push_back(cx.background_executor().spawn(async move {
                         (
                             index,
-                            convert::convert_file(
-                                &root, &path, &out_dir, format, quality, max_edge,
-                            ),
+                            convert::convert_to(&source, &written, format, quality, max_edge),
                         )
                     }));
                 }
@@ -664,11 +676,13 @@ impl Audit {
     /// a file keeps its thumbnail, its tick and its result through any re-ordering.
     fn refresh_visible(&mut self) {
         let needle = self.filter.to_lowercase();
+        let finding = self.finding;
         let mut visible: Vec<usize> = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| needle.is_empty() || entry.name().to_lowercase().contains(&needle))
+            .filter(|(_, entry)| finding.is_none_or(|finding| finding.holds(entry)))
             .map(|(index, _)| index)
             .collect();
 
@@ -711,6 +725,18 @@ impl Audit {
             return;
         }
         self.filter = filter;
+        self.refresh_visible();
+        self.schedule_estimate(cx);
+        cx.notify();
+    }
+
+    /// Narrow the list to one finding, or widen it again if that finding already holds.
+    /// A second click on a lit control has to turn it off, the way Lossless does.
+    fn set_finding(&mut self, finding: Finding, cx: &mut Context<Self>) {
+        if self.converting {
+            return;
+        }
+        self.finding = (self.finding != Some(finding)).then_some(finding);
         self.refresh_visible();
         self.schedule_estimate(cx);
         cx.notify();
@@ -1120,6 +1146,7 @@ impl Audit {
             .scroll_to_item_strict(0, ScrollStrategy::Top);
         self.skipped_raw = scanned.skipped_raw;
         self.unreadable = scanned.unreadable;
+        self.existing_output = scanned.existing_output;
         self.thumbs.clear();
         self.thumb_order.clear();
         self.requested.clear();
@@ -1129,6 +1156,9 @@ impl Audit {
         self.compare = None;
         self.cached = None;
         self.filter.clear();
+        // A finding belongs to the folder it was found in. Carrying it over would show
+        // the new folder narrowed to something nobody asked about.
+        self.finding = None;
         self.filter_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
@@ -1175,7 +1205,8 @@ impl Audit {
                             scan::Scan {
                                 entries: vec![entry],
                                 skipped_raw: 0,
-                                unreadable: 0,
+                                unreadable: Vec::new(),
+                                existing_output: 0,
                             },
                             root,
                             true,
@@ -2878,6 +2909,24 @@ impl Audit {
                         .prefix(IconName::Search),
                 ),
             )
+            // The audit colours every row by weight per pixel and then asks you to find
+            // the heavy ones yourself. Counted here rather than cached: it is a
+            // multiply and a compare per row, unlike the allocating `extension_lies`.
+            .children({
+                let heavy = self
+                    .entries
+                    .iter()
+                    .filter(|entry| Finding::Heavy.holds(entry))
+                    .count();
+                (heavy > 0).then(|| {
+                    self.finding_button(
+                        Finding::Heavy,
+                        IconName::TriangleAlert,
+                        format!("{heavy} heavy"),
+                        cx,
+                    )
+                })
+            })
             .child(
                 div()
                     .w(px(1.))
@@ -3169,31 +3218,27 @@ impl Audit {
     }
 
     /// Everything the scan could not take at face value, in one line rather than
-    /// three scattered ones.
-    fn notices(&self) -> Option<gpui::AnyElement> {
+    /// three scattered ones. The mislabelled count is a button: it is the audit's best
+    /// finding, and a number you cannot act on is a dead end.
+    fn notices(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let mut parts = Vec::new();
-        if self.mislabelled > 0 {
-            parts.push(match self.mislabelled {
-                1 => "1 file is not the format its extension claims".to_string(),
-                many => format!("{many} files are not the format their extension claims"),
-            });
+        if !self.unreadable.is_empty() {
+            parts.push(format!(
+                "would not decode: {}",
+                named(self.unreadable.iter().filter_map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                }))
+            ));
         }
-        if self.unreadable > 0 {
-            parts.push(format!("{} would not decode", self.unreadable));
+        if self.existing_output > 0 {
+            parts.push(match self.existing_output {
+                1 => format!("{}/ already holds 1 file", scan::OUTPUT_DIR),
+                many => format!("{}/ already holds {many} files", scan::OUTPUT_DIR),
+            });
         }
         if !self.failures.is_empty() {
-            // Name a few. A bare count is not a report.
-            let named: Vec<&str> = self
-                .failures
-                .iter()
-                .take(3)
-                .map(|name| name.as_str())
-                .collect();
-            let rest = self.failures.len().saturating_sub(named.len());
-            parts.push(match rest {
-                0 => format!("failed: {}", named.join(", ")),
-                rest => format!("failed: {} and {rest} more", named.join(", ")),
-            });
+            parts.push(format!("failed: {}", named(self.failures.iter().cloned())));
         }
         if let Some(job) = &self.sirv_job {
             let verb = match job.kind {
@@ -3216,18 +3261,58 @@ impl Audit {
             };
             parts.push(format!("{verb}: {} of {}{failures}", job.done, job.total));
         }
-        if parts.is_empty() {
+        if parts.is_empty() && self.mislabelled == 0 {
             return None;
         }
 
         // Left-aligned and only as wide as its text. A full-bleed box for six words
         // was a bigger shape on screen than the finding it was reporting.
         Some(
-            Alert::warning("notices", parts.join("  ·  "))
-                .icon(IconName::TriangleAlert)
-                .py_1()
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .children((self.mislabelled > 0).then(|| {
+                    self.finding_button(
+                        Finding::Mislabelled,
+                        IconName::TriangleAlert,
+                        match self.mislabelled {
+                            1 => "1 file is not the format its extension claims".to_string(),
+                            many => {
+                                format!("{many} files are not the format their extension claims")
+                            }
+                        },
+                        cx,
+                    )
+                }))
+                .children((!parts.is_empty()).then(|| {
+                    Alert::warning("notices", parts.join("  ·  "))
+                        .icon(IconName::TriangleAlert)
+                        .py_1()
+                }))
                 .into_any_element(),
         )
+    }
+
+    /// A finding shown as the control that narrows the list to it. Lit while it is the
+    /// one in force, so the count and the list below it never disagree.
+    fn finding_button(
+        &self,
+        finding: Finding,
+        icon: IconName,
+        label: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.finding == Some(finding);
+        Button::new(("finding", finding as usize))
+            .small()
+            .icon(icon)
+            .label(label)
+            .selected(active)
+            .when(!active, |button| button.ghost())
+            .when(active, |button| button.warning())
+            .on_click(cx.listener(move |audit, _, _, cx| audit.set_finding(finding, cx)))
     }
 
     /// Kick off decoding for a row, unless it is already loaded or in flight.
@@ -3270,6 +3355,40 @@ impl Audit {
             self.thumbs.remove(&oldest);
             self.requested.remove(&oldest);
         }
+    }
+}
+
+/// What the audit found, as something the list can be narrowed to.
+///
+/// The window used to state these as numbers and stop there. A folder of 5,739 images
+/// saying "5 files are not the format their extension claims" is a finding you cannot
+/// reach: the whole point of an audit is to end up looking at those five.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Finding {
+    /// The extension disagrees with the bytes inside the file.
+    Mislabelled,
+    /// More bytes per pixel than a photograph needs. These are the files a conversion
+    /// is actually for.
+    Heavy,
+}
+
+impl Finding {
+    fn holds(self, entry: &Entry) -> bool {
+        match self {
+            Finding::Mislabelled => entry.extension_lies(),
+            Finding::Heavy => entry.bytes_per_pixel() > DENSITY_HEAVY,
+        }
+    }
+}
+
+/// A few names and then a count, rather than a count alone. Used wherever the window
+/// reports a set of files it could not handle.
+fn named(names: impl Iterator<Item = String>) -> String {
+    let all: Vec<String> = names.collect();
+    let shown = all.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    match all.len().saturating_sub(3) {
+        0 => shown,
+        rest => format!("{shown} and {rest} more"),
     }
 }
 
@@ -4208,7 +4327,7 @@ impl Render for Audit {
             }))
             .child(self.header(count, cx))
             .child(self.controls(cx))
-            .children(self.notices())
+            .children(self.notices(cx))
             .child(
                 // The list runs to the window edge; hairlines above it, not a
                 // card floating in padding.
@@ -4437,7 +4556,8 @@ fn main() {
             root: PathBuf::new(),
             entries: Vec::new(),
             skipped_raw: 0,
-            unreadable: 0,
+            unreadable: Vec::new(),
+            existing_output: 0,
             open_single: false,
             format: args.format,
             quality: args.quality,
@@ -4463,7 +4583,8 @@ fn main() {
             scan::Scan {
                 entries: vec![entry],
                 skipped_raw: 0,
-                unreadable: 0,
+                unreadable: Vec::new(),
+                existing_output: 0,
             },
             parent,
         )
@@ -4488,6 +4609,7 @@ fn main() {
         entries,
         skipped_raw: scanned.skipped_raw,
         unreadable: scanned.unreadable,
+        existing_output: scanned.existing_output,
         open_single,
         format: args.format,
         quality: args.quality,
@@ -4504,6 +4626,7 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
         entries,
         skipped_raw,
         unreadable,
+        existing_output,
         open_single,
         format,
         quality,
@@ -4579,6 +4702,7 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
             },
             visible: Vec::new(),
             filter: String::new(),
+            finding: None,
             filter_input,
             cursor: 0,
             anchor: 0,
@@ -4601,6 +4725,7 @@ fn build_audit(launch: Launch, window: &mut Window, cx: &mut App) -> gpui::Entit
             active_target_count: None,
             failures: Vec::new(),
             unreadable,
+            existing_output,
             drag_over: false,
             sirv_pairing: None,
             sirv_counts: None,
@@ -4704,7 +4829,8 @@ struct Launch {
     root: PathBuf,
     entries: Vec<Entry>,
     skipped_raw: usize,
-    unreadable: usize,
+    unreadable: Vec<PathBuf>,
+    existing_output: usize,
     open_single: bool,
     format: Format,
     quality: Quality,
@@ -4719,6 +4845,12 @@ fn run_window(launch: Launch) {
         .with_assets(gpui_component_assets::Assets)
         .run(move |cx: &mut App| {
             init_theme(cx);
+
+            // The thumbnail cache grows with every folder ever opened. Bound it once,
+            // here, where a whole-directory pass costs a thread nobody waits for.
+            cx.background_executor()
+                .spawn(async { thumbs::trim_cache() })
+                .detach();
 
             let remembered = settings::load();
             let (width, height) = restored_window_size(remembered.width, remembered.height);
@@ -4801,6 +4933,7 @@ mod screenshot {
                         entries: scanned.entries,
                         skipped_raw: scanned.skipped_raw,
                         unreadable: scanned.unreadable,
+                        existing_output: scanned.existing_output,
                         open_single: mode == "compare",
                         format: Format::WebP,
                         quality: Quality::lossy(80.),
@@ -4937,6 +5070,114 @@ mod tests {
         entries.sort_by(|a, b| compare_entries(a, b, sort));
     }
 
+    /// Names before counts, wherever the window reports a set of files it could not
+    /// handle. "3 would not decode" gives you nowhere to look.
+    #[test]
+    fn a_report_names_a_few_files_and_then_counts_the_rest() {
+        let of = |names: &[&str]| named(names.iter().map(|name| name.to_string()));
+        assert_eq!(of(&[]), "");
+        assert_eq!(of(&["a.png"]), "a.png");
+        assert_eq!(of(&["a.png", "b.png", "c.png"]), "a.png, b.png, c.png");
+        assert_eq!(
+            of(&["a.png", "b.png", "c.png", "d.png", "e.png"]),
+            "a.png, b.png, c.png and 2 more"
+        );
+    }
+
+    /// The audit's findings have to be reachable. Narrowing to one shows those rows and
+    /// nothing else, and asking for the same one again widens the list back out.
+    #[gpui::test]
+    fn a_finding_narrows_the_list_and_a_second_click_widens_it(cx: &mut TestAppContext) {
+        let (audit, cx) = finding_audit(cx);
+        let shown = |audit: &Audit| -> Vec<String> {
+            audit
+                .visible
+                .iter()
+                .filter_map(|index| audit.entries.get(*index))
+                .map(|entry| entry.name())
+                .collect()
+        };
+
+        audit.update(cx, |audit, cx| {
+            assert_eq!(audit.visible.len(), 3, "everything, to begin with");
+
+            audit.set_finding(Finding::Mislabelled, cx);
+            assert_eq!(
+                shown(audit),
+                ["liar.webp"],
+                "only the file whose extension disagrees with its bytes"
+            );
+
+            audit.set_finding(Finding::Heavy, cx);
+            assert_eq!(
+                shown(audit),
+                ["screenshot.png"],
+                "one finding at a time, and heavy means bytes per pixel"
+            );
+
+            audit.set_finding(Finding::Heavy, cx);
+            assert_eq!(audit.visible.len(), 3, "asking again puts the list back");
+        });
+    }
+
+    /// A finding belongs to the folder it was found in.
+    #[gpui::test]
+    fn opening_another_folder_clears_the_finding(cx: &mut TestAppContext) {
+        let (audit, cx) = finding_audit(cx);
+        audit.update(cx, |audit, cx| audit.set_finding(Finding::Heavy, cx));
+
+        cx.update(|window, cx| {
+            audit.update(cx, |audit, cx| {
+                audit.install_dataset(
+                    scan::Scan {
+                        entries: vec![entry("new.png", 10, 10, 100, ImageFormat::Png)],
+                        skipped_raw: 0,
+                        unreadable: Vec::new(),
+                        existing_output: 0,
+                    },
+                    PathBuf::from("/elsewhere"),
+                    false,
+                    window,
+                    cx,
+                );
+            });
+        });
+
+        audit.read_with(cx, |audit, _| {
+            assert_eq!(audit.finding, None);
+            assert_eq!(audit.visible.len(), 1);
+        });
+    }
+
+    fn finding_audit(
+        cx: &mut TestAppContext,
+    ) -> (gpui::Entity<Audit>, &mut gpui::VisualTestContext) {
+        cx.update(init_theme);
+        // A PNG named `.webp` is the mislabelled one. The screenshot is 30 bytes per
+        // pixel; the photo is a tenth of one.
+        let launch = Launch {
+            root: PathBuf::new(),
+            entries: vec![
+                entry("photo.jpg", 1000, 1000, 100_000, ImageFormat::Jpeg),
+                entry("screenshot.png", 100, 100, 300_000, ImageFormat::Png),
+                entry("liar.webp", 100, 100, 1_000, ImageFormat::Png),
+            ],
+            skipped_raw: 0,
+            unreadable: Vec::new(),
+            existing_output: 0,
+            open_single: false,
+            format: Format::WebP,
+            quality: Quality::lossy(80.),
+            max_edge: MaxEdge::FULL,
+            grid: false,
+        };
+        let (harness, cx) = cx.add_window_view(move |window, cx| AuditHarness {
+            audit: build_audit(launch, window, cx),
+        });
+        let audit = harness.read_with(cx, |harness, _| harness.audit.clone());
+        (audit, cx)
+    }
+
     fn pointer_checkbox_audit(
         grid: bool,
         cx: &mut TestAppContext,
@@ -4949,7 +5190,8 @@ mod tests {
                 entry("second.png", 10, 10, 200, ImageFormat::Png),
             ],
             skipped_raw: 0,
-            unreadable: 0,
+            unreadable: Vec::new(),
+            existing_output: 0,
             open_single: false,
             format: Format::WebP,
             quality: Quality::lossy(80.),
@@ -5198,7 +5440,8 @@ mod tests {
                     root: PathBuf::new(),
                     entries,
                     skipped_raw: 0,
-                    unreadable: 0,
+                    unreadable: Vec::new(),
+                    existing_output: 0,
                     open_single: false,
                     format: Format::WebP,
                     quality: Quality::lossy(80.),
@@ -5298,7 +5541,8 @@ mod tests {
                     root: PathBuf::new(),
                     entries: Vec::new(),
                     skipped_raw: 0,
-                    unreadable: 0,
+                    unreadable: Vec::new(),
+                    existing_output: 0,
                     open_single: false,
                     format: Format::WebP,
                     quality: Quality::lossy(80.),

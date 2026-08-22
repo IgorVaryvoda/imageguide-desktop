@@ -30,11 +30,22 @@ pub const OUTPUT_DIR: &str = "optimized";
 pub struct Scan {
     pub entries: Vec<Entry>,
     /// Camera raw files left out of the list, so the total is not silently short.
+    /// A count, not names: raw is excluded by design and a photographer knows they
+    /// have it. Nothing in the window would act on the list.
     pub skipped_raw: usize,
-    /// Files that look like images by extension but would not decode. Counted rather
-    /// than dropped in silence, because a folder that reports fewer files than it
-    /// holds is a bug report waiting to happen.
-    pub unreadable: usize,
+    /// Files that look like images by extension but would not decode. Named, not
+    /// counted: "3 would not decode" tells you a folder has a problem and gives you
+    /// nowhere to look for it.
+    pub unreadable: Vec<PathBuf>,
+    /// Files already sitting in this root's own `OUTPUT_DIR`. The walk steps over them
+    /// anyway, so counting them is free, and a second run is otherwise silent about
+    /// what it is about to write over.
+    ///
+    /// Only this root's output folder counts. The walk skips every path with an
+    /// `optimized` component in it, wherever it sits, but a run rooted at `~/Pictures`
+    /// would not touch `~/Pictures/Screenshots/optimized`, so warning about it would
+    /// name the wrong 5,415 files.
+    pub existing_output: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +132,8 @@ pub fn decode(path: &Path) -> Option<image::DynamicImage> {
 pub fn scan(root: &Path) -> Scan {
     let mut candidates = Vec::new();
     let mut skipped_raw = 0;
+    let mut existing_output = 0;
+    let output_root = root.join(OUTPUT_DIR);
 
     for file in WalkDir::new(root)
         .follow_links(false)
@@ -133,6 +146,9 @@ pub fn scan(root: &Path) -> Scan {
             .components()
             .any(|part| part.as_os_str() == OUTPUT_DIR)
         {
+            if file.path().starts_with(&output_root) {
+                existing_output += 1;
+            }
             continue;
         }
         if is_raw(file.path()) {
@@ -149,7 +165,7 @@ pub fn scan(root: &Path) -> Scan {
     let threads = std::thread::available_parallelism().map_or(4, |count| count.get());
     let chunk = candidates.len().div_ceil(threads).max(1);
     let mut entries = Vec::with_capacity(candidates.len());
-    let mut unreadable = 0;
+    let mut unreadable = Vec::new();
     std::thread::scope(|scope| {
         // Chunks are contiguous and joined in order, so the walk order survives into
         // the stable sort below and ties still break the way they always did.
@@ -158,13 +174,13 @@ pub fn scan(root: &Path) -> Scan {
             .map(|chunk| {
                 scope.spawn(move || {
                     let mut found = Vec::new();
-                    let mut missed = 0usize;
+                    let mut missed = Vec::new();
                     for path in chunk {
                         match probe(path) {
                             Some(entry) => found.push(entry),
-                            // Only count things that claimed to be images. A README is
+                            // Only report things that claimed to be images. A README is
                             // not a failure.
-                            None if looks_like_an_image(path) => missed += 1,
+                            None if looks_like_an_image(path) => missed.push(path.clone()),
                             None => {}
                         }
                     }
@@ -175,7 +191,7 @@ pub fn scan(root: &Path) -> Scan {
         for worker in workers {
             let (found, missed) = worker.join().unwrap_or_default();
             entries.extend(found);
-            unreadable += missed;
+            unreadable.extend(missed);
         }
     });
 
@@ -185,6 +201,7 @@ pub fn scan(root: &Path) -> Scan {
         entries,
         skipped_raw,
         unreadable,
+        existing_output,
     }
 }
 
@@ -353,6 +370,34 @@ mod tests {
             1,
             "a second run must not offer to convert its own output"
         );
+        assert_eq!(
+            scanned.existing_output, 1,
+            "and it says what it would replace"
+        );
+    }
+
+    /// Every `optimized` folder is skipped as input, but only this root's own is what a
+    /// run would write over. Counting a nested one told a real folder that converting
+    /// would replace 5,415 files it was never going to touch.
+    #[test]
+    fn only_this_roots_output_folder_counts_as_what_a_run_would_replace() {
+        let dir = temp_dir("nested-output");
+        write_sample(&dir, "source.png", 16, 16);
+        let nested = dir.join("screenshots").join(OUTPUT_DIR);
+        std::fs::create_dir_all(&nested).unwrap();
+        write_sample(&nested, "old.png", 8, 8);
+        write_sample(&nested, "older.png", 8, 8);
+
+        let scanned = scan(&dir);
+        assert_eq!(
+            scanned.entries.len(),
+            1,
+            "the nested output is still skipped"
+        );
+        assert_eq!(
+            scanned.existing_output, 0,
+            "a run rooted here would not touch screenshots/optimized"
+        );
     }
 
     #[test]
@@ -383,7 +428,7 @@ mod tests {
 
         let scanned = scan(&dir);
         assert_eq!(scanned.entries.len(), 40, "no file is probed twice or lost");
-        assert_eq!(scanned.unreadable, 1, "failures survive the join");
+        assert_eq!(scanned.unreadable.len(), 1, "failures survive the join");
         assert!(
             scanned
                 .entries
@@ -403,8 +448,13 @@ mod tests {
         let scanned = scan(&dir);
         assert_eq!(scanned.entries.len(), 1);
         assert_eq!(
-            scanned.unreadable, 1,
-            "a broken png counts; a text file is not a failure"
+            scanned.unreadable.len(),
+            1,
+            "a broken png is named; a text file is not a failure"
+        );
+        assert!(
+            scanned.unreadable[0].ends_with("truncated.png"),
+            "the report says which file, not how many"
         );
     }
 

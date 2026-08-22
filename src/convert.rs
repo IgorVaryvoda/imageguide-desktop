@@ -10,6 +10,7 @@
 //! times slower than WebP per file. That is AV1, not a missing build flag: measured on
 //! a 5.6MB photo, libwebp takes a third of a second and rav1e takes six.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -208,6 +209,7 @@ pub fn convert_each(
     max_edge: MaxEdge,
     report: impl Fn(&Path, Option<Converted>) + Sync,
 ) {
+    let planned = &plan_outputs(root, sources, out_dir, format);
     // A shared cursor rather than a slice per thread: files in one folder differ in
     // size by a hundred times, so a fixed split leaves most threads finished early.
     let next = &AtomicUsize::new(0);
@@ -218,10 +220,11 @@ pub fn convert_each(
             scope.spawn(move || {
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(source) = sources.get(index) else {
+                    let (Some(source), Some(written)) = (sources.get(index), planned.get(index))
+                    else {
                         return;
                     };
-                    let converted = convert_file(root, source, out_dir, format, quality, max_edge);
+                    let converted = convert_to(source, written, format, quality, max_edge);
                     let _ordered = reporting.lock();
                     report(source, converted);
                 }
@@ -238,11 +241,60 @@ pub fn output_path(root: &Path, source: &Path, out_dir: &Path, format: Format) -
     out_dir.join(relative).with_extension(format.extension())
 }
 
-/// Read, encode, and write one file. Returns what was written.
-pub fn convert_file(
+/// One output path per source, no two of them the same.
+///
+/// `output_path` replaces the source extension, so `shot.jpg` and `shot.png` in one
+/// folder both ask for `optimized/shot.webp`. Whichever finished second replaced the
+/// other, and the run still reported two files converted and a saving that counted
+/// bytes no longer on disk. A second claim on a name keeps its source extension:
+/// `optimized/shot-jpg.webp`, then `-2`, `-3` if even that is taken.
+pub fn plan_outputs(
     root: &Path,
-    source: &Path,
+    sources: &[PathBuf],
     out_dir: &Path,
+    format: Format,
+) -> Vec<PathBuf> {
+    // Keyed case-insensitively. `Shot.png` and `shot.jpg` are two files on Linux and
+    // one on macOS, and renaming one of them needlessly costs a stranger name, while
+    // not renaming it costs a lost image.
+    let mut taken: HashSet<String> = HashSet::new();
+    let key = |path: &Path| path.to_string_lossy().to_lowercase();
+
+    sources
+        .iter()
+        .map(|source| {
+            let plain = output_path(root, source, out_dir, format);
+            if taken.insert(key(&plain)) {
+                return plain;
+            }
+            let extension = source
+                .extension()
+                .map(|extension| extension.to_string_lossy().to_lowercase())
+                .unwrap_or_else(|| "file".to_string());
+            let stem = plain.file_stem().unwrap_or_default().to_string_lossy();
+            let parent = plain.parent().unwrap_or(out_dir);
+            for attempt in 1.. {
+                let suffix = if attempt == 1 {
+                    String::new()
+                } else {
+                    format!("-{attempt}")
+                };
+                let candidate = parent
+                    .join(format!("{stem}-{extension}{suffix}"))
+                    .with_extension(format.extension());
+                if taken.insert(key(&candidate)) {
+                    return candidate;
+                }
+            }
+            unreachable!("the loop returns as soon as a name is free")
+        })
+        .collect()
+}
+
+/// Read, encode, and write one file to the path `plan_outputs` chose for it.
+pub fn convert_to(
+    source: &Path,
+    written: &Path,
     format: Format,
     quality: Quality,
     max_edge: MaxEdge,
@@ -251,12 +303,20 @@ pub fn convert_file(
     let (width, height) = (decoded.width(), decoded.height());
     let encoded = encode(&decoded, format, quality)?;
 
-    let written = output_path(root, source, out_dir, format);
     std::fs::create_dir_all(written.parent()?).ok()?;
-    std::fs::write(&written, &encoded).ok()?;
+    // Write beside the target and rename onto it. A crash or a full disk part-way
+    // through the write would otherwise leave a short `.webp` that looks finished, and
+    // the next run would list it as a real image.
+    let mut partial = written.to_path_buf().into_os_string();
+    partial.push(".part");
+    let partial = PathBuf::from(partial);
+    if std::fs::write(&partial, &encoded).is_err() || std::fs::rename(&partial, written).is_err() {
+        let _ = std::fs::remove_file(&partial);
+        return None;
+    }
 
     Some(Converted {
-        written,
+        written: written.to_path_buf(),
         bytes: encoded.len() as u64,
         width,
         height,
@@ -384,10 +444,9 @@ mod tests {
         photo(400, 400).save(&source).unwrap();
         let out = dir.join("optimised");
 
-        let converted = convert_file(
-            &dir,
+        let converted = convert_to(
             &source,
-            &out,
+            &output_path(&dir, &source, &out, Format::WebP),
             Format::WebP,
             Quality::lossy(75.),
             MaxEdge::FULL,
@@ -430,10 +489,9 @@ mod tests {
         let source = dir.join("wide.png");
         photo(600, 300).save(&source).unwrap();
 
-        let converted = convert_file(
-            &dir,
+        let converted = convert_to(
             &source,
-            &dir.join("out"),
+            &output_path(&dir, &source, &dir.join("out"), Format::WebP),
             Format::WebP,
             Quality::lossy(80.),
             MaxEdge(Some(200)),
@@ -441,6 +499,78 @@ mod tests {
         .expect("conversion runs");
 
         assert_eq!((converted.width, converted.height), (200, 100));
+    }
+
+    /// The bug this exists to stop: `shot.jpg` and `shot.png` both asked for
+    /// `optimized/shot.webp`, one silently replaced the other, and the run still
+    /// reported two conversions and a total that counted bytes no longer on disk.
+    #[test]
+    fn two_sources_never_claim_one_output() {
+        let root = Path::new("/photos");
+        let out = Path::new("/photos/optimized");
+        let sources = [
+            PathBuf::from("/photos/shot.jpg"),
+            PathBuf::from("/photos/shot.png"),
+            PathBuf::from("/photos/album/shot.png"),
+            PathBuf::from("/photos/shot.webp"),
+        ];
+
+        let planned = plan_outputs(root, &sources, out, Format::WebP);
+        assert_eq!(
+            planned,
+            [
+                PathBuf::from("/photos/optimized/shot.webp"),
+                PathBuf::from("/photos/optimized/shot-png.webp"),
+                PathBuf::from("/photos/optimized/album/shot.webp"),
+                PathBuf::from("/photos/optimized/shot-webp.webp"),
+            ],
+            "the first claim keeps the plain name, a subfolder is not a clash"
+        );
+    }
+
+    /// Names that differ only in case are two files on Linux and one on macOS, so they
+    /// count as a clash either way. Three of them exhaust the extension suffix and
+    /// reach the numbered fallback.
+    #[test]
+    fn case_alone_is_a_clash_and_a_taken_suffix_gets_numbered() {
+        let sources = [
+            PathBuf::from("/p/a.png"),
+            PathBuf::from("/p/A.png"),
+            PathBuf::from("/p/a.PNG"),
+        ];
+
+        let planned = plan_outputs(Path::new("/p"), &sources, Path::new("/p/out"), Format::WebP);
+        let names: Vec<String> = planned
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.webp", "A-png.webp", "a-png-2.webp"]);
+    }
+
+    /// A part-written file must never be left looking like a finished one.
+    #[test]
+    fn a_conversion_leaves_no_partial_file_behind() {
+        let dir = temp_dir("atomic");
+        let source = dir.join("in.png");
+        photo(64, 64).save(&source).unwrap();
+        let written = dir.join("out").join("in.webp");
+
+        convert_to(
+            &source,
+            &written,
+            Format::WebP,
+            Quality::lossy(80.),
+            MaxEdge::FULL,
+        )
+        .expect("conversion runs");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.join("out"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "found {leftovers:?}");
     }
 
     #[test]
