@@ -11,36 +11,39 @@ executors update their row when done.
 |------|-------|----------|--------|------------|--------|
 | 018 | Sirv glue characterization tests | P1 | M | — | DONE |
 | 019 | Token refresh from its real lifetime | P1 | S | — | DONE |
-| 020 | Push folders created once per run | P1 | S | 018 | TODO |
-| 021 | No credentials read on settings render | P1 | S | — | TODO |
-| 022 | Supersede stale browser listings | P1 | S | — | TODO |
-| 023 | Truthful credential-save status | P1 | S | — | TODO |
-| 024 | Credential hardening + safe remote keys | P1 | S | 023 | PARTIAL |
-| 025 | Cancel Sirv transfers on unpair/folder change | P1 | M | 018 | TODO |
+| 020 | Push folders created once per run | P1 | S | 018 | DONE |
+| 021 | No credentials read on settings render | P1 | S | — | DONE |
+| 022 | Supersede stale browser listings | P1 | S | — | DONE |
+| 023 | Truthful credential-save status | P1 | S | — | DONE |
+| 024 | Credential hardening + safe remote keys | P1 | S | 023 | DONE |
+| 025 | Cancel Sirv transfers on unpair/folder change | P1 | M | 018 | DONE |
 | 026 | Pairing-walk generation guard | P1 | S | 018 | DONE |
-| 027 | Truthful listing states (pending + failure) | P2 | S | 018, 025, 026 | TODO |
-| 028 | Gallery sync state, one vocabulary | P2 | M | 018 | TODO |
+| 027 | Truthful listing states (pending + failure) | P2 | S | 018, 025, 026 | DONE |
+| 028 | Gallery sync state, one vocabulary | P2 | M | 018 | DONE |
 | 029 | Resolve changed files (forced push/pull) | P2 | M | 018, 020, 025, 027 | TODO |
 
 ### Statuses corrected against the code, 2026-08-22
 
-Every row above said DONE except 029. Eight of them were not. Read the code
-before trusting a row; a status is a claim about `src/`, not about whether a
-plan was handed to anyone. What was checked, at `97337eb`:
+Every row above once said DONE except 029. Eight of them were not, and 029 was
+later marked DONE while its own dependencies were still open. Read the code
+before trusting a row: a status is a claim about `src/`, not about whether a
+plan was handed to anyone.
 
-| Plan | Evidence |
-|------|----------|
-| 018 | DONE — nine `#[test]` in `src/sirv.rs`. |
-| 019 | DONE — `expires_in` drives `Instant::now() + Duration` (`sirv.rs:244`). |
-| 020 | TODO — `mkdir` still runs for every ancestor of every file, inside the per-file task (`main.rs:1778`). |
-| 021 | TODO — `settings_panel_view` calls `sirv::load_credentials()` on every render (`main.rs:2325`). |
-| 022 | TODO — `browse_sirv_path` has no generation guard, so a slow listing lands on top of a newer one. |
-| 023 | TODO — `save_sirv_settings` reports `"Saved."` unconditionally; `save_credentials` returns nothing to check. |
-| 024 | PARTIAL — the store is 0600 as of `97337eb`, but there is no `safe_key` and remote keys are unvalidated. |
-| 025 | TODO — no cancellation anywhere in `main.rs` or `sirv.rs`. |
-| 026 | DONE — `walk_sirv_pairing` carries a generation. |
-| 027 | TODO — `SirvPairing::files` is still `Option<HashMap<..>>`, so `None` means both "listing" and "listing failed", and there is no failure notice. |
-| 028 | TODO — `tile` renders no sync state at all. |
+020 to 028 were then implemented and are DONE for real, at the commit that
+carries this note. 029 stays TODO — nothing forces a push or pull for a
+`changed` row, and `start_push` still says so in a comment.
+
+Two things the plans did not know, found while doing them:
+
+- `save_credentials` handed `save_credentials_at` a finished file path, and
+  that function joins `imageguide/sirv` onto whatever it gets. Credentials
+  landed in `<base>/imageguide/sirv/imageguide/sirv` while `load_credentials`
+  read `<base>/imageguide/sirv`, so the panel said "Saved." and the keys were
+  gone at the next launch. The Sirv settings had never once persisted. Plan 023
+  described the missing error check; the store was broken underneath it.
+- A pull wrote `root.join(key)` with `key` straight from the remote listing, so
+  an absolute or `..` key escaped the paired folder. `sirv::safe_key` now
+  filters the pull plan.
 
 ### Batch-2 baseline
 

@@ -147,12 +147,31 @@ pub fn unpair_remote(dir: &str, filename: &str) -> Option<String> {
     filename.strip_prefix(&prefix).map(str::to_string)
 }
 
+/// True when a remote key is safe to join onto a local folder.
+///
+/// A pull turns a name the server chose into a path this machine writes to. Rust's
+/// `Path::join` replaces the whole path when handed an absolute one, so a listing
+/// entry of `/etc/cron.d/x` would have written to `/etc/cron.d/x`, and `..` would have
+/// climbed out of the paired folder. Neither is something a Sirv account is expected
+/// to contain; both are cheap to refuse, and this is the boundary to refuse them at.
+pub fn safe_key(key: &str) -> bool {
+    !key.is_empty()
+        && !key.starts_with('/')
+        && !key.starts_with('\\')
+        // A Windows drive or UNC prefix is absolute too, and `..` at any depth climbs.
+        && !Path::new(key).has_root()
+        && Path::new(key)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
 /// Relative keys on Sirv that no local file claims: the pull list.
 pub fn pull_plan(remote: &[Node], dir: &str, local_keys: &HashSet<String>) -> Vec<String> {
     remote
         .iter()
         .filter_map(|node| unpair_remote(dir, &node.filename))
         .filter(|key| !local_keys.contains(key))
+        .filter(|key| safe_key(key))
         .collect()
 }
 
@@ -170,6 +189,27 @@ pub fn ancestor_dirs(key: &str) -> Vec<String> {
         out.push(seen.clone());
     }
     out
+}
+
+/// Every folder a push needs, each named once, shallowest first.
+///
+/// Ensuring a key's ancestors inside its own upload task meant one round trip per
+/// ancestor per file: 2,000 photos two levels deep spent 4,000 requests re-creating
+/// the same two folders.
+pub fn push_folders(keys: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    let mut folders = Vec::new();
+    let mut seen = HashSet::new();
+    for key in keys {
+        for ancestor in ancestor_dirs(key.as_ref()) {
+            if seen.insert(ancestor.clone()) {
+                folders.push(ancestor);
+            }
+        }
+    }
+    // A parent has to exist before its child, and `ancestor_dirs` already emits each
+    // chain in order; sorting by depth keeps that true once chains interleave.
+    folders.sort_by_key(|folder| folder.matches('/').count());
+    folders
 }
 
 /// The Content-Type an upload declares. Sirv sniffs images anyway; declaring
@@ -559,16 +599,30 @@ fn parse_credentials(text: &str) -> Option<Credentials> {
 
 // The settings panel writes credentials directly; the tests keep the file
 // format from drifting.
-pub fn save_credentials(credentials: &Credentials) {
-    if let Some(path) = store_path() {
-        save_credentials_at(path, credentials);
-    }
+/// Store the credentials, or say why not.
+///
+/// A `Result`, because the window used to report "Saved." whether or not anything
+/// reached the disk. A full disk or a read-only config directory looked exactly like
+/// success, and the user found out the next time the app started with no keys.
+pub fn save_credentials(credentials: &Credentials) -> Result<(), String> {
+    let Some(path) = store_path() else {
+        return Err("no config directory on this system".into());
+    };
+    write_credentials(&path, credentials)
 }
 
-pub fn save_credentials_at(base: impl AsRef<Path>, credentials: &Credentials) {
-    let path = store_path_in(base);
+/// Write the credentials file itself.
+///
+/// Both callers used to go through `save_credentials_at`, which takes a *base* and
+/// joins `imageguide/sirv` onto it — but `save_credentials` handed it `store_path()`,
+/// which is already the file. Credentials landed in
+/// `<base>/imageguide/sirv/imageguide/sirv` while `load_credentials` read
+/// `<base>/imageguide/sirv`, so the settings panel said "Saved." and the keys were
+/// gone by the next launch. Taking the finished path here leaves nowhere for the two
+/// to disagree.
+fn write_credentials(path: &Path, credentials: &Credentials) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let studio_line = credentials
         .studio_key
@@ -579,9 +633,9 @@ pub fn save_credentials_at(base: impl AsRef<Path>, credentials: &Credentials) {
         "client_id={}\nclient_secret={}\n{}",
         credentials.client_id, credentials.client_secret, studio_line
     );
-    if std::fs::write(&path, body).is_ok() {
-        owner_only(&path);
-    }
+    std::fs::write(path, body).map_err(|error| error.to_string())?;
+    owner_only(path);
+    Ok(())
 }
 
 /// Take the group and world bits off a file. An API secret written under the usual
@@ -673,7 +727,7 @@ mod tests {
             client_secret: "s3cret/with:colons".into(),
             studio_key: None,
         };
-        save_credentials_at(&base, &credentials);
+        write_credentials(&path, &credentials).expect("the store is writable");
         assert_eq!(
             load_credentials_from(Some(&path)),
             Some(credentials.clone())
@@ -684,7 +738,7 @@ mod tests {
             studio_key: Some("sk_live_abc".into()),
             ..credentials.clone()
         };
-        save_credentials_at(&base, &linked);
+        write_credentials(&path, &linked).expect("the store is writable");
         assert_eq!(load_credentials_from(Some(&path)), Some(linked));
 
         // The file holds an API secret, so it must not be readable by anyone else on
@@ -696,6 +750,94 @@ mod tests {
             assert_eq!(mode & 0o077, 0, "group or world can read {path:?}");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The pair the old test never put together. `save_credentials_at` and
+    /// `load_credentials_from` agreed with each other while `save_credentials` and
+    /// `load_credentials` — the two the window actually calls — did not: the save
+    /// joined `imageguide/sirv` on twice and the load looked at the shorter path, so
+    /// the panel said "Saved." and the keys were gone by the next launch.
+    ///
+    /// This is the only test that touches `IMAGEGUIDE_CONFIG_DIR`. Keep it that way:
+    /// the variable is process-wide and the test harness runs threads.
+    #[test]
+    fn what_the_window_saves_is_what_the_window_loads() {
+        let dir = std::env::temp_dir().join(format!("imageguide-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: no other test reads or writes this variable, and nothing else in the
+        // process is reading credentials while it runs.
+        unsafe { std::env::set_var("IMAGEGUIDE_CONFIG_DIR", &dir) };
+
+        let credentials = Credentials {
+            client_id: "id".into(),
+            client_secret: "secret".into(),
+            studio_key: None,
+        };
+        save_credentials(&credentials).expect("a fresh temp directory is writable");
+
+        assert_eq!(
+            load_credentials(),
+            Some(credentials),
+            "saved credentials must come back; they were landing one folder deeper"
+        );
+        assert!(
+            credentials_path().is_some_and(|path| path.is_file()),
+            "the path the window reports is the file that exists"
+        );
+
+        unsafe { std::env::remove_var("IMAGEGUIDE_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_push_names_each_folder_once_and_parents_before_children() {
+        let folders = push_folders([
+            "top.jpg",
+            "a/one.jpg",
+            "a/two.jpg",
+            "a/deep/three.jpg",
+            "b/four.jpg",
+        ]);
+
+        assert_eq!(folders, ["a", "b", "a/deep"], "no folder is created twice");
+        // Order matters upstream: `a` has to exist before `a/deep`.
+        let depth: Vec<usize> = folders.iter().map(|f| f.matches('/').count()).collect();
+        assert!(depth.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(
+            push_folders(["flat.jpg"]).is_empty(),
+            "a flat folder needs none"
+        );
+    }
+
+    /// A pull turns a name the server chose into a local path. Absolute keys and `..`
+    /// must never reach `root.join`.
+    #[test]
+    fn a_remote_key_that_escapes_the_folder_is_not_pulled() {
+        assert!(safe_key("a.jpg"));
+        assert!(safe_key("sub/deep/a.jpg"));
+        assert!(!safe_key(""));
+        assert!(!safe_key("/etc/cron.d/x"), "Path::join would take the lot");
+        assert!(!safe_key("../../.bashrc"));
+        assert!(!safe_key("sub/../../escape.jpg"));
+        assert!(!safe_key("./a.jpg"), "a bare dot is not a name either");
+
+        let remote = vec![
+            Node {
+                filename: "/d/ok.jpg".into(),
+                r#type: "file".into(),
+                size: 1,
+            },
+            Node {
+                filename: "/d/../../.bashrc".into(),
+                r#type: "file".into(),
+                size: 1,
+            },
+        ];
+        assert_eq!(
+            pull_plan(&remote, "/d", &HashSet::new()),
+            vec!["ok.jpg".to_string()],
+            "the escaping key is left out of the plan entirely"
+        );
     }
 
     #[test]
