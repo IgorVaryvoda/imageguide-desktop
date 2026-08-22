@@ -5,12 +5,13 @@
 //! libwebp directly for both, and picks between them by whether the source has
 //! meaningful transparency.
 //!
-//! AVIF goes through `rav1e`, built without its assembly. `rav1e`'s `asm` feature
-//! refuses to build unless `nasm` is installed, and requiring a build tool from every
-//! contributor to save encode time is the wrong trade for a desktop app. It is
-//! noticeably slower than WebP either way — that is AV1, not the missing assembly.
+//! AVIF goes through `rav1e`, with its assembly and threading on — both are `ravif`
+//! defaults and `nasm` is already a documented build requirement. It is still several
+//! times slower than WebP per file. That is AV1, not a missing build flag: measured on
+//! a 5.6MB photo, libwebp takes a third of a second and rav1e takes six.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use image::DynamicImage;
 use ravif::{Encoder as AvifEncoder, Img};
@@ -136,15 +137,26 @@ fn encode_webp(image: &DynamicImage, quality: Quality) -> Option<Vec<u8>> {
 /// AVIF keeps alpha in a separate plane, so transparency needs no special case here.
 /// `quality` maps straight onto rav1e's 1-100 scale; lossless AVIF is not offered
 /// because it is routinely larger than lossless WebP and slower to produce.
+///
+/// Opaque images go in as RGB. `encode_rgba` drops an all-opaque alpha plane itself,
+/// but only after the caller has allocated one: `to_rgba8` on a 6400x5968 photo is a
+/// 150MB buffer and a copy, and ravif then walks it twice more to decide the channel
+/// was never used.
 fn encode_avif(image: &DynamicImage, quality: Quality) -> Option<Vec<u8>> {
-    let rgba = image.to_rgba8();
-    let (width, height) = (rgba.width() as usize, rgba.height() as usize);
-
-    let encoded = AvifEncoder::new()
+    let encoder = AvifEncoder::new()
         .with_quality(quality.0.unwrap_or(90.))
-        .with_speed(6)
-        .encode_rgba(Img::new(rgba.as_raw().as_rgba(), width, height))
-        .ok()?;
+        .with_speed(6);
+
+    let encoded = if has_transparency(image) {
+        let rgba = image.to_rgba8();
+        let (width, height) = (rgba.width() as usize, rgba.height() as usize);
+        encoder.encode_rgba(Img::new(rgba.as_raw().as_rgba(), width, height))
+    } else {
+        let rgb = image.to_rgb8();
+        let (width, height) = (rgb.width() as usize, rgb.height() as usize);
+        encoder.encode_rgb(Img::new(rgb.as_raw().as_rgb(), width, height))
+    }
+    .ok()?;
 
     Some(encoded.avif_file)
 }
@@ -157,8 +169,65 @@ fn has_transparency(image: &DynamicImage) -> bool {
         DynamicImage::ImageRgba8(buffer) => buffer.pixels().any(|pixel| pixel.0[3] != 255),
         DynamicImage::ImageLumaA8(buffer) => buffer.pixels().any(|pixel| pixel.0[1] != 255),
         DynamicImage::ImageRgba16(buffer) => buffer.pixels().any(|pixel| pixel.0[3] != u16::MAX),
+        DynamicImage::ImageLumaA16(buffer) => buffer.pixels().any(|pixel| pixel.0[1] != u16::MAX),
+        // A float TIFF is rare and its alpha is still alpha. Answering "no" here would
+        // send a cut-out down the opaque path and flatten it.
+        DynamicImage::ImageRgba32F(buffer) => buffer.pixels().any(|pixel| pixel.0[3] != 1.0),
         _ => false,
     }
+}
+
+/// How many files to convert at once.
+///
+/// Each file in flight holds a fully decoded image, so this bounds memory as much as
+/// it bounds speed, and the two encoders want opposite things. libwebp runs on the
+/// calling thread and left one core 46% busy on a sixteen-core machine, so WebP wants
+/// a file per core. rav1e already spreads one image across the whole rayon pool: on
+/// the same machine, 113MB of photos took 128s one at a time, 88s two at a time and
+/// 83s four at a time, so the fourth worker bought 5% for twice the memory.
+pub fn workers(format: Format) -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, |count| count.get());
+    match format {
+        Format::WebP => cores.clamp(2, 8),
+        Format::Avif => 2,
+    }
+}
+
+/// Convert every path, `workers(format)` at a time, calling `report` with each result
+/// as it lands. `report` is called from a worker thread, one at a time.
+///
+/// The window's conversion has its own copy of this loop built out of executor tasks,
+/// because it has to hand each result back to the UI thread. This one is for callers
+/// that only need the work done.
+pub fn convert_each(
+    root: &Path,
+    sources: &[PathBuf],
+    out_dir: &Path,
+    format: Format,
+    quality: Quality,
+    max_edge: MaxEdge,
+    report: impl Fn(&Path, Option<Converted>) + Sync,
+) {
+    // A shared cursor rather than a slice per thread: files in one folder differ in
+    // size by a hundred times, so a fixed split leaves most threads finished early.
+    let next = &AtomicUsize::new(0);
+    let report = &report;
+    let reporting = &parking_lot::Mutex::new(());
+    std::thread::scope(|scope| {
+        for _ in 0..workers(format).min(sources.len().max(1)) {
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(source) = sources.get(index) else {
+                        return;
+                    };
+                    let converted = convert_file(root, source, out_dir, format, quality, max_edge);
+                    let _ordered = reporting.lock();
+                    report(source, converted);
+                }
+            });
+        }
+    });
 }
 
 /// Where a converted file goes: the same layout as the source, rooted at `out_dir`,

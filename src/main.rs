@@ -72,9 +72,6 @@ const W_NAME_MIN: f32 = 140.;
 /// diagnostic something you had to read rather than see.
 const DENSITY_GOOD: f32 = 0.5;
 const DENSITY_HEAVY: f32 = 1.5;
-/// How many files encode at once. Each one holds a fully decoded image in memory, so
-/// this is a memory bound as much as a CPU one.
-const WORKERS: usize = 8;
 /// The smallest compositor window that supports every production view.
 const WINDOW_MIN_WIDTH: f32 = 760.;
 const WINDOW_MIN_HEIGHT: f32 = 560.;
@@ -91,9 +88,19 @@ const ROOT_PADDING: f32 = 12.;
 const ROOT_BORDER: f32 = 2.;
 const GALLERY_PADDING: f32 = 8.;
 const GALLERY_BORDER: f32 = 1.;
-/// Files encoded to project a total. More is more accurate and much slower — an AVIF
-/// sample is a second or two each.
-const SAMPLE_SIZE: usize = 4;
+/// Files encoded to project a total.
+///
+/// Measured against a real 3.0GB folder that converts to 422.9MB, sweeping which file
+/// each slice offers up: 16 slices land anywhere in −53%..+59%, and 32 slices tighten
+/// that to −36%..+10%. Samples run together, so 32 of them cost 0.9s on that folder.
+/// rav1e takes seconds per image and already fills the machine on one, so AVIF settles
+/// for three and stays a rough number.
+fn sample_size(format: Format) -> usize {
+    match format {
+        Format::WebP => 32,
+        Format::Avif => 3,
+    }
+}
 /// Settling time before sampling, so dragging the slider does not start a run per pixel.
 const ESTIMATE_DELAY: Duration = Duration::from_millis(400);
 /// Settling time before building a comparison, so a held arrow key does not queue one
@@ -583,48 +590,55 @@ impl Audit {
             .collect();
 
         cx.spawn(async move |this, cx| {
-            for chunk in sources.chunks(WORKERS) {
-                // Spawn a bounded batch, then wait for it. Queueing all 5,000 at once
-                // would be fine for the executor and terrible for memory.
-                let batch: Vec<_> = chunk
-                    .iter()
-                    .map(|(index, path)| {
-                        let (index, path) = (*index, path.clone());
-                        let (root, out_dir) = (root.clone(), out_dir.clone());
-                        cx.background_executor().spawn(async move {
-                            (
-                                index,
-                                convert::convert_file(
-                                    &root, &path, &out_dir, format, quality, max_edge,
-                                ),
-                            )
-                        })
-                    })
-                    .collect();
+            // A sliding window rather than batches. Batching waited for all eight of a
+            // chunk before starting the ninth, so one 40MB photo held seven workers
+            // idle; here a finished file is replaced immediately. The window is what
+            // bounds memory: every file in flight holds a fully decoded image.
+            let workers = convert::workers(format);
+            let mut inflight: VecDeque<gpui::Task<(usize, Option<convert::Converted>)>> =
+                VecDeque::new();
+            let mut queued = sources.iter();
 
-                let mut done = Vec::with_capacity(batch.len());
-                for task in batch {
-                    done.push(task.await);
+            loop {
+                while inflight.len() < workers {
+                    let Some((index, path)) = queued.next() else {
+                        break;
+                    };
+                    let (index, path) = (*index, path.clone());
+                    let (root, out_dir) = (root.clone(), out_dir.clone());
+                    inflight.push_back(cx.background_executor().spawn(async move {
+                        (
+                            index,
+                            convert::convert_file(
+                                &root, &path, &out_dir, format, quality, max_edge,
+                            ),
+                        )
+                    }));
                 }
+                // Awaiting the oldest keeps the results in list order for the table.
+                // The rest are already running: an executor task does not need to be
+                // awaited to make progress.
+                let Some(task) = inflight.pop_front() else {
+                    break;
+                };
+                let (index, result) = task.await;
 
                 if this
                     .update(cx, |audit, cx| {
                         if audit.dataset_generation != dataset_generation {
                             return;
                         }
-                        for (index, result) in done {
-                            match result {
-                                Some(converted) => {
-                                    audit.results.insert(index, converted.bytes);
-                                }
-                                None => {
-                                    let name = audit
-                                        .entries
-                                        .get(index)
-                                        .map(|entry| entry.name())
-                                        .unwrap_or_default();
-                                    audit.failures.push(name);
-                                }
+                        match result {
+                            Some(converted) => {
+                                audit.results.insert(index, converted.bytes);
+                            }
+                            None => {
+                                let name = audit
+                                    .entries
+                                    .get(index)
+                                    .map(|entry| entry.name())
+                                    .unwrap_or_default();
+                                audit.failures.push(name);
                             }
                         }
                         cx.notify();
@@ -716,25 +730,27 @@ impl Audit {
             return;
         }
 
-        // Spread the sample across the list rather than taking the heaviest few: the
-        // top of a folder is often one outlier.
-        let stride = targets.len().div_ceil(SAMPLE_SIZE).max(1);
-        let sample: Vec<(PathBuf, u64)> = targets
-            .iter()
-            .step_by(stride)
-            .take(SAMPLE_SIZE)
-            .filter_map(|index| {
-                let entry = self.entries.get(*index)?;
-                Some((entry.path.clone(), entry.bytes))
+        let (format, quality, max_edge) = (self.format, self.quality, self.max_edge);
+        let slices = sample_size(format).min(targets.len());
+        // One sample per slice of the list, taken from the middle of it. The list is
+        // weight-sorted, so the first file of a slice is its heaviest and the least
+        // like the rest of it.
+        let strata: Vec<Stratum> = (0..slices)
+            .filter_map(|slice| {
+                let start = slice * targets.len() / slices;
+                let end = (slice + 1) * targets.len() / slices;
+                let entry = self.entries.get(*targets.get((start + end) / 2)?)?;
+                Some(Stratum {
+                    path: entry.path.clone(),
+                    bytes: entry.bytes,
+                    slice_bytes: targets[start..end]
+                        .iter()
+                        .filter_map(|index| self.entries.get(*index))
+                        .map(|entry| entry.bytes)
+                        .sum(),
+                })
             })
             .collect();
-        let total: u64 = targets
-            .iter()
-            .filter_map(|index| self.entries.get(*index))
-            .map(|entry| entry.bytes)
-            .sum();
-
-        let (format, quality, max_edge) = (self.format, self.quality, self.max_edge);
 
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(ESTIMATE_DELAY).await;
@@ -748,33 +764,39 @@ impl Audit {
                 return;
             }
 
-            let sampled = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut source = 0u64;
-                    let mut encoded = 0u64;
-                    let mut counted = 0usize;
-                    for (path, bytes) in sample {
-                        let Some(image) = scan::decode(&path).map(|i| max_edge.apply(i)) else {
-                            continue;
-                        };
-                        let Some(output) = convert::encode(&image, format, quality) else {
-                            continue;
-                        };
-                        source += bytes;
-                        encoded += output.len() as u64;
-                        counted += 1;
-                    }
-                    (source, encoded, counted)
-                })
-                .await;
+            // The samples are independent, so they run together, as many at once as a
+            // conversion allows. That is what pays for a sample wide enough to trust:
+            // 32 WebP samples of a 3.0GB folder take 0.9s, inside the wait the status
+            // bar already shows as "Sizing it up…".
+            let concurrency = convert::workers(format);
+            let mut inflight: VecDeque<(u64, u64, gpui::Task<Option<u64>>)> = VecDeque::new();
+            let mut queued = strata.iter();
+            let mut sampled = Vec::with_capacity(strata.len());
 
-            let (source, encoded, counted) = sampled;
-            if counted == 0 || source == 0 {
-                return;
+            loop {
+                while inflight.len() < concurrency {
+                    let Some(stratum) = queued.next() else {
+                        break;
+                    };
+                    let path = stratum.path.clone();
+                    inflight.push_back((
+                        stratum.slice_bytes,
+                        stratum.bytes,
+                        cx.background_executor().spawn(async move {
+                            let image = scan::decode(&path).map(|image| max_edge.apply(image))?;
+                            Some(convert::encode(&image, format, quality)?.len() as u64)
+                        }),
+                    ));
+                }
+                let Some((slice_bytes, bytes, task)) = inflight.pop_front() else {
+                    break;
+                };
+                sampled.push((slice_bytes, task.await.map(|encoded| (bytes, encoded))));
             }
 
-            let projected = (total as f64 * (encoded as f64 / source as f64)) as u64;
+            let Some((projected, counted)) = project_total(&sampled) else {
+                return;
+            };
             let _ = this.update(cx, |audit, cx| {
                 // A newer change started while this was encoding.
                 if audit.estimate_generation == generation
@@ -2999,8 +3021,11 @@ impl Audit {
             let delta = source.abs_diff(projected);
             let percent = delta as f32 / source.max(1) as f32 * 100.;
             (
+                // A projection from a few dozen encodes, said as one. Unqualified it
+                // read as a measurement, and the reader had no way to tell it from the
+                // completed total above, which is one.
                 format!(
-                    "{} to {}",
+                    "≈{} to {}",
                     format_bytes(delta),
                     if growth { "grow" } else { "save" }
                 ),
@@ -3246,6 +3271,44 @@ impl Audit {
             self.requested.remove(&oldest);
         }
     }
+}
+
+/// One sampled file and the slice of the list it speaks for.
+struct Stratum {
+    path: PathBuf,
+    /// The sampled file's own size on disk.
+    bytes: u64,
+    /// Every file in its slice, that one included.
+    slice_bytes: u64,
+}
+
+/// Project the encoded size of a whole list from a few real encodes.
+///
+/// Each entry is one slice's bytes and, when its sample encoded, that sample's own
+/// source and encoded size. A slice is scaled by its own sample; a slice whose sample
+/// would not decode is scaled by the average of the ones that did. Returns the total
+/// and how many samples stood behind it, or `None` when nothing encoded at all.
+///
+/// The old version divided the summed sample bytes by the summed source bytes and
+/// applied that one ratio to the folder. On a weight-sorted list of 5,739 photos the
+/// heaviest file was 109MB of a 110MB sample, so its 300:1 compression became the
+/// forecast for all 3GB and the window promised "3.0 GB to save, −100%".
+fn project_total(slices: &[(u64, Option<(u64, u64)>)]) -> Option<(u64, usize)> {
+    let ratio = |(source, encoded): (u64, u64)| encoded as f64 / source.max(1) as f64;
+    let sampled: Vec<f64> = slices
+        .iter()
+        .filter_map(|(_, sample)| sample.map(ratio))
+        .collect();
+    if sampled.is_empty() {
+        return None;
+    }
+
+    let average = sampled.iter().sum::<f64>() / sampled.len() as f64;
+    let projected: f64 = slices
+        .iter()
+        .map(|(slice_bytes, sample)| *slice_bytes as f64 * sample.map_or(average, ratio))
+        .sum();
+    Some((projected as u64, sampled.len()))
 }
 
 fn conversion_targets(visible: &[usize], selected: &HashSet<usize>) -> Vec<usize> {
@@ -4283,33 +4346,53 @@ fn convert_headless(
     max_edge: MaxEdge,
 ) {
     let out_dir = root.join(scan::OUTPUT_DIR);
-    let (mut before, mut after, mut failed) = (0u64, 0u64, 0usize);
+    let sources: Vec<PathBuf> = entries.iter().map(|entry| entry.path.clone()).collect();
+    let by_path: HashMap<&Path, &Entry> = entries
+        .iter()
+        .map(|entry| (entry.path.as_path(), entry))
+        .collect();
 
-    for entry in entries {
-        match convert::convert_file(root, &entry.path, &out_dir, format, quality, max_edge) {
-            Some(converted) => {
-                before += entry.bytes;
-                after += converted.bytes;
-                let delta = entry.bytes as i64 - converted.bytes as i64;
-                let percent = delta as f64 / entry.bytes.max(1) as f64 * 100.;
-                let resized = if converted.width == entry.width {
-                    String::new()
-                } else {
-                    format!("  {}x{}", converted.width, converted.height)
-                };
-                println!(
-                    "{:<52} {:>9} -> {:>9}  {percent:+.0}%{resized}",
-                    entry.name(),
-                    format_bytes(entry.bytes),
-                    format_bytes(converted.bytes)
-                );
+    // Lines arrive as files finish rather than in list order, which is what running
+    // several at once looks like. The totals are the same either way.
+    let totals = parking_lot::Mutex::new((0u64, 0u64, 0usize));
+    convert::convert_each(
+        root,
+        &sources,
+        &out_dir,
+        format,
+        quality,
+        max_edge,
+        |source, converted| {
+            let Some(entry) = by_path.get(source) else {
+                return;
+            };
+            let mut totals = totals.lock();
+            match converted {
+                Some(converted) => {
+                    totals.0 += entry.bytes;
+                    totals.1 += converted.bytes;
+                    let delta = entry.bytes as i64 - converted.bytes as i64;
+                    let percent = delta as f64 / entry.bytes.max(1) as f64 * 100.;
+                    let resized = if converted.width == entry.width {
+                        String::new()
+                    } else {
+                        format!("  {}x{}", converted.width, converted.height)
+                    };
+                    println!(
+                        "{:<52} {:>9} -> {:>9}  {percent:+.0}%{resized}",
+                        entry.name(),
+                        format_bytes(entry.bytes),
+                        format_bytes(converted.bytes)
+                    );
+                }
+                None => {
+                    totals.2 += 1;
+                    println!("{:<52} failed", entry.name());
+                }
             }
-            None => {
-                failed += 1;
-                println!("{:<52} failed", entry.name());
-            }
-        }
-    }
+        },
+    );
+    let (before, after, failed) = *totals.lock();
 
     let growth = after > before;
     let delta = before.abs_diff(after);
@@ -4777,6 +4860,46 @@ mod tests {
 
     fn names(entries: &[Entry]) -> Vec<String> {
         entries.iter().map(|entry| entry.name()).collect()
+    }
+
+    /// The list is sorted heaviest first, so its outlier is always sample one. Whatever
+    /// that file does must stop at the slice it was taken from.
+    #[test]
+    fn each_slice_is_projected_by_its_own_sample() {
+        // A gigabyte of images that compress 100:1, then a gigabyte that does not
+        // compress at all.
+        let (projected, counted) = project_total(&[
+            (1_000_000_000, Some((10_000_000, 100_000))),
+            (1_000_000_000, Some((10_000_000, 10_000_000))),
+        ])
+        .expect("two samples encoded");
+
+        assert_eq!(counted, 2);
+        assert_eq!(
+            projected, 1_010_000_000,
+            "10 MB from the first slice and the whole gigabyte from the second"
+        );
+        // The summed-bytes ratio this replaced: 10.1 MB of sample from 20 MB of source
+        // called the entire 2 GB half its size.
+    }
+
+    #[test]
+    fn a_slice_whose_sample_would_not_decode_borrows_the_average() {
+        let (projected, counted) = project_total(&[
+            (100, Some((1000, 100))),
+            (100, Some((1000, 300))),
+            (100, None),
+        ])
+        .expect("two of three encoded");
+
+        assert_eq!(counted, 2, "the broken file is not counted as evidence");
+        assert_eq!(projected, 10 + 30 + 20, "its slice takes the 0.2 average");
+    }
+
+    #[test]
+    fn nothing_encoded_is_no_estimate() {
+        assert!(project_total(&[(1000, None), (2000, None)]).is_none());
+        assert!(project_total(&[]).is_none());
     }
 
     #[test]
