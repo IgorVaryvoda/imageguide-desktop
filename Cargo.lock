@@ -3378,7 +3378,7 @@ dependencies = [
 
 [[package]]
 name = "imageguide-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cargo-packager-updater",
  "cc",
