@@ -9,7 +9,7 @@
 //! the thing that silently drops a credential.
 
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -149,13 +149,24 @@ pub fn safe_key(key: &str) -> bool {
             .all(|part| matches!(part, std::path::Component::Normal(_)))
 }
 
-/// Relative keys on Sirv that no local file claims: the pull list.
-pub fn pull_plan(remote: &[Node], dir: &str, local_keys: &HashSet<String>) -> Vec<String> {
+/// Safe relative keys missing locally, or differing when explicitly requested.
+pub fn pull_plan(
+    remote: &[Node],
+    dir: &str,
+    local_sizes: &HashMap<String, u64>,
+    differing: bool,
+) -> Vec<String> {
     remote
         .iter()
-        .filter_map(|node| unpair_remote(dir, &node.filename))
-        .filter(|key| !local_keys.contains(key))
-        .filter(|key| safe_key(key))
+        .filter_map(|node| unpair_remote(dir, &node.filename).map(|key| (key, node)))
+        .filter(|(key, _)| safe_key(key))
+        .filter(|(key, node)| match local_sizes.get(key) {
+            Some(local_size) => {
+                differing && classify(*local_size, Some(node)) == SyncState::Changed
+            }
+            None => !differing,
+        })
+        .map(|(key, _)| key)
         .collect()
 }
 
@@ -730,7 +741,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            pull_plan(&remote, "/d", &HashSet::new()),
+            pull_plan(&remote, "/d", &HashMap::new(), false),
             vec!["ok.jpg".to_string()],
             "the escaping key is left out of the plan entirely"
         );
@@ -755,10 +766,41 @@ mod tests {
                 size: 3,
             },
         ];
-        let local: HashSet<String> = ["a.jpg".into(), "b.jpg".into()].into();
+        let local = HashMap::from([("a.jpg".into(), 1), ("b.jpg".into(), 2)]);
         assert_eq!(
-            pull_plan(&remote, "/d", &local),
+            pull_plan(&remote, "/d", &local, false),
             vec!["sub/c.jpg".to_string()]
+        );
+    }
+
+    #[test]
+    fn changed_keys_only_when_asked() {
+        let remote = vec![
+            Node {
+                filename: "/d/missing.jpg".into(),
+                r#type: "file".into(),
+                size: 1,
+            },
+            Node {
+                filename: "/d/same.jpg".into(),
+                r#type: "file".into(),
+                size: 2,
+            },
+            Node {
+                filename: "/d/changed.jpg".into(),
+                r#type: "file".into(),
+                size: 3,
+            },
+        ];
+        let local = HashMap::from([("same.jpg".into(), 2), ("changed.jpg".into(), 4)]);
+
+        assert_eq!(
+            pull_plan(&remote, "/d", &local, false),
+            ["missing.jpg".to_string()]
+        );
+        assert_eq!(
+            pull_plan(&remote, "/d", &local, true),
+            ["changed.jpg".to_string()]
         );
     }
 
