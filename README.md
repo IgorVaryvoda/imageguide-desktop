@@ -154,18 +154,17 @@ twenty, which are already at the top.
 
 ### WebP or AVIF
 
-Twelve mixed files from a real photo library — four JPEG photos, four upscaled PNGs,
-four screenshots — at q80, on a 12-thread machine:
+64 size-stratified files from a real photo library, at q80 on a 16-thread machine:
 
-| | Result | Wall clock | CPU time |
-|---|---|---|---|
-| WebP | 76.0 MB → **4.6 MB** (94%) | 5.4 s | 5.1 s |
-| AVIF | 76.0 MB → **4.1 MB** (95%) | 26.1 s | 158 s |
+| | Result | Wall clock |
+|---|---|---|
+| WebP | 134.1 MB → 5.4 MB (96%) | 0.67 s |
+| AVIF, former rav1e encoder | 134.1 MB → 4.0 MB (97%) | 21.50 s |
+| AVIF, current libaom encoder | 134.1 MB → **3.6 MB** (97%) | **9.07 s** |
 
-AVIF is about 11% smaller and roughly thirty times the CPU. That is AV1 being AV1,
-not a build problem — `rav1e` is compiled with its assembly and used all twelve
-threads. Whether the extra 11% is worth the wait is your call, which is why both are
-one click apart.
+The current path is 58% faster and 9% smaller than the former rav1e path at matched
+visual quality. It uses the system libavif, libaom and libyuv libraries directly, so
+there is no subprocess per image.
 
 AVIF has no lossless option here. Lossless AVIF is routinely larger than lossless
 WebP and much slower to produce, so `--lossless` means WebP.
@@ -198,8 +197,8 @@ rather than tells you.
 
 - Zoom in the comparison. It is 1:1 and pannable, but there is no way to back out to
   a whole-image view.
-- Windows. dav1d decodes AVIF here and getting it onto a Windows runner means vcpkg;
-  Ubuntu and macOS are both green in CI.
+- Windows. dav1d decodes AVIF and libavif/libaom encode it; getting those onto a
+  Windows runner means vcpkg. Ubuntu and macOS are both green in CI.
 - Spec profiles — "1400×1400, white background, under 250 KB" — for marketplace
   pre-flight.
 
@@ -210,12 +209,13 @@ cargo build --release   # fetches the pinned Rust toolchain on first run
 cargo test
 ```
 
-Needs `nasm` to build `rav1e`'s assembly, plus `libwebp` and `dav1d`:
+Needs `dav1d` to decode AVIF, and libavif with its libaom and libyuv backends to
+encode it:
 
 ```bash
-sudo pacman -S nasm libwebp dav1d                 # Arch and derivatives
-sudo apt install nasm libwebp-dev libdav1d-dev    # Debian and derivatives
-brew install nasm webp dav1d                      # macOS
+sudo pacman -S dav1d libavif aom libyuv                  # Arch and derivatives
+sudo apt install libdav1d-dev libavif-dev libaom-dev libyuv-dev
+brew install dav1d libavif aom libyuv                     # macOS
 ```
 
 Nothing in `src/` is platform-specific. Two dependencies are, and `Cargo.toml` splits

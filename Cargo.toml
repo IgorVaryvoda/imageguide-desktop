@@ -21,8 +21,6 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 futures = "0.3"
 image = { version = "0.25", features = ["avif-native"] }
-ravif = "0.13.0"
-rgb = "0.8.53"
 walkdir = "2"
 libwebp-sys = "0.14.4"
 # Sirv REST sync. ureq keeps the dependency tree pure Rust (rustls), so no new
@@ -48,6 +46,10 @@ rfd = "0.17.2"
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
 
 [profile.release]
 opt-level = 2

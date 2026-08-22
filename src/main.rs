@@ -4,6 +4,7 @@
 //! does the same work locally, so nothing leaves the machine and the folder size is
 //! bounded by the disk rather than by a tab.
 
+mod avif;
 mod compare;
 mod convert;
 mod scan;
@@ -94,8 +95,8 @@ const GALLERY_BORDER: f32 = 1.;
 /// Measured against a real 3.0GB folder that converts to 422.9MB, sweeping which file
 /// each slice offers up: 16 slices land anywhere in −53%..+59%, and 32 slices tighten
 /// that to −36%..+10%. Samples run together, so 32 of them cost 0.9s on that folder.
-/// rav1e takes seconds per image and already fills the machine on one, so AVIF settles
-/// for three and stays a rough number.
+/// AVIF remains the expensive path even with libaom, so it settles for three and stays
+/// a rough number instead of making each slider stop feel like a conversion.
 fn sample_size(format: Format) -> usize {
     match format {
         Format::WebP => 32,

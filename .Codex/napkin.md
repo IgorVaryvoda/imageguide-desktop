@@ -12,6 +12,7 @@
 - For pre-alpha UI work, reshape the design freely and make real app screenshots yourself; do not wait for an in-repo headless capture test.
 
 ## Patterns That Work
+- The in-process system libavif 1.4.2 + libaom 3.14.1 + libyuv path took 9.070s versus rav1e speed 8's 21.503s on the same 64-file / 134.1MB sample (57.8% faster); output fell 8.7%, and PSNR was higher on four of five spot checks. A tiny C bridge avoids stale Rust wrappers and subprocess overhead.
 - On the 5,739-image corpus, bundled libwebp 1.6.0 with zero-copy RGB/RGBA input took 28.512s versus 29.569s for the 1.3.1 wrapper (3.6% faster) and encoded five formats the wrapper rejected; converting every image to a fresh RGB buffer first regressed to 33.119s.
 - Rav1e speed 8 took 20.628s versus 23.373s at speed 6 on a 64-file size-stratified real sample (11.7% faster), while output grew only 0.6%.
 - For lossy WebP, libwebp method 1 with eight file workers cut the current 5,739-image / 3.0GB q80 full-size run from 69.505s to 29.608s (57.4%); output grew from 423.2MB to 480.3MB but still saved 84%. Keep method 4 for lossless/transparent images. Threaded libwebp was worse: 71.2s at eight file workers and 125.3s at four.

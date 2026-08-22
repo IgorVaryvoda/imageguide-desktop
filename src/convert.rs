@@ -5,10 +5,8 @@
 //! libwebp directly for both, and picks between them by whether the source has
 //! meaningful transparency.
 //!
-//! AVIF goes through `rav1e`, with its assembly and threading on — both are `ravif`
-//! defaults and `nasm` is already a documented build requirement. It is still several
-//! times slower than WebP per file. That is AV1, not a missing build flag: measured on
-//! a 5.6MB photo, libwebp takes a third of a second and rav1e takes six.
+//! AVIF goes through libavif's libaom backend and libyuv colour conversion. The system
+//! libraries are the same path as `avifenc`, without starting a process per image.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -21,8 +19,6 @@ use libwebp_sys::{
     WebPPictureImportRGB, WebPPictureImportRGBA, WebPPictureInitInternal, WebPPreset,
     WebPValidateConfig,
 };
-use ravif::{Encoder as AvifEncoder, Img};
-use rgb::FromSlice;
 
 /// Encoder quality, 1 to 100. `None` means lossless.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -251,30 +247,39 @@ fn encode_webp_pixels(
 }
 
 /// AVIF keeps alpha in a separate plane, so transparency needs no special case here.
-/// `quality` maps straight onto rav1e's 1-100 scale; lossless AVIF is not offered
-/// because it is routinely larger than lossless WebP and slower to produce.
-///
-/// Opaque images go in as RGB. `encode_rgba` drops an all-opaque alpha plane itself,
-/// but only after the caller has allocated one: `to_rgba8` on a 6400x5968 photo is a
-/// 150MB buffer and a copy, and ravif then walks it twice more to decide the channel
-/// was never used.
+/// libaom and rav1e calibrate their 1-100 scales differently; 75% matches the former
+/// rav1e output size and measured PSNR on the real corpus.
 fn encode_avif(image: &DynamicImage, quality: Quality) -> Option<Vec<u8>> {
-    let encoder = AvifEncoder::new()
-        .with_quality(quality.0.unwrap_or(90.))
-        .with_speed(8);
+    let has_alpha = has_transparency(image);
+    let quality = aom_quality(quality);
+    let cores = std::thread::available_parallelism().map_or(4, |count| count.get());
+    let threads = (cores / workers(Format::Avif)).clamp(1, 8);
 
-    let encoded = if has_transparency(image) {
+    if has_alpha {
         let rgba = image.to_rgba8();
-        let (width, height) = (rgba.width() as usize, rgba.height() as usize);
-        encoder.encode_rgba(Img::new(rgba.as_raw().as_rgba(), width, height))
+        crate::avif::encode(
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+            true,
+            quality,
+            threads,
+        )
     } else {
         let rgb = image.to_rgb8();
-        let (width, height) = (rgb.width() as usize, rgb.height() as usize);
-        encoder.encode_rgb(Img::new(rgb.as_raw().as_rgb(), width, height))
+        crate::avif::encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            false,
+            quality,
+            threads,
+        )
     }
-    .ok()?;
+}
 
-    Some(encoded.avif_file)
+fn aom_quality(quality: Quality) -> u8 {
+    ((quality.0.unwrap_or(90.) * 0.75).round() as u8).clamp(1, 75)
 }
 
 /// True when any pixel is not fully opaque. A PNG with an alpha channel that is
@@ -298,9 +303,8 @@ fn has_transparency(image: &DynamicImage) -> bool {
 /// Each file in flight holds a fully decoded image, so this bounds memory as much as
 /// it bounds speed, and the two encoders want opposite things. libwebp runs on the
 /// calling thread and left one core 46% busy on a sixteen-core machine, so WebP wants
-/// a file per core. rav1e already spreads one image across the whole rayon pool: on
-/// the same machine, 113MB of photos took 128s one at a time, 88s two at a time and
-/// 83s four at a time, so the fourth worker bought 5% for twice the memory.
+/// a file per core. libaom gets half the available threads per image, so two files
+/// keep the machine busy without doubling peak decoded-image memory again.
 pub fn workers(format: Format) -> usize {
     let cores = std::thread::available_parallelism().map_or(4, |count| count.get());
     match format {
@@ -498,6 +502,11 @@ mod tests {
         // ISO base media file format: a 'ftyp' box naming the AVIF brand.
         assert_eq!(&encoded[4..8], b"ftyp");
         assert_eq!(&encoded[8..12], b"avif");
+    }
+
+    #[test]
+    fn aom_quality_matches_the_measured_rav1e_output() {
+        assert_eq!(aom_quality(Quality::lossy(80.)), 60);
     }
 
     /// Alpha survives the trip. AVIF carries it in its own plane, so unlike WebP there
