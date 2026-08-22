@@ -76,6 +76,7 @@ jobs:
           echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
           echo "VCPKGRS_TRIPLET=${{ matrix.vcpkg_triplet }}" >> "$GITHUB_ENV"
           echo "DAV1D_STATIC=1" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$VCPKG_INSTALLATION_ROOT/installed/${{ matrix.vcpkg_triplet }}/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - name: System dependencies (Windows)
         if: runner.os == 'Windows'
