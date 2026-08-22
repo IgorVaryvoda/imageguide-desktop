@@ -71,6 +71,7 @@ jobs:
       - name: System dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
+          brew install nasm
           "$VCPKG_INSTALLATION_ROOT/vcpkg" install "libavif[aom,dav1d]:${{ matrix.vcpkg_triplet }}"
           echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
           echo "VCPKGRS_TRIPLET=${{ matrix.vcpkg_triplet }}" >> "$GITHUB_ENV"
