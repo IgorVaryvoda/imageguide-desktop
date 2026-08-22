@@ -15,6 +15,7 @@ fn main() {
 
     let avif = pkg_config::Config::new()
         .atleast_version("1.0")
+        .statik(std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos"))
         .cargo_metadata(false)
         .probe("libavif")
         .expect("libavif >= 1.0 is required; install libavif-dev or libavif");
@@ -23,6 +24,7 @@ fn main() {
     // Emit libavif after the static bridge so linkers using --as-needed retain it.
     pkg_config::Config::new()
         .atleast_version("1.0")
+        .statik(std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos"))
         .probe("libavif")
         .expect("libavif disappeared between configure and link");
 }
